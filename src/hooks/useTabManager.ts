@@ -15,7 +15,8 @@ import {
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
 
-type OutputHandler = (chunk: Uint8Array) => void;
+/** `isReplay` marks the attach-time ring replay, as opposed to live output. */
+type OutputHandler = (chunk: Uint8Array, isReplay?: boolean) => void;
 /** Internal sink: a live chunk plus its absolute position in the byte stream. */
 type StreamSink = (chunk: Uint8Array, seq: number) => void;
 
@@ -181,7 +182,7 @@ export function useTabManager(): TabManagerState {
         const response = await invoke<AttachStreamResponse>('attach_stream', { tabId });
         replayEnd = response.replayEnd;
         const bytes = base64ToBytes(response.data);
-        if (bytes.length > 0) handler(bytes);
+        if (bytes.length > 0) handler(bytes, true);
       } catch (err) {
         // The tab can legitimately disappear while we are attaching to it
         // (open then immediately close); anything else is worth showing.

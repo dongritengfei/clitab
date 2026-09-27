@@ -74,10 +74,11 @@ export const TabList: React.FC<TabListProps> = ({
         aria-orientation="vertical"
         onKeyDown={onKeyDown}
       >
-        {tabs.map((tab) => (
+        {tabs.map((tab, index) => (
           <TabItem
             key={tab.id}
             tab={tab}
+            index={index}
             isActive={tab.id === activeTabId}
             onClick={() => onTabClick(tab.id)}
             onClose={() => onTabClose(tab.id)}

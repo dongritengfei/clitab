@@ -95,9 +95,44 @@ button:focus-visible {
   }
 }
 
-.tab-title {
+/* Position number, doubling as the ⌘<number> switch hint. Quiet by default;
+   the title stays the prominent part of the tab. */
+.tab-index {
+  flex-shrink: 0;
+  align-self: flex-start;
+  width: 16px;
+  font-size: 11px;
+  line-height: 16px; /* matches the title's line box, so the two align */
+  text-align: center;
+  color: #6c7086;
+  font-variant-numeric: tabular-nums;
+}
+
+.tab-item.active .tab-index {
+  color: #89b4fa;
+}
+
+.tab-text {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tab-title {
   font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Second line: the working directory, deliberately quiet — the title names
+   the tab, the path only locates it. */
+.tab-cwd {
+  font-size: 11px;
+  color: #6c7086;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -125,6 +160,27 @@ button:focus-visible {
 
 .tab-close:hover {
   color: #f38ba8;
+}
+
+/* Full-name tooltip for a clipped tab title. Portaled to <body> and anchored
+   beside the tab; `translateY(-50%)` centers it on the row. */
+.tab-tooltip {
+  position: fixed;
+  z-index: 1000;
+  transform: translateY(-50%);
+  max-width: 60vw;
+  padding: 6px 10px;
+  background: #313244;
+  color: #cdd6f4;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.4);
+  /* Long paths have no spaces to wrap on, so break within the word. */
+  overflow-wrap: anywhere;
+  white-space: normal;
+  pointer-events: none;
 }
 
 .new-tab-button {

@@ -5,7 +5,11 @@ import { TabItem } from './TabItem';
 interface TabListProps {
   tabs: Tab[];
   activeTabId: string | null;
+  /** Activate without moving focus out of the list; used by arrow navigation. */
   onTabClick: (tabId: string) => void;
+  /** Activate a tab from a deliberate gesture (click, Enter, Space): the
+   *  caret must end up in that tab's terminal. */
+  onTabActivate: (tabId: string) => void;
   onTabClose: (tabId: string) => void;
   onNewTab: () => void;
 }
@@ -14,6 +18,7 @@ export const TabList: React.FC<TabListProps> = ({
   tabs,
   activeTabId,
   onTabClick,
+  onTabActivate,
   onTabClose,
   onNewTab,
 }) => {
@@ -81,7 +86,7 @@ export const TabList: React.FC<TabListProps> = ({
             index={index}
             count={tabs.length}
             isActive={tab.id === activeTabId}
-            onClick={() => onTabClick(tab.id)}
+            onClick={() => onTabActivate(tab.id)}
             onClose={() => onTabClose(tab.id)}
           />
         ))}

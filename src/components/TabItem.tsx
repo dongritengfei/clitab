@@ -106,8 +106,14 @@ export const TabItem: React.FC<TabItemProps> = ({
       // Select on press, like browser tab strips: WKWebView's tap-to-click
       // synthesis intermittently drops the synthesized `click`, which made
       // trackpad taps need a second try. mousedown always arrives.
+      // preventDefault keeps the browser from focusing the row: focus must
+      // land in the terminal (App.activateTab does that), or the next arrow
+      // keys would navigate the tab list instead of reaching the shell.
       onMouseDown={(event) => {
-        if (event.button === 0) onClick();
+        if (event.button === 0) {
+          event.preventDefault();
+          onClick();
+        }
       }}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {

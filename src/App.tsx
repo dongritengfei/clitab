@@ -1,3 +1,4 @@
+import { useCallback } from 'react';
 import { TabList } from './components/TabList';
 import { Terminal } from './components/Terminal';
 import { useTabManager } from './hooks/useTabManager';
@@ -18,12 +19,30 @@ function App() {
     resizePty,
   } = useTabManager();
 
+  // Clicking (or pressing Enter/Space on) a tab must land the caret in its
+  // terminal — also when it is already the active one, where no `isActive`
+  // transition runs. rAF: React has flushed by then, so the panel is visible
+  // and its xterm helper textarea (the real input target) can take focus.
+  const activateTab = useCallback(
+    (tabId: string) => {
+      switchTab(tabId);
+      requestAnimationFrame(() => {
+        document
+          .getElementById(`panel-${tabId}`)
+          ?.querySelector<HTMLElement>('.xterm-helper-textarea')
+          ?.focus();
+      });
+    },
+    [switchTab]
+  );
+
   return (
     <div className="app-container">
       <TabList
         tabs={tabs}
         activeTabId={activeTabId}
         onTabClick={switchTab}
+        onTabActivate={activateTab}
         onTabClose={closeTab}
         onNewTab={createTab}
       />

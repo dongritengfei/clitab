@@ -107,3 +107,7 @@ npm test            # cargo test --lib:OSC 解析器、注册表、shell 集成
   (`clitab-<tab-id>`),绝不使用固定共享路径,并随会话删除。
 - **Capabilities** 在 `src-tauri/capabilities/default.json`;其中的 `windows`
   列表必须与配置里的 `app.windows[].label` 一致。
+
+## 许可
+
+MIT,见 [LICENSE](LICENSE)。

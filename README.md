@@ -120,3 +120,7 @@ npm test            # cargo test --lib: OSC parser, registry, shell integration
   session.
 - **Capabilities** live in `src-tauri/capabilities/default.json`; the `windows`
   list there must match `app.windows[].label` in the config.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

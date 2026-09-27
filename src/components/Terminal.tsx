@@ -18,40 +18,63 @@ const MIN_SIZE = 10;
 /** Debounce so dragging the window does not spam the PTY with resize ioctls. */
 const RESIZE_DEBOUNCE_MS = 60;
 
-/* macOS "tap to click" synthesizes the same mouse events for a trackpad tap
-   as for a physical click, so "tap, then tap again and swipe" (tap-to-drag)
-   reaches the web layer looking exactly like a deliberate drag — its moves
-   even carry buttons=0, so event state cannot identify them. The one usable
-   difference is rhythm: the swipe's mousedown lands right after the first
-   tap's mouseup at the same spot, and its first real movement follows within
-   a few hundred ms, while a deliberate press-hold-drag pauses longer before
-   moving. A drag matching that signature has its mousemoves stopped before
-   xterm's selection listener sees them, so nothing gets selected. */
-/** Max time between the tap's mouseup and the swipe's mousedown. */
-const TAP_SWIPE_GAP_MS = 300;
-/** Max distance between those two points. */
-const TAP_SWIPE_POS_PX = 24;
-/** A drag that starts moving sooner than this after mousedown is a swipe.
-    Measured on real trackpad data: a tap-to-drag swipe's first >3px move lands
-    ~250-290ms after the synthesized mousedown (second-tap dwell plus swipe
-    ramp-up), while a deliberate press-hold pauses longer before moving. */
-const TAP_SWIPE_HOLD_MS = 400;
+/* macOS "tap to click" reaches WKWebView as fully synthesized mouse events,
+   and the tap-to-drag gesture ("tap, then tap again and swipe") produces an
+   accidental text selection in xterm. Measured on a real Force Touch trackpad,
+   the gestures are separable by per-event physical state — no timing windows:
+
+     - A deliberate tap / double-tap: the synthesized click's mousedown
+       carries buttons=1 (the system committed a real click).
+     - A real press-drag: mousedown buttons=1, every mousemove buttons=1, and
+       webkitmouseforcechanged fires continuously as finger pressure ramps.
+     - Tap-to-drag: a stream of buttons=0 mousemoves (the swipe, delivered
+       with no button held at all) bracketed by synthesized clicks whose
+       mousedown also carries buttons=0 — no physical press exists at any
+       point. When the two taps land close together, macOS scores such a
+       click as detail>=2, and xterm turns that double-click into a word
+       selection: this is the accidental highlight. (The swipe's moves are
+       inert: xterm's drag window is the 7ms between the synthesized
+       down/up, and the moves never fall inside it.)
+
+   So multi-click selection semantics are only honored when the click carries
+   physical button state; a buttonless multi-click is stopped before xterm's
+   selection service. WebKit also varies where the swipe sits: the moves can
+   follow the synthesized 7ms click (inert — xterm's drag window is closed),
+   or the down/up can bracket the entire swipe (dangerous — xterm extends the
+   selection on every move inside its own drag without checking buttons), so
+   moves inside a buttonless gesture are held back too. Single clicks always
+   pass (cursor placement), and a real press-drag is untouched end to end. */
 
 /** Cursor-ups in a replay above which the producer is a repaint-style TUI.
     Plain shell output emits essentially none; ink/Claude Code emits one per
     repaint, so a ring full of them means the replay starts mid-frame. */
 const REDRAW_HEAVY_CURSOR_UPS = 8;
 
+/** What a replayed ring buffer contains, which decides how it may be used. */
+type ReplayKind =
+  /** Ordinary sequential output: replaying it reconstructs the screen. */
+  | 'plain'
+  /** Repaint-style TUI output on the normal screen (ink/Claude Code). The
+      replay starts mid-frame, so executing it leaves the *visible* screen
+      misaligned — but the content it pushes into the scrollback is exactly
+      the recent history the user wants to keep browsing. Replay it, then
+      home + ED2: that clears the visible screen without touching the
+      scrollback, and the TUI's next repaint resyncs on the empty screen. */
+  | 'redraw'
+  /** The ring ends inside the alternate screen (vim, less, …). A full-screen
+      app has no meaningful scrollback history, its repaint assumes alt-screen
+      state, and the mid-replay clear semantics differ — drop it and let the
+      app repaint itself. */
+  | 'alt-screen';
+
 /**
- * Whether a replay must be dropped in favour of a clean start + forced
- * repaint. Repaint-style TUIs (ink/Claude Code on the normal screen, vim &
- * friends on the alternate screen) redraw with cursor-relative sequences
- * (cursor-up N, overwrite); a replay that starts mid-frame executes fewer
- * cursor-ups than the TUI expects, leaving xterm's cursor below the TUI's
- * assumed position, so every later repaint lands misaligned and ghost lines
- * accumulate. The replay cannot be repaired — only skipped.
+ * Classify a replay by scanning its escape sequences. Repaint-style TUIs
+ * redraw with cursor-relative moves (cursor-up N, overwrite); a replay that
+ * starts mid-frame executes fewer cursor-ups than the TUI expects, so a ring
+ * full of them cannot reconstruct the visible screen — but it still carries
+ * the recent output as scrollback (see ReplayKind).
  */
-function replayNeedsCleanStart(bytes: Uint8Array): boolean {
+function classifyReplay(bytes: Uint8Array): ReplayKind {
   let inAlt = false;
   let cursorUps = 0;
   for (let i = 0; i + 3 <= bytes.length; i++) {
@@ -74,7 +97,8 @@ function replayNeedsCleanStart(bytes: Uint8Array): boolean {
     }
     i = j;
   }
-  return inAlt || cursorUps > REDRAW_HEAVY_CURSOR_UPS;
+  if (inAlt) return 'alt-screen';
+  return cursorUps > REDRAW_HEAVY_CURSOR_UPS ? 'redraw' : 'plain';
 }
 
 export const Terminal: React.FC<TerminalProps> = ({
@@ -134,6 +158,28 @@ export const Terminal: React.FC<TerminalProps> = ({
       callbacks.current.onInput(tabId, new TextEncoder().encode(data));
     });
 
+    // xterm.js implements neither modifyOtherKeys nor the kitty keyboard
+    // protocol, so Shift+Enter would reach the shell as a plain CR — Claude
+    // Code (which enables the kitty keyboard protocol at startup) would
+    // submit the prompt instead of inserting a newline. Send the kitty CSI-u
+    // encoding of Shift+Enter ourselves, exactly what a kitty-protocol
+    // terminal would deliver.
+    term.attachCustomKeyEventHandler((event) => {
+      if (
+        event.key === 'Enter' &&
+        event.shiftKey &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey
+      ) {
+        if (event.type === 'keydown' && !event.repeat) {
+          callbacks.current.onInput(tabId, new TextEncoder().encode('\x1b[13;2u'));
+        }
+        return false;
+      }
+      return true;
+    });
+
     term.onResize(({ cols, rows }) => {
       if (cols < 1 || rows < 1) return;
       window.clearTimeout(resizeTimer);
@@ -160,85 +206,72 @@ export const Terminal: React.FC<TerminalProps> = ({
     fit();
 
     // Replay whatever the PTY produced before we were listening, then stream.
-    // A replay of repaint-style TUI output is dropped (see
-    // replayNeedsCleanStart): the misaligned cursor it leaves behind ghosts
-    // every later repaint. The next repaint the TUI emits on its own (spinner
-    // tick, keypress, window resize) then lands on the empty screen, where
-    // its cursor-relative moves clamp to the top and resync — a forced
-    // extra repaint would only risk two frames of differing heights
-    // overwriting each other partially, which is its own ghost source.
-    let replaySkipped = false;
+    // How the replay is used depends on what it contains (see classifyReplay):
+    // plain output reconstructs the screen as-is; a repaint-style TUI ring is
+    // executed for its scrollback (the recent conversation stays browsable)
+    // and the misaligned visible screen is then cleared with home + ED2,
+    // which leaves the scrollback untouched — the TUI's next repaint (spinner
+    // tick, keypress, window resize) lands on the empty screen, where its
+    // cursor-relative moves clamp to the top and resync; an alt-screen ring
+    // is dropped entirely and the app repaints itself.
     void callbacks.current
       .attach(tabId, (chunk, isReplay) => {
         if (disposed) return;
-        if (isReplay && replayNeedsCleanStart(chunk)) {
-          replaySkipped = true;
+        if (!isReplay) {
+          term.write(chunk);
           return;
         }
-        term.write(chunk);
-      })
-      .then(() => {
-        if (!replaySkipped || disposed) return;
-        // The program enabled modifyOtherKeys back at session start, long
-        // before the ring window; re-assert it locally so shift+enter keeps
-        // reporting as its own key instead of a plain CR in this new view.
-        term.write('\x1b[>4;2m');
+        switch (classifyReplay(chunk)) {
+          case 'alt-screen':
+            return;
+          case 'redraw':
+            term.write(chunk);
+            // Home + ED2: clear the visible screen, keep the replayed
+            // history in the scrollback.
+            term.write('\x1b[H\x1b[2J');
+            return;
+          case 'plain':
+            term.write(chunk);
+            return;
+        }
       });
 
-    // Tap-swipe suppression (see the constants above for the rationale).
-    let lastUp: { time: number; x: number; y: number } | null = null;
-    let drag: {
-      downTime: number;
-      downX: number;
-      downY: number;
-      undecided: boolean;
-      accidental: boolean;
-    } | null = null;
+    // Synthesized-gesture filtering (see the block comment above for the
+    // measured-data rationale). Every event macOS synthesizes for a tap or
+    // tap-to-drag carries buttons=0 — no physical press exists — while a real
+    // press-drag carries buttons=1 on its mousedown and every mousemove.
+    // Two state-based filters, no timing windows:
+    //   1. A buttonless multi-click is tap machinery, not a deliberate
+    //      double-click: it never reaches xterm's selection service.
+    //   2. While a buttonless gesture is down, its moves never reach xterm's
+    //      document-level drag listener either — WebKit sometimes brackets
+    //      the whole swipe between the synthesized down/up, and xterm
+    //      extends the selection on any move inside its own drag without
+    //      checking buttons. A detail=1 buttonless down still passes (tap to
+    //      place the cursor); with its moves held back, the gesture ends as
+    //      the plain click it physically was.
+    let synthesizedGesture = false;
 
     const onMouseDown = (event: MouseEvent) => {
       if (event.button !== 0) return;
-      const nearLastUp =
-        lastUp !== null &&
-        event.timeStamp - lastUp.time < TAP_SWIPE_GAP_MS &&
-        Math.abs(event.clientX - lastUp.x) < TAP_SWIPE_POS_PX &&
-        Math.abs(event.clientY - lastUp.y) < TAP_SWIPE_POS_PX;
-      drag = {
-        downTime: event.timeStamp,
-        downX: event.clientX,
-        downY: event.clientY,
-        undecided: nearLastUp,
-        accidental: false,
-      };
-    };
-
-    // Captured on window so a swipe that leaves the container is still held
-    // back; stopping propagation here keeps the move from ever reaching
-    // xterm's own document-level selection listener. `drag` alone gates this:
-    // the synthesized tap-to-drag moves arrive with buttons=0, and xterm
-    // extends its selection on any move between its own down and up.
-    const onMouseMove = (event: MouseEvent) => {
-      if (!drag) return;
-      if (drag.undecided) {
-        // Sub-3px motion is hand jitter, not a swipe; a double-click must keep
-        // its word selection, so only real movement starts the hold clock.
-        const dx = event.clientX - drag.downX;
-        const dy = event.clientY - drag.downY;
-        if (dx * dx + dy * dy < 9) return;
-        const hold = event.timeStamp - drag.downTime;
-        drag.accidental = hold < TAP_SWIPE_HOLD_MS;
-        drag.undecided = false;
-        // The double-tap half of the gesture may already have made xterm
-        // select the word under the cursor; an accidental drag keeps nothing.
-        if (drag.accidental) term.clearSelection();
+      synthesizedGesture = event.buttons === 0;
+      if (synthesizedGesture && event.detail >= 2) {
+        event.stopPropagation();
       }
-      if (drag.accidental) event.stopPropagation();
     };
 
     const onMouseUp = (event: MouseEvent) => {
-      if (event.button === 0) {
-        lastUp = { time: event.timeStamp, x: event.clientX, y: event.clientY };
+      if (event.button === 0) synthesizedGesture = false;
+    };
+
+    const onMouseMove = (event: MouseEvent) => {
+      if (event.buttons !== 0) {
+        // Physical button state: a real drag, never suppress (and heal a
+        // gesture window left open by a missed mouseup).
+        synthesizedGesture = false;
+        return;
       }
-      drag = null;
+      if (synthesizedGesture) event.stopPropagation();
     };
 
     container.addEventListener('mousedown', onMouseDown, true);

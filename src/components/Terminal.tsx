@@ -1,37 +1,52 @@
 import React, { useEffect, useRef } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
-import { WebglAddon } from '@xterm/addon-webgl';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 
 interface TerminalProps {
   tabId: string;
   isActive: boolean;
-  onOutput: (tabId: string, handler: (data: Uint8Array) => void) => void;
-  onUnmount: (tabId: string) => void;
+  /** Subscribe to this tab's output; resolves once the live stream is flowing. */
+  attach: (tabId: string, write: (chunk: Uint8Array) => void) => Promise<void>;
+  detach: (tabId: string) => void;
   onInput: (tabId: string, data: Uint8Array) => void;
   onResize: (tabId: string, rows: number, cols: number) => void;
 }
 
+/** Below this the container is hidden (or mid-animation) and cannot be measured. */
+const MIN_SIZE = 10;
+/** Debounce so dragging the window does not spam the PTY with resize ioctls. */
+const RESIZE_DEBOUNCE_MS = 60;
+
 export const Terminal: React.FC<TerminalProps> = ({
   tabId,
   isActive,
-  onOutput,
-  onUnmount,
+  attach,
+  detach,
   onInput,
   onResize,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
+  // The terminal is created once per tab, so the callbacks it calls must not be
+  // baked into the effect's dependency list (that would tear down the PTY view
+  // on every parent render).
+  const callbacks = useRef({ attach, detach, onInput, onResize });
+  callbacks.current = { attach, detach, onInput, onResize };
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
+
+    let disposed = false;
+    let resizeTimer: number | undefined;
 
     const term = new XTerm({
       cursorBlink: true,
       fontSize: 14,
       fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", Menlo, monospace',
+      scrollback: 5000,
       theme: {
         background: '#1e1e2e',
         foreground: '#cdd6f4',
@@ -42,60 +57,74 @@ export const Terminal: React.FC<TerminalProps> = ({
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    term.open(containerRef.current);
-
-    // Try to load WebGL addon
-    try {
-      const webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => {
-        webglAddon.dispose();
-      });
-      term.loadAddon(webglAddon);
-    } catch (e) {
-      console.warn('WebGL addon failed to load, using canvas renderer');
-    }
-
-    fitAddon.fit();
+    term.open(container);
+    fitRef.current = fitAddon;
     termRef.current = term;
-    fitAddonRef.current = fitAddon;
 
-    // Handle input
-    term.onData((data: string) => {
-      const encoder = new TextEncoder();
-      onInput(tabId, encoder.encode(data));
+    // No WebGL renderer, on purpose. Every tab keeps its terminal mounted (hidden
+    // ones use `visibility: hidden` so they stay measurable), so one GL context
+    // per tab means WKWebView eventually reclaims the oldest and fires
+    // `webglcontextlost` in a live tab. Recovering means swapping renderers, and
+    // xterm's swap disposes the old renderer before the fallback is re-attached:
+    // `RenderService.dimensions` is an unguarded `this._renderer.value.dimensions`,
+    // so one scroll tick landing after a teardown throws `undefined is not an
+    // object`. The DOM renderer has no context budget and nothing to swap; reach
+    // for @xterm/addon-canvas (2D canvas, no GL context) if output ever gets slow.
+
+    term.onData((data) => {
+      callbacks.current.onInput(tabId, new TextEncoder().encode(data));
     });
 
-    // Handle resize
     term.onResize(({ cols, rows }) => {
-      onResize(tabId, rows, cols);
+      if (cols < 1 || rows < 1) return;
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        if (!disposed) callbacks.current.onResize(tabId, rows, cols);
+      }, RESIZE_DEBOUNCE_MS);
     });
 
-    // Register output handler
-    onOutput(tabId, (data: Uint8Array) => {
-      term.write(data);
-    });
-
-    // Handle window resize
-    const handleResize = () => {
-      fitAddon.fit();
+    const fit = () => {
+      // A hidden container reports 0x0; fitting it would shrink the PTY and
+      // leave the shell wrapping lines for a size nobody can see.
+      if (container.offsetWidth < MIN_SIZE || container.offsetHeight < MIN_SIZE) return;
+      try {
+        fitAddon.fit();
+      } catch (err) {
+        console.debug('fit failed', err);
+      }
     };
-    window.addEventListener('resize', handleResize);
+
+    // Covers window resizes, tab switches and sidebar changes — no need for a
+    // `window.addEventListener('resize')` that would also hit hidden tabs.
+    const observer = new ResizeObserver(fit);
+    observer.observe(container);
+    fit();
+
+    // Replay whatever the PTY produced before we were listening, then stream.
+    void callbacks.current.attach(tabId, (chunk) => {
+      if (!disposed) term.write(chunk);
+    });
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      onUnmount(tabId);
+      disposed = true;
+      window.clearTimeout(resizeTimer);
+      observer.disconnect();
+      callbacks.current.detach(tabId);
+      if (fitRef.current === fitAddon) fitRef.current = null;
+      if (termRef.current === term) termRef.current = null;
       term.dispose();
     };
   }, [tabId]);
 
-  // Re-fit when becoming active
+  // A tab that was hidden gets its box back on activation; ResizeObserver is
+  // not guaranteed to fire for a display:none -> block change, so fit directly.
+  // Switching tabs must also move the caret, or keystrokes go to the sidebar.
   useEffect(() => {
-    if (isActive && fitAddonRef.current) {
-      // Small delay to ensure container is visible
-      setTimeout(() => {
-        fitAddonRef.current?.fit();
-      }, 50);
-    }
+    const container = containerRef.current;
+    if (!isActive || !container) return;
+    if (container.offsetWidth < MIN_SIZE || container.offsetHeight < MIN_SIZE) return;
+    fitRef.current?.fit();
+    termRef.current?.focus();
   }, [isActive]);
 
   return <div ref={containerRef} className="terminal-container" />;

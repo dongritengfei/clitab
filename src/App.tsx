@@ -1,4 +1,3 @@
-import { useCallback } from 'react';
 import { TabList } from './components/TabList';
 import { Terminal } from './components/Terminal';
 import { useTabManager } from './hooks/useTabManager';
@@ -8,61 +7,54 @@ function App() {
   const {
     tabs,
     activeTabId,
+    error,
+    dismissError,
     createTab,
     closeTab,
     switchTab,
-    registerOutputHandler,
-    unregisterOutputHandler,
+    attachTab,
+    detachTab,
     writeInput,
     resizePty,
   } = useTabManager();
-
-  const handleTabClick = useCallback(
-    (tabId: string) => {
-      switchTab(tabId);
-    },
-    [switchTab]
-  );
-
-  const handleTabClose = useCallback(
-    (tabId: string) => {
-      closeTab(tabId);
-    },
-    [closeTab]
-  );
-
-  const handleNewTab = useCallback(() => {
-    createTab();
-  }, [createTab]);
-
-  const activeTab = tabs.find((t) => t.id === activeTabId);
 
   return (
     <div className="app-container">
       <TabList
         tabs={tabs}
         activeTabId={activeTabId}
-        onTabClick={handleTabClick}
-        onTabClose={handleTabClose}
-        onNewTab={handleNewTab}
+        onTabClick={switchTab}
+        onTabClose={closeTab}
+        onNewTab={createTab}
       />
       <div className="terminal-area">
+        {error && (
+          <div className="error-banner" role="alert">
+            <span>{error}</span>
+            <button onClick={dismissError} aria-label="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
         {tabs.length === 0 ? (
           <div className="empty-state">
             <p>No tabs open</p>
-            <button onClick={handleNewTab}>Create a new tab</button>
+            <button onClick={createTab}>Create a new tab</button>
           </div>
         ) : (
           tabs.map((tab) => (
             <div
               key={tab.id}
+              id={`panel-${tab.id}`}
+              role="tabpanel"
+              aria-labelledby={`tab-${tab.id}`}
               className={`terminal-wrapper ${tab.id === activeTabId ? 'active' : ''}`}
             >
               <Terminal
                 tabId={tab.id}
                 isActive={tab.id === activeTabId}
-                onOutput={registerOutputHandler}
-                onUnmount={unregisterOutputHandler}
+                attach={attachTab}
+                detach={detachTab}
                 onInput={writeInput}
                 onResize={resizePty}
               />

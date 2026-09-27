@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useRef } from 'react';
 import { Tab } from '../types';
 import { TabItem } from './TabItem';
 
@@ -17,12 +17,63 @@ export const TabList: React.FC<TabListProps> = ({
   onTabClose,
   onNewTab,
 }) => {
+  const itemsRef = useRef<HTMLDivElement>(null);
+
+  // Arrow navigation inside the tablist: activate and move focus in one step,
+  // which is what a vertical tablist is expected to do.
+  const focusTab = useCallback(
+    (index: number) => {
+      const count = tabs.length;
+      if (count === 0) return;
+      const tab = tabs[(index + count) % count];
+      if (!tab) return;
+      onTabClick(tab.id);
+      itemsRef.current
+        ?.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(tab.id)}"]`)
+        ?.focus();
+    },
+    [tabs, onTabClick]
+  );
+
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    const active = tabs.findIndex((tab) => tab.id === activeTabId);
+    const current = active < 0 ? 0 : active;
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowRight':
+        event.preventDefault();
+        focusTab(current + 1);
+        break;
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        event.preventDefault();
+        focusTab(current - 1);
+        break;
+      case 'Home':
+        event.preventDefault();
+        focusTab(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        focusTab(tabs.length - 1);
+        break;
+      default:
+        break;
+    }
+  };
+
   return (
-    <div className="tab-list">
+    <nav className="tab-list" aria-label="Terminals">
       <div className="tab-list-header">
         <span>Terminal Tabs</span>
       </div>
-      <div className="tab-list-items">
+      <div
+        className="tab-list-items"
+        ref={itemsRef}
+        role="tablist"
+        aria-orientation="vertical"
+        onKeyDown={onKeyDown}
+      >
         {tabs.map((tab) => (
           <TabItem
             key={tab.id}
@@ -36,6 +87,6 @@ export const TabList: React.FC<TabListProps> = ({
       <button className="new-tab-button" onClick={onNewTab}>
         + New Tab
       </button>
-    </div>
+    </nav>
   );
 };

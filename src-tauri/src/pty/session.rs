@@ -1,9 +1,30 @@
-use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem, ChildKiller};
+use super::lock;
+use super::registry::Registry;
+use super::shell_integration;
+use crate::osc::{self, OscEvent, OscParser};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use crate::osc::{OscEvent, OscParser};
+
+/// Size the PTY starts with, until the frontend reports the real one.
+const INITIAL_ROWS: u16 = 24;
+const INITIAL_COLS: u16 = 80;
+/// Bigger chunks mean fewer IPC round-trips on noisy commands.
+const READ_CHUNK: usize = 16 * 1024;
+/// Cap on the per-tab replay ring: the most recent bytes of PTY output, handed
+/// to the renderer whenever a terminal view (re)attaches. Keeps a tab usable
+/// across a webview reload instead of leaving it blank.
+const REPLAY_LIMIT: usize = 256 * 1024;
+/// A quiet period while an assistant turn is in flight means it needs input.
+const TURN_IDLE: Duration = Duration::from_secs(2);
+const WATCHER_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -13,303 +34,335 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
 }
 
+/// Routing of PTY output for one tab.
+#[derive(Debug, Default)]
+struct StreamState {
+    /// A terminal view is attached: chunks are emitted live as well as ringed.
+    attached: bool,
+    /// Sliding window of the most recent output, replayed on attach.
+    recent: VecDeque<u8>,
+    /// Total bytes ever pushed into the ring. Every emitted chunk carries the
+    /// position it starts at, and `attach_stream` reports the position the
+    /// replay ends at, so a renderer that re-attaches (webview reload) can drop
+    /// live chunks the replay already covered instead of writing them twice.
+    position: u64,
+}
+
+/// Append to the replay ring, dropping from the front once it is full.
+fn push_recent(ring: &mut VecDeque<u8>, data: &[u8]) {
+    ring.extend(data.iter().copied());
+    let overflow = ring.len().saturating_sub(REPLAY_LIMIT);
+    for _ in 0..overflow {
+        ring.pop_front();
+    }
+}
+
 pub struct PtySession {
-    pub tab_id: String,
-    pub cwd: String,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child_killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// False once the child process is gone.
+    running: Arc<AtomicBool>,
+    stream: Arc<Mutex<StreamState>>,
+    /// Deleting the per-tab shell rc files happens in `Drop`.
+    integration: shell_integration::Prepared,
 }
 
 impl PtySession {
-    pub fn new(tab_id: String, app: AppHandle) -> Result<Self, SessionError> {
+    /// Spawn `cwd`'s shell in a fresh PTY and start pumping its output.
+    pub fn new(
+        tab_id: String,
+        cwd: String,
+        app: AppHandle,
+        registry: Arc<Registry>,
+    ) -> Result<Self, SessionError> {
         let pty_system = NativePtySystem::default();
-
         let pair = pty_system
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows: INITIAL_ROWS,
+                cols: INITIAL_COLS,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| SessionError::Pty(e.to_string()))?;
 
-        let cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string();
-
-        // Determine shell
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
-
-        let mut cmd = CommandBuilder::new(&shell);
+        // An unset (or empty) $SHELL must still produce a usable shell.
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let shell = if shell.is_empty() { "bash".to_string() } else { shell };
+        let integration = shell_integration::prepare(&tab_id, &shell);
+        let mut cmd = CommandBuilder::new(&integration.shell);
+        for arg in &integration.args {
+            cmd.arg(arg);
+        }
+        for (key, value) in &integration.env {
+            cmd.env(key, value);
+        }
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "clitab");
 
-        // Shell integration: inject hooks to send OSC 7 (cwd) on prompt
-        let shell_name = std::path::Path::new(&shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("bash");
-
-        match shell_name {
-            "zsh" => {
-                // For zsh, use ZDOTDIR with a wrapper .zshrc
-                let zdotdir = std::env::var("ZDOTDIR").unwrap_or_else(|_| {
-                    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
-                });
-                cmd.env("CLITAB_ZDOTDIR", &zdotdir);
-                cmd.env("CLITAB_SHELL_INTEGRATION", "1");
+        let mut child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                integration.cleanup();
+                return Err(SessionError::Pty(e.to_string()));
             }
-            "bash" => {
-                cmd.env("CLITAB_SHELL_INTEGRATION", "1");
-            }
-            _ => {}
-        }
+        };
 
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| SessionError::Pty(e.to_string()))?;
-
-        // Drop slave to allow EOF detection
+        // The master must hold the last handle to the slave side, otherwise the
+        // reader never sees EOF when the shell exits.
         drop(pair.slave);
 
-        let reader = pair
+        // The child is already running: if grabbing the reader/writer fails we
+        // must not leave an orphaned shell or its rc files behind.
+        let handles = pair
             .master
             .try_clone_reader()
-            .map_err(|e| SessionError::Pty(e.to_string()))?;
-
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| SessionError::Pty(e.to_string()))?;
-
-        let child_killer = child.clone_killer();
+            .and_then(|reader| pair.master.take_writer().map(|writer| (reader, writer)))
+            .map_err(|e| SessionError::Pty(e.to_string()));
+        let (reader, writer) = match handles {
+            Ok(handles) => handles,
+            Err(e) => {
+                let _ = child.kill();
+                integration.cleanup();
+                return Err(e);
+            }
+        };
+        let killer = child.clone_killer();
 
         let master = Arc::new(Mutex::new(pair.master));
         let writer = Arc::new(Mutex::new(writer));
-        let child_killer = Arc::new(Mutex::new(Some(child_killer)));
+        let child_killer = Arc::new(Mutex::new(Some(killer)));
+        let running = Arc::new(AtomicBool::new(true));
+        let stream = Arc::new(Mutex::new(StreamState::default()));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
 
-        // Inject shell integration after a short delay
-        let writer_clone = writer.clone();
-        let shell_name_owned = shell_name.to_string();
-        thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_millis(300));
+        // Set while a program that owns the title (Claude Code) is in the
+        // foreground, and cleared when its turn ends / the shell prompt returns.
+        let program_active = Arc::new(AtomicBool::new(false));
 
-            let integration_code = match shell_name_owned.as_str() {
-                "zsh" => {
-                    r#"
-# clitab shell integration
-_clitab_claude_running=0
-_clitab_preexec() {
-    if [[ "$1" == *"claude"* ]]; then
-        _clitab_claude_running=1
-    fi
-}
-_clitab_precmd() {
-    printf '\e]7;file://%s%s\e\\' "$(hostname)" "$PWD"
-    if [[ $_clitab_claude_running -eq 1 ]]; then
-        _clitab_claude_running=0
-        printf '\e]9;claude-done\e\\'
-    fi
-}
-[[ -z "${preexec_functions[*]}" ]] && preexec_functions=()
-preexec_functions+=(_clitab_preexec)
-[[ -z "${precmd_functions[*]}" ]] && precmd_functions=()
-precmd_functions+=(_clitab_precmd)
-"#
+        // Reader thread: pump PTY output into the renderer + OSC parser.
+        {
+            let tab_id = tab_id.clone();
+            let app = app.clone();
+            let stream = Arc::clone(&stream);
+            let running = Arc::clone(&running);
+            let last_activity = Arc::clone(&last_activity);
+            let program_active = Arc::clone(&program_active);
+            thread::spawn(move || {
+                Self::read_loop(
+                    tab_id,
+                    app,
+                    registry,
+                    reader,
+                    stream,
+                    running,
+                    last_activity,
+                    program_active,
+                );
+            });
+        }
+
+        // Attention watcher: an assistant turn that stops producing output for
+        // a while is waiting for the user, so flash the tab (once per turn).
+        {
+            let tab_id = tab_id.clone();
+            let app = app.clone();
+            let running = Arc::clone(&running);
+            let last_activity = Arc::clone(&last_activity);
+            let program_active = Arc::clone(&program_active);
+            thread::spawn(move || {
+                let mut flashed = false;
+                while running.load(Ordering::Relaxed) {
+                    thread::sleep(WATCHER_POLL);
+                    if !program_active.load(Ordering::Relaxed) {
+                        flashed = false;
+                        continue;
+                    }
+                    let idle = lock(&last_activity).elapsed();
+                    if idle < TURN_IDLE {
+                        continue; // still streaming
+                    }
+                    if !flashed {
+                        flashed = true;
+                        let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                    }
                 }
-                "bash" => {
-                    r#"
-# clitab shell integration
-_clitab_claude_running=0
-_clitab_preexec() {
-    if [[ "$BASH_COMMAND" == *"claude"* ]]; then
-        _clitab_claude_running=1
-    fi
-}
-_clitab_prompt() {
-    printf '\e]7;file://%s%s\e\\' "$(hostname)" "$PWD"
-    if [[ $_clitab_claude_running -eq 1 ]]; then
-        _clitab_claude_running=0
-        printf '\e]9;claude-done\e\\'
-    fi
-}
-trap '_clitab_preexec' DEBUG
-PROMPT_COMMAND="_clitab_prompt;${PROMPT_COMMAND:-}"
-"#
-                }
-                _ => "",
-            };
-            if !integration_code.is_empty() {
-                // Write to temp file and source it
-                let tmp_path = std::env::temp_dir().join(".clitab_integration.sh");
-                let _ = std::fs::write(&tmp_path, integration_code);
+            });
+        }
 
-                if let Ok(mut w) = writer_clone.lock() {
-                    // Source the file (command will be echoed but that's OK)
-                    let source_cmd = format!(". {}\n", tmp_path.display());
-                    let _ = w.write_all(source_cmd.as_bytes());
-                    let _ = w.flush();
-                }
-            }
-        });
-
-        // Spawn reader thread
-        let tab_id_clone = tab_id.clone();
-        let app_clone = app.clone();
-
-        thread::spawn(move || {
-            Self::read_loop(tab_id_clone, app_clone, reader);
-        });
-
-        // Spawn exit watcher thread
-        let tab_id_exit = tab_id.clone();
-        let app_exit = app.clone();
-
-        thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                let _ = app_exit.emit("tab-exit", serde_json::json!({
-                    "tab_id": tab_id_exit,
-                    "code": status.exit_code()
-                }));
-            }
-        });
+        // Exit watcher: report the child's status and stop every other thread.
+        {
+            let app = app.clone();
+            let running = Arc::clone(&running);
+            let program_active = Arc::clone(&program_active);
+            thread::spawn(move || {
+                // Even when wait() itself fails the child is gone as far as we
+                // are concerned; skipping the event would strand a dead tab in
+                // both the renderer and the session map.
+                let code = child.wait().map(|status| status.exit_code()).unwrap_or(u32::MAX);
+                program_active.store(false, Ordering::Relaxed);
+                running.store(false, Ordering::SeqCst);
+                let _ =
+                    app.emit("tab-exit", serde_json::json!({ "tab_id": tab_id, "code": code }));
+            });
+        }
 
         Ok(Self {
-            tab_id,
-            cwd,
             writer,
             child_killer,
             master,
+            running,
+            stream,
+            integration,
         })
     }
 
-    fn read_loop(tab_id: String, app: AppHandle, mut reader: Box<dyn Read + Send>) {
-        let mut buf = [0u8; 4096];
+    #[allow(clippy::too_many_arguments)]
+    fn read_loop(
+        tab_id: String,
+        app: AppHandle,
+        registry: Arc<Registry>,
+        mut reader: Box<dyn Read + Send>,
+        stream: Arc<Mutex<StreamState>>,
+        running: Arc<AtomicBool>,
+        last_activity: Arc<Mutex<Instant>>,
+        program_active: Arc<AtomicBool>,
+    ) {
+        let mut buf = vec![0u8; READ_CHUNK];
         let mut parser = OscParser::new();
-
-        // Output idle detection: flash when output stops for 2 seconds (only when Claude is active)
-        let last_output = Arc::new(Mutex::new(std::time::Instant::now()));
-        let pending = Arc::new(Mutex::new(false));
-        let claude_active = Arc::new(Mutex::new(false));
-
-        let last_output_clone = last_output.clone();
-        let pending_clone = pending.clone();
-        let claude_active_clone = claude_active.clone();
-        let tab_id_flash = tab_id.clone();
-        let app_flash = app.clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(std::time::Duration::from_millis(500));
-                let is_claude_active = claude_active_clone.lock().ok().map(|c| *c).unwrap_or(false);
-                if !is_claude_active {
-                    continue; // Only check when Claude is running
-                }
-                let last = last_output_clone.lock().ok().map(|l| *l);
-                if let Some(last_time) = last {
-                    if last_time.elapsed() > std::time::Duration::from_secs(2) {
-                        let mut p = pending_clone.lock().unwrap();
-                        if *p {
-                            *p = false;
-                            let _ = app_flash.emit("tab-flash", serde_json::json!({
-                                "tab_id": tab_id_flash
-                            }));
-                        }
-                    }
-                }
-            }
-        });
 
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
+                Ok(0) => break, // EOF: the shell is gone
                 Ok(n) => {
                     let data = &buf[..n];
+                    *lock(&last_activity) = Instant::now();
 
-                    // Update last output time and set pending flash
-                    if let Ok(mut last) = last_output.lock() {
-                        *last = std::time::Instant::now();
-                    }
-                    if let Ok(mut p) = pending.lock() {
-                        *p = true;
-                    }
-
-                    // Parse for OSC events
-                    let events = parser.parse(data);
-                    for event in events {
-                        match event {
-                            OscEvent::TitleChanged(title) => {
-                                // Detect if Claude is running based on title
-                                // Claude sets title to session name (not a path)
-                                let is_path = title.starts_with('/') || title.starts_with('~');
-                                let is_claude = !is_path && title.len() > 3;
-                                if let Ok(mut active) = claude_active.lock() {
-                                    *active = is_claude;
-                                }
-
-                                let _ = app.emit("tab-title", serde_json::json!({
-                                    "tab_id": tab_id,
-                                    "title": title
-                                }));
-                            }
-                            OscEvent::CwdChanged(cwd) => {
-                                let _ = app.emit("tab-cwd", serde_json::json!({
-                                    "tab_id": tab_id,
-                                    "cwd": cwd
-                                }));
-                            }
-                            OscEvent::Bell => {
-                                let _ = app.emit("tab-flash", serde_json::json!({
-                                    "tab_id": tab_id
-                                }));
-                            }
-                            OscEvent::PromptReady => {
-                                let _ = app.emit("tab-flash", serde_json::json!({
-                                    "tab_id": tab_id
-                                }));
-                                let _ = app.emit("prompt-ready", serde_json::json!({
-                                    "tab_id": tab_id
-                                }));
-                            }
-                        }
+                    for event in parser.parse(data) {
+                        Self::handle_osc(
+                            &tab_id,
+                            &app,
+                            &registry,
+                            &program_active,
+                            &last_activity,
+                            event,
+                        );
                     }
 
-                    // Forward all data to frontend
-                    let _ = app.emit("pty-output", serde_json::json!({
-                        "tab_id": tab_id,
-                        "data": data
-                    }));
+                    // The ring is filled whether or not anyone is watching, so a
+                    // later attach can rebuild the screen. Emitting while still
+                    // holding the lock is what keeps the byte stream ordered
+                    // against a concurrent `attach_stream`. Chunks that were in
+                    // flight when the renderer re-attached carry a position the
+                    // replay already covers; the renderer dedups on it.
+                    let mut state = lock(&stream);
+                    push_recent(&mut state.recent, data);
+                    if state.attached {
+                        emit_output(&app, &tab_id, data, state.position);
+                    }
+                    state.position += data.len() as u64;
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
+            }
+        }
+
+        running.store(false, Ordering::SeqCst);
+    }
+
+    fn handle_osc(
+        tab_id: &str,
+        app: &AppHandle,
+        registry: &Registry,
+        program_active: &AtomicBool,
+        last_activity: &Mutex<Instant>,
+        event: OscEvent,
+    ) {
+        match event {
+            OscEvent::TitleChanged(title) => {
+                // Claude Code names the session; a plain shell reports a path.
+                let is_path = osc::looks_like_path(&title);
+                let is_program_title = !is_path && title.chars().count() > 3;
+                program_active.store(is_program_title, Ordering::Relaxed);
+                registry.set_title(tab_id, &title, is_program_title);
+                // The classification travels with the event so the renderer
+                // does not have to mirror (and drift from) this heuristic.
+                let _ = app.emit(
+                    "tab-title",
+                    serde_json::json!({
+                        "tab_id": tab_id,
+                        "title": title,
+                        "program_title": is_program_title,
+                    }),
+                );
+            }
+            OscEvent::CwdChanged(cwd) => {
+                registry.set_cwd(tab_id, &cwd);
+                let _ = app.emit(
+                    "tab-cwd",
+                    serde_json::json!({ "tab_id": tab_id, "cwd": cwd }),
+                );
+            }
+            OscEvent::Bell => {
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            }
+            OscEvent::PromptReady => {
+                // The assistant's turn ended and the prompt came back.
+                program_active.store(false, Ordering::Relaxed);
+                registry.clear_program_title(tab_id);
+                *lock(last_activity) = Instant::now();
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }
         }
     }
 
+    /// Attach this tab's stream to the renderer: everything currently in the
+    /// replay ring, oldest first, plus the stream position the replay ends at.
+    /// Later chunks are emitted live as well, each tagged with its position.
+    pub fn attach_stream(&self) -> (Vec<u8>, u64) {
+        let mut state = lock(&self.stream);
+        state.attached = true;
+        (state.recent.iter().copied().collect(), state.position)
+    }
+
+    /// Stop emitting to the renderer; the replay ring keeps filling regardless.
+    /// Called when a tab's view unmounts (React remount, tab closed) so nothing
+    /// is sent into a listener that no longer exists.
+    pub fn detach(&self) {
+        lock(&self.stream).attached = false;
+    }
+
     pub fn write(&self, data: &[u8]) -> Result<(), SessionError> {
-        let mut writer = self.writer.lock().map_err(|e| SessionError::Pty(e.to_string()))?;
+        let mut writer = lock(&self.writer);
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError> {
-        let master = self.master.lock().map_err(|e| SessionError::Pty(e.to_string()))?;
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }).map_err(|e| SessionError::Pty(e.to_string()))?;
+        let master = lock(&self.master);
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| SessionError::Pty(e.to_string()))?;
         Ok(())
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     pub fn kill(&self) {
-        if let Ok(mut killer) = self.child_killer.lock() {
-            if let Some(mut k) = killer.take() {
-                let _ = k.kill();
-            }
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(mut killer) = lock(&self.child_killer).take() {
+            let _ = killer.kill();
         }
     }
 }
@@ -317,5 +370,93 @@ PROMPT_COMMAND="_clitab_prompt;${PROMPT_COMMAND:-}"
 impl Drop for PtySession {
     fn drop(&mut self) {
         self.kill();
+        self.integration.cleanup();
+    }
+}
+
+/// Forward raw PTY bytes. They travel base64-encoded because a Tauri event
+/// payload is JSON: serialising bytes as a number array costs roughly four
+/// times the bandwidth on every chunk of output.
+fn emit_output(app: &AppHandle, tab_id: &str, data: &[u8], seq: u64) {
+    let _ = app.emit(
+        "pty-output",
+        serde_json::json!({
+            "tab_id": tab_id,
+            "data": BASE64.encode(data),
+            "seq": seq,
+        }),
+    );
+}
+
+/// Where a new tab starts. A bundled macOS app launched from Finder has `/` as
+/// its working directory, which would otherwise open every tab at the root.
+pub fn default_cwd() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.is_dir() {
+            return cwd;
+        }
+    }
+    PathBuf::from("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_preserves_byte_order() {
+        let mut ring = VecDeque::new();
+        push_recent(&mut ring, b"abc");
+        push_recent(&mut ring, b"\x1b]0;t\x07");
+        let bytes: Vec<u8> = ring.into_iter().collect();
+        assert_eq!(bytes, b"abc\x1b]0;t\x07");
+    }
+
+    #[test]
+    fn ring_keeps_the_newest_bytes_when_full() {
+        let chunk = vec![0xABu8; REPLAY_LIMIT / 2];
+        let mut ring = VecDeque::new();
+        for i in 0..6 {
+            let mut block = chunk.clone();
+            // Tag the tail of every block so we can identify the boundary.
+            block[REPLAY_LIMIT / 2 - 1] = i;
+            push_recent(&mut ring, &block);
+        }
+
+        // Never more than the cap, and what remains is the *newest* tail.
+        assert_eq!(ring.len(), REPLAY_LIMIT);
+        assert_eq!(ring.back(), Some(&5), "the newest block survives");
+        assert_eq!(
+            ring.iter().filter(|b| **b == 4).count(),
+            1,
+            "block 4 should still be there"
+        );
+        for evicted in 0..4u8 {
+            assert_eq!(
+                ring.iter().filter(|b| **b == evicted).count(),
+                0,
+                "block {evicted} should have been evicted"
+            );
+        }
+    }
+
+    /// Eviction must come off the front, never the back: the newest bytes are
+    /// the ones a re-attaching terminal needs.
+    #[test]
+    fn a_full_ring_evicts_only_from_the_front() {
+        let mut ring = VecDeque::new();
+        push_recent(&mut ring, &vec![7u8; REPLAY_LIMIT]);
+        push_recent(&mut ring, b"xy");
+
+        assert_eq!(ring.len(), REPLAY_LIMIT, "the cap must hold exactly");
+        assert_eq!(ring.front(), Some(&7u8), "oldest surviving byte");
+        assert_eq!(ring.iter().filter(|b| **b == b'x').count(), 1);
+        assert_eq!(ring.back(), Some(&b'y'), "newest byte last");
     }
 }

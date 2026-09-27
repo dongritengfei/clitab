@@ -63,8 +63,23 @@ body {
 }
 
 .tab-item.active {
-  background: #1e1e2e;
+  background: #313244;
   border-left-color: #89b4fa;
+}
+
+/* The active tab must be pickable at a glance: it names the terminal on the
+   right, so it gets both a filled background and an accent-colored title. */
+.tab-item.active .tab-title {
+  color: #89b4fa;
+  font-weight: 600;
+}
+
+/* Keyboard users need to see where they are; `:focus-visible` keeps the ring
+   off mouse clicks. */
+.tab-item:focus-visible,
+button:focus-visible {
+  outline: 2px solid #89b4fa;
+  outline-offset: -2px;
 }
 
 .tab-item.flashing {
@@ -142,12 +157,45 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  display: none;
   margin: 12px;
+  /* Hidden tabs keep their box (instead of `display: none`) so the renderer can
+     still measure them: the PTY keeps the same size across a tab switch, and a
+     program like vim does not have to redraw the whole screen. */
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .terminal-wrapper.active {
-  display: block;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* Error Banner */
+.error-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #3a1d27;
+  border-bottom: 1px solid #f38ba8;
+  color: #f5c2c7;
+  font-size: 13px;
+}
+
+.error-banner button {
+  background: none;
+  border: none;
+  color: #f5c2c7;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
 }
 
 .terminal-container {

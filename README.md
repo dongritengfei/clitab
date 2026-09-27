@@ -38,7 +38,8 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 
 ## Install (macOS)
 
-Download the latest `.dmg` from [Releases](../../releases) and drag **clitab**
+Download the `.dmg` for your chip from [Releases](../../releases) —
+`aarch64` for Apple Silicon (M1–M4), `x64` for Intel — and drag **clitab**
 into Applications.
 
 The app is not code-signed or notarized yet, so on first launch macOS will
@@ -48,8 +49,7 @@ refuse to open it. Either right-click the app and choose **Open**, or run:
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
 
-The current release is an Intel (x64) build; on Apple Silicon it runs through
-Rosetta 2.
+Both builds are native; nothing needs Rosetta.
 
 ## Claude Code integration
 

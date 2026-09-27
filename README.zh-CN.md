@@ -30,7 +30,8 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 
 ## 安装 (macOS)
 
-从 [Releases](../../releases) 下载最新 `.dmg`,把 **clitab** 拖入应用程序。
+从 [Releases](../../releases) 按芯片下载 `.dmg`——Apple Silicon(M1–M4)选
+`aarch64`,Intel 选 `x64`——把 **clitab** 拖入应用程序。
 
 应用尚未签名和公证,首次启动 macOS 会拒绝打开:右键点击应用选择**打开**,
 或执行:
@@ -39,7 +40,7 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
 
-当前发布为 Intel (x64) 构建;Apple Silicon 上通过 Rosetta 2 运行。
+两种构建均为对应芯片原生运行,无需 Rosetta。
 
 ## Claude Code 集成
 

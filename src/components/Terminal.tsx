@@ -54,7 +54,7 @@ const REDRAW_HEAVY_CURSOR_UPS = 8;
 function replayNeedsCleanStart(bytes: Uint8Array): boolean {
   let inAlt = false;
   let cursorUps = 0;
-  for (let i = 0; i + 3 < bytes.length; i++) {
+  for (let i = 0; i + 3 <= bytes.length; i++) {
     if (bytes[i] !== 0x1b || bytes[i + 1] !== 0x5b) continue;
     let j = i + 2;
     const privateMode = bytes[j] === 0x3f;

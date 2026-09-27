@@ -162,27 +162,6 @@ button:focus-visible {
   color: #f38ba8;
 }
 
-/* Full-name tooltip for a clipped tab title. Portaled to <body> and anchored
-   beside the tab; `translateY(-50%)` centers it on the row. */
-.tab-tooltip {
-  position: fixed;
-  z-index: 1000;
-  transform: translateY(-50%);
-  max-width: 60vw;
-  padding: 6px 10px;
-  background: #313244;
-  color: #cdd6f4;
-  border: 1px solid #45475a;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.4;
-  box-shadow: 0 4px 16px rgb(0 0 0 / 0.4);
-  /* Long paths have no spaces to wrap on, so break within the word. */
-  overflow-wrap: anywhere;
-  white-space: normal;
-  pointer-events: none;
-}
-
 .new-tab-button {
   margin: 8px 12px;
   padding: 8px 12px;

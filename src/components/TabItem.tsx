@@ -1,11 +1,12 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import { Tab } from '../types';
 
 interface TabItemProps {
   tab: Tab;
-  /** Zero-based position; shown as the ⌘<number> switch hint. */
+  /** Zero-based position in the tab list. */
   index: number;
+  /** Total number of tabs; with index decides the ⌘<number> badge. */
+  count: number;
   isActive: boolean;
   onClick: () => void;
   onClose: () => void;
@@ -15,8 +16,9 @@ interface TabItemProps {
 const CHAR_WIDTH = 7.2;
 /** Same, at the smaller cwd line's font size. */
 const CWD_CHAR_WIDTH = 6.1;
-/** Space reserved for the number badge, close button, and padding. */
-const CHROME_WIDTH = 54;
+/** Space reserved for the non-text parts of a row: 3px border-left +
+ *  16px/4px padding + 16px badge + 2×4px gaps + 20px close button. */
+const CHROME_WIDTH = 67;
 
 /**
  * Shorten a path from the left: the tail is what identifies a tab, so
@@ -53,18 +55,17 @@ export function shortenPath(path: string, availableChars: number): string {
   return `…${joined}`;
 }
 
-/** Delay before the full-name tooltip appears, so sweeping the cursor across
- *  the tab list does not strobe a tooltip for every row. */
-const TOOLTIP_DELAY_MS = 350;
-
-export const TabItem: React.FC<TabItemProps> = ({ tab, index, isActive, onClick, onClose }) => {
+export const TabItem: React.FC<TabItemProps> = ({
+  tab,
+  index,
+  count,
+  isActive,
+  onClick,
+  onClose,
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const titleRef = useRef<HTMLSpanElement>(null);
-  const hoverTimer = useRef<number | undefined>(undefined);
   const [displayTitle, setDisplayTitle] = useState(tab.title);
   const [displayCwd, setDisplayCwd] = useState(tab.cwd);
-  // Full title plus where to anchor the tooltip; null keeps it hidden.
-  const [tooltip, setTooltip] = useState<{ text: string; x: number; y: number } | null>(null);
 
   // A path title is the working directory, so shorten it; a program title
   // (Claude Code naming its session) is shown as the author intended.
@@ -86,33 +87,14 @@ export const TabItem: React.FC<TabItemProps> = ({ tab, index, isActive, onClick,
     setDisplayCwd(container ? shortenPath(tab.cwd, cwdAvailable) : tab.cwd);
   }, [tab.title, tab.cwd, isPath]);
 
-  // Clear any pending tooltip timer on unmount so it can't fire on a dead node.
-  useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
-
-  const handleTitleEnter = () => {
-    const title = titleRef.current;
-    const container = containerRef.current;
-    if (!title || !container) return;
-    window.clearTimeout(hoverTimer.current);
-    hoverTimer.current = window.setTimeout(() => {
-      // Only worth showing when the name is clipped: either shortened by
-      // shortenPath (displayTitle differs) or cut by CSS ellipsis (overflow).
-      if (displayTitle === tab.title && title.scrollWidth <= title.clientWidth) return;
-      const rect = container.getBoundingClientRect();
-      setTooltip({ text: tab.title, x: rect.right + 8, y: rect.top + rect.height / 2 });
-    }, TOOLTIP_DELAY_MS);
-  };
-
-  const handleTitleLeave = () => {
-    window.clearTimeout(hoverTimer.current);
-    setTooltip(null);
-  };
+  // ⌘9 targets the last tab (macOS convention), so with more than 9 tabs
+  // positions 9..n-1 have no shortcut of their own and get no badge.
+  const badge = count > 9 && index >= 8 ? (index === count - 1 ? 9 : null) : index + 1;
 
   return (
     <div
       ref={containerRef}
       className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''}`}
-      onClick={onClick}
       // Tabs are switched with the keyboard too, so make them reachable.
       role="tab"
       id={`tab-${tab.id}`}
@@ -134,18 +116,14 @@ export const TabItem: React.FC<TabItemProps> = ({ tab, index, isActive, onClick,
         }
       }}
     >
-      {/* ⌘1–⌘9 switch tabs by position; showing the number makes the
-          shortcut discoverable. Decorative: ATs get it via aria-posinset. */}
+      {/* The badge doubles as the ⌘<number> hint, and always matches what
+          the shortcut actually does. Decorative: ATs get position via
+          aria-posinset. */}
       <span className="tab-index" aria-hidden="true">
-        {index + 1}
+        {badge ?? ''}
       </span>
       <div className="tab-text">
-        <span
-          ref={titleRef}
-          className="tab-title"
-          onMouseEnter={handleTitleEnter}
-          onMouseLeave={handleTitleLeave}
-        >
+        <span className="tab-title" title={tab.title}>
           {displayTitle}
         </span>
         {showCwd && (
@@ -158,25 +136,10 @@ export const TabItem: React.FC<TabItemProps> = ({ tab, index, isActive, onClick,
         className="tab-close"
         aria-label={`Close ${tab.title}`}
         onMouseDown={(event) => event.stopPropagation()}
-        onClick={(event) => {
-          event.stopPropagation();
-          onClose();
-        }}
+        onClick={onClose}
       >
         ×
       </button>
-      {/* Portaled so the sidebar's overflow cannot clip it. */}
-      {tooltip &&
-        createPortal(
-          <div
-            className="tab-tooltip"
-            style={{ left: tooltip.x, top: tooltip.y }}
-            role="tooltip"
-          >
-            {tooltip.text}
-          </div>,
-          document.body
-        )}
     </div>
   );
 };

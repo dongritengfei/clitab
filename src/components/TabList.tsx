@@ -79,6 +79,7 @@ export const TabList: React.FC<TabListProps> = ({
             key={tab.id}
             tab={tab}
             index={index}
+            count={tabs.length}
             isActive={tab.id === activeTabId}
             onClick={() => onTabClick(tab.id)}
             onClose={() => onTabClose(tab.id)}

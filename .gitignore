@@ -23,3 +23,7 @@ src-tauri/gen/
 # Logs
 *.log
 npm-debug.log*
+
+# tauri icon also emits mobile icon sets; this project is desktop-only
+src-tauri/icons/ios/
+src-tauri/icons/android/

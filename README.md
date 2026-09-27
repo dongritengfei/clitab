@@ -43,11 +43,15 @@ Download the `.dmg` for your chip from [Releases](../../releases) —
 into Applications.
 
 The app is not code-signed or notarized yet, so on first launch macOS will
-refuse to open it. Either right-click the app and choose **Open**, or run:
+refuse to open it. Clear the quarantine flag once, either in Terminal:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
+
+or via System Settings → **Privacy & Security** → scroll down → **Open
+Anyway**. (On macOS 15 Sequoia and later, the old right-click → Open
+trick no longer bypasses Gatekeeper for unsigned apps.)
 
 Both builds are native; nothing needs Rosetta.
 

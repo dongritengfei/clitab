@@ -33,12 +33,15 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 从 [Releases](../../releases) 按芯片下载 `.dmg`——Apple Silicon(M1–M4)选
 `aarch64`,Intel 选 `x64`——把 **clitab** 拖入应用程序。
 
-应用尚未签名和公证,首次启动 macOS 会拒绝打开:右键点击应用选择**打开**,
-或执行:
+应用尚未签名和公证,首次启动 macOS 会拒绝打开。执行一次以下命令移除隔离
+标记:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
+
+或:系统设置 → **隐私与安全性** → 向下滚动 → 点击**仍要打开**。
+(macOS 15 Sequoia 起,"右键 → 打开"对未签名应用不再有效。)
 
 两种构建均为对应芯片原生运行,无需 Rosetta。
 

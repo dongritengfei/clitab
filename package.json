@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "sign:macos": "sh scripts/macos-sign.sh",
+    "package:macos": "tauri build --bundles app && npm run sign:macos"
   },
   "dependencies": {
     "@fontsource/jetbrains-mono": "^5.3.0",

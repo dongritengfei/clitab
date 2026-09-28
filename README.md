@@ -42,16 +42,20 @@ Download the `.dmg` for your chip from [Releases](../../releases) —
 `aarch64` for Apple Silicon (M1–M4), `x64` for Intel — and drag **clitab**
 into Applications.
 
-The app is not code-signed or notarized yet, so on first launch macOS will
-refuse to open it. Clear the quarantine flag once, either in Terminal:
+Release builds are ad-hoc signed but not notarized. A downloaded `.dmg`
+still carries the quarantine attribute, so on first launch macOS will
+refuse to open the app. Clear the quarantine flag once, either in Terminal:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
 
 or via System Settings → **Privacy & Security** → scroll down → **Open
-Anyway**. (On macOS 15 Sequoia and later, the old right-click → Open
-trick no longer bypasses Gatekeeper for unsigned apps.)
+Anyway**. (On macOS 15 Sequoia and later, right-click → Open no longer
+bypasses Gatekeeper for an ad-hoc signature like this one.)
+
+Building from source (`npm run package:macos`) needs no such step: the
+bundle is ad-hoc signed and never quarantined, so it opens directly.
 
 Both builds are native; nothing needs Rosetta.
 

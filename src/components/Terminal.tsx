@@ -161,6 +161,57 @@ export const Terminal: React.FC<TerminalProps> = ({
       callbacks.current.onInput(tabId, new TextEncoder().encode(data));
     });
 
+    /* WKWebView delivers IME-committed punctuation ( “ 《 『 …) as a plain
+       `input` event *before* the keystroke's own keydown (WebKit #25119), while
+       xterm.js gates its input-event fallback on "no keydown seen yet"
+       (`!e.composed || !this._keyDownSeen` in CompositionHelper._inputEvent) —
+       the still-held Shift's keydown already set that flag, so the commit is
+       dropped (the "type twice to see it" symptom, xterm.js #6144/#5887).
+       Recover exactly those dropped commits, and nothing else:
+
+       - Mirror xterm's `_keyDownSeen` (true on any keydown, false on any
+         keyup). When it is false at an `input`, xterm's gate passed and it
+         already sent `ev.data` — stay out.
+       - Send `ev.data` alone, never the textarea's value: xterm never clears
+         the hidden textarea after a composition commit, so its content is
+         stale residue (earlier pinyin commits) and forwarding it wholesale
+         duplicates already-delivered text.
+       - An `input` whose data equals the preceding keydown's key is normal
+         ordered typing (ABC): xterm's keydown/keypress path owns it. */
+    let lastKeyDownKey: string | undefined;
+    let keyDownSeen = false;
+    let composing = false;
+
+    const onKeyDownSeen = (ev: Event) => {
+      keyDownSeen = true;
+      lastKeyDownKey = (ev as KeyboardEvent).key;
+    };
+    const onKeyUpSeen = () => {
+      keyDownSeen = false;
+    };
+    const onCompositionStart = () => {
+      composing = true;
+    };
+    const onCompositionEnd = () => {
+      composing = false;
+    };
+    const onInputAfterXterm = (ev: Event) => {
+      const ie = ev as InputEvent;
+      if (ie.inputType !== 'insertText' || ie.isComposing || composing || !ie.data) return;
+      if (!keyDownSeen) return; // xterm's gate passed: it sent ev.data itself
+      if (lastKeyDownKey === ie.data) return; // keydown path already sent it
+      callbacks.current.onInput(tabId, new TextEncoder().encode(ie.data));
+      const ta = container.querySelector('textarea');
+      if (ta) ta.value = ''; // hygiene only: nothing reads the textarea again
+    };
+    container.addEventListener('keydown', onKeyDownSeen, true);
+    container.addEventListener('keyup', onKeyUpSeen, true);
+    container.addEventListener('compositionstart', onCompositionStart, true);
+    container.addEventListener('compositionend', onCompositionEnd, true);
+    // Bubble phase on the container: runs after xterm's own textarea listener,
+    // so the mirror state observed here matches what xterm's gate saw.
+    container.addEventListener('input', onInputAfterXterm);
+
     // xterm.js implements neither modifyOtherKeys nor the kitty keyboard
     // protocol, so Shift+Enter would reach the shell as a plain CR — Claude
     // Code (which enables the kitty keyboard protocol at startup) would
@@ -288,6 +339,11 @@ export const Terminal: React.FC<TerminalProps> = ({
       container.removeEventListener('mousedown', onMouseDown, true);
       window.removeEventListener('mousemove', onMouseMove, true);
       window.removeEventListener('mouseup', onMouseUp, true);
+      container.removeEventListener('keydown', onKeyDownSeen, true);
+      container.removeEventListener('keyup', onKeyUpSeen, true);
+      container.removeEventListener('compositionstart', onCompositionStart, true);
+      container.removeEventListener('compositionend', onCompositionEnd, true);
+      container.removeEventListener('input', onInputAfterXterm);
       callbacks.current.detach(tabId);
       if (fitRef.current === fitAddon) fitRef.current = null;
       if (termRef.current === term) termRef.current = null;

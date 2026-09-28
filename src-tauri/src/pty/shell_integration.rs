@@ -8,7 +8,13 @@
 //! Instead we hand the shell an rc file that it reads *by itself* on startup:
 //!
 //!   * bash -> `bash --rcfile <wrapper>`
-//!   * zsh  -> `ZDOTDIR=<wrapper dir>`
+//!   * zsh  -> `zsh -l` with `ZDOTDIR=<wrapper dir>`
+//!
+//! A Finder-launched app inherits launchd's minimal PATH, so the shells must
+//! come up the way a terminal emulator starts them: as login shells, letting
+//! path_helper (`/etc/zprofile`, `/etc/profile`) and the user's profile
+//! restore the full PATH. zsh gets `-l`; bash 3.2 ignores `--rcfile` in login
+//! mode, so its wrapper sources `/etc/profile` itself.
 //!
 //! The user's own `.zshenv`, `.zprofile` and `.zlogin` are linked into the zsh
 //! wrapper directory, so zsh's startup order is preserved.
@@ -126,9 +132,13 @@ fn bash(tab_id: &str, shell_path: &str) -> Prepared {
     };
 
     // An interactive non-login bash only reads ~/.bashrc, and `--rcfile`
-    // overrides exactly that. Source the first rc file the user actually has.
+    // overrides exactly that. Source /etc/profile (what a login bash runs
+    // first; on macOS it invokes path_helper to build the full PATH) and then
+    // the first rc file the user actually has. `bash --login` is not an
+    // option: bash 3.2 ignores --rcfile in login mode, losing these hooks.
     let contents = "\
 # clitab shell integration wrapper
+[ -r /etc/profile ] && . /etc/profile
 for __clitab_rc in \"$HOME/.bashrc\" \"$HOME/.bash_profile\" \"$HOME/.bash_login\" \"$HOME/.profile\"; do
     if [ -f \"$__clitab_rc\" ]; then
         . \"$__clitab_rc\"
@@ -184,7 +194,10 @@ fn zsh(tab_id: &str, shell_path: &str) -> Prepared {
 
     Prepared {
         shell: shell_path.to_string(),
-        args: Vec::new(),
+        // Login shell: without -l, zsh skips /etc/zprofile (path_helper) and
+        // ~/.zprofile, leaving a GUI-launched app's shell with launchd's
+        // minimal PATH.
+        args: vec![String::from("-l")],
         env: vec![
             (String::from("CLITAB_ZDOTDIR"), real_zdotdir),
             (String::from("ZDOTDIR"), dir.display().to_string()),
@@ -264,6 +277,108 @@ mod tests {
 
         prepared.cleanup();
         assert!(!dir.exists());
+    }
+
+    /// A Finder-launched clitab inherits launchd's minimal PATH. The shell
+    /// must come up as a login shell (zsh) or emulate one (bash) so
+    /// path_helper and the user's profile restore the full PATH.
+    #[test]
+    fn zsh_is_prepared_as_login_shell() {
+        let prepared = prepare("5555-6666", "/bin/zsh");
+        assert!(
+            prepared.args.iter().any(|a| a == "-l"),
+            "zsh must be spawned as a login shell, got args {:?}",
+            prepared.args
+        );
+        prepared.cleanup();
+    }
+
+    #[test]
+    fn bash_wrapper_sources_etc_profile_before_user_rc() {
+        let prepared = prepare("7777-8888", "/bin/bash");
+        let dir = prepared.dir.clone().expect("wrapper dir");
+        let contents = fs::read_to_string(dir.join("bashrc")).expect("rc file");
+        let profile = contents
+            .find("/etc/profile")
+            .expect("wrapper must source /etc/profile for path_helper");
+        let user_rc = contents.find("__clitab_rc").expect("user rc loop");
+        assert!(
+            profile < user_rc,
+            "/etc/profile must be sourced before the user's rc:\n{contents}"
+        );
+        prepared.cleanup();
+    }
+
+    /// The reported bug: under a GUI app's minimal launchd PATH, tools in
+    /// /usr/local/bin (e.g. `claude`) were not found because path_helper never
+    /// ran. Spawn with a cleared env and demand /usr/local/bin shows up.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn minimal_gui_env_still_yields_full_path() {
+        use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+        use std::io::{Read, Write};
+
+        // Both shells always exist on macOS; a spawn failure is a real bug,
+        // so fail loudly instead of skipping silently.
+        for (id, shell_path) in [
+            ("probe-gui-path-zsh", "/bin/zsh"),
+            ("probe-gui-path-bash", "/bin/bash"),
+        ] {
+            let pair = NativePtySystem::default()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("openpty");
+
+            let prepared = prepare(id, shell_path);
+            let mut cmd = CommandBuilder::new(&prepared.shell);
+            for arg in &prepared.args {
+                cmd.arg(arg);
+            }
+            cmd.env_clear();
+            cmd.env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+            cmd.env("TERM", "xterm-256color");
+            // What launchd hands a Finder-launched app: no /usr/local/bin.
+            cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            for (key, value) in &prepared.env {
+                cmd.env(key, value);
+            }
+
+            let mut child = pair
+                .slave
+                .spawn_command(cmd)
+                .unwrap_or_else(|e| panic!("spawning {shell_path}: {e}"));
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().expect("reader");
+            let mut writer = pair.master.take_writer().expect("writer");
+
+            // The marker is split so the tty's echo of the typed command
+            // (`HAS_LO""CAL_BIN`) cannot satisfy the assertion by itself.
+            writer
+                .write_all(
+                    b"case \":$PATH:\" in *\":/usr/local/bin:\"*) echo HAS_LO\"\"CAL_BIN ;; esac\nexit\n",
+                )
+                .ok();
+            writer.flush().ok();
+
+            let mut output = String::new();
+            let mut buf = [0u8; 4096];
+            while output.len() < 64 * 1024 {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+            let _ = child.wait();
+            prepared.cleanup();
+            assert!(
+                output.contains("HAS_LOCAL_BIN"),
+                "{shell_path}: /usr/local/bin missing from PATH under a GUI-like env:\n{output}"
+            );
+        }
     }
 
     #[test]

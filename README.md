@@ -10,6 +10,23 @@ attention, so a row of parallel agents stays glanceable.
 Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 [xterm.js](https://xtermjs.org).
 
+## Screenshots
+
+![Three tabs, each a live shell named after its working directory](docs/screenshots/tabs.png)
+
+Every tab is a real shell named after its working directory — three
+projects side by side in one window.
+
+![A Claude Code session running in a tab](docs/screenshots/session.png)
+
+Run `claude` in any tab: while the session runs, the tab switches from
+the directory to the session's own title, and reverts when the turn ends.
+
+![A background tab lit up because its session needs attention](docs/screenshots/attention.png)
+
+When a session needs you, its tab flashes (BEL / OSC 9) — a row of
+parallel agents stays glanceable from whichever tab you are in.
+
 ## Features
 
 - **Real PTY tabs** — each tab spawns your `$SHELL` through a per-tab

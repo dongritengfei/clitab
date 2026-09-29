@@ -9,6 +9,22 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 基于 [Tauri 2](https://tauri.app)(Rust + portable-pty)与
 [xterm.js](https://xtermjs.org) 构建。
 
+## 截图
+
+![三个标签,每个都是按工作目录命名的真实 shell](docs/screenshots/tabs.png)
+
+每个标签都是一个真实 shell,以工作目录命名 —— 三个项目并排,只占一个窗口。
+
+![在标签中运行的 Claude Code 会话](docs/screenshots/session.png)
+
+在任意标签里运行 `claude`:会话期间标签改用会话自己的标题,回合结束后
+恢复为目录名。
+
+![后台标签因会话需要关注而亮起](docs/screenshots/attention.png)
+
+会话需要你时响铃(BEL / OSC 9),后台标签随之闪烁 —— 一排并行 agent
+的状态,在任何一个标签里都一目了然。
+
 ## 特性
 
 - **真实 PTY 标签** — 每个标签通过独立的伪终端启动你的 `$SHELL`;

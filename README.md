@@ -42,24 +42,29 @@ Download the `.dmg` for your chip from [Releases](../../releases) —
 `aarch64` for Apple Silicon (M1–M4), `x64` for Intel — and drag **clitab**
 into Applications.
 
-Release builds are ad-hoc signed but **not notarized**, and a downloaded
-file carries the quarantine attribute, so macOS blocks the first launch:
-double-clicking the app (or right-click → Open) reports that it "cannot be
-opened" / cannot verify the developer. Allow it once:
+Release builds are ad-hoc signed but **not notarized**, and downloaded
+files carry the quarantine attribute, so on a fresh download macOS
+Gatekeeper intervenes twice — once for the `.dmg`, once for the app.
+Both are one-time **Open Anyway** clicks:
 
-1. Double-click (or right-click → Open) **clitab**; in the warning dialog
-   click **Cancel** — not "Move to Trash".
-2. Open **System Settings → Privacy & Security**.
-3. Scroll down to the **Security** section: a notice says the use of
-   clitab was blocked because it is not from an identified developer,
-   next to an **Open Anyway** button.
-4. Click **Open Anyway** and confirm with your password (or Touch ID).
-   The app launches; this is a one-time step.
+1. Double-click the `.dmg`; macOS refuses with a dialog saying the file
+   "cannot be opened" / does not have permission to open it. Click
+   **OK**.
+2. Open **System Settings → Privacy & Security** and scroll to the
+   **Security** section: "*clitab_0.1.0_….dmg* was blocked to protect
+   your Mac" with an **Open Anyway** button. Click it and confirm with
+   your password (or Touch ID); the disk image then mounts normally.
+3. Drag **clitab** into Applications. The first time you open it, the
+   app itself is blocked the same way: back in **Privacy & Security**,
+   click **Open Anyway** next to "*clitab* was blocked…". One-time —
+   later launches open normally.
 
-If you prefer the Terminal, the equivalent one-time command:
+Terminal shortcut (skips both prompts): clear the quarantine flag on the
+downloaded `.dmg` *before* opening it; apps copied from it then inherit
+nothing:
 
 ```bash
-xattr -d com.apple.quarantine /Applications/clitab.app
+xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
 ```
 
 (On macOS 15 Sequoia and later, right-click → Open no longer bypasses

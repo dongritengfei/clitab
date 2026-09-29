@@ -195,6 +195,24 @@ export const Terminal: React.FC<TerminalProps> = ({
     const onCompositionEnd = () => {
       composing = false;
     };
+    /* xterm keeps committed text in the hidden textarea (it only clears it on
+       Enter / Ctrl+C / blur / paste) and derives the next commit as
+       value.substring(value.length at compositionstart) — i.e. it assumes the
+       caret stays parked at the end of that residue. An unhandled key
+       (Cmd+Left) lets WebKit move the caret to offset 0, so the next
+       composition inserts its preedit *before* the residue and the commit
+       re-sends the stale character instead of the new one. Restoring xterm's
+       own "empty while not composing" invariant after every commit makes any
+       caret-moving key harmless. Queued from the bubble phase so this timeout
+       runs after xterm's own setTimeout(0) textarea read, which its
+       target-phase compositionend listener queues first. */
+    const onCompositionEndCleanup = () => {
+      setTimeout(() => {
+        if (composing) return; // a new composition already began
+        const ta = container.querySelector('textarea');
+        if (ta) ta.value = '';
+      }, 0);
+    };
     const onInputAfterXterm = (ev: Event) => {
       const ie = ev as InputEvent;
       if (ie.inputType !== 'insertText' || ie.isComposing || composing || !ie.data) return;
@@ -208,6 +226,7 @@ export const Terminal: React.FC<TerminalProps> = ({
     container.addEventListener('keyup', onKeyUpSeen, true);
     container.addEventListener('compositionstart', onCompositionStart, true);
     container.addEventListener('compositionend', onCompositionEnd, true);
+    container.addEventListener('compositionend', onCompositionEndCleanup);
     // Bubble phase on the container: runs after xterm's own textarea listener,
     // so the mirror state observed here matches what xterm's gate saw.
     container.addEventListener('input', onInputAfterXterm);
@@ -343,6 +362,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       container.removeEventListener('keyup', onKeyUpSeen, true);
       container.removeEventListener('compositionstart', onCompositionStart, true);
       container.removeEventListener('compositionend', onCompositionEnd, true);
+      container.removeEventListener('compositionend', onCompositionEndCleanup);
       container.removeEventListener('input', onInputAfterXterm);
       callbacks.current.detach(tabId);
       if (fitRef.current === fitAddon) fitRef.current = null;

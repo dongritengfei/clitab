@@ -42,17 +42,28 @@ Download the `.dmg` for your chip from [Releases](../../releases) —
 `aarch64` for Apple Silicon (M1–M4), `x64` for Intel — and drag **clitab**
 into Applications.
 
-Release builds are ad-hoc signed but not notarized. A downloaded `.dmg`
-still carries the quarantine attribute, so on first launch macOS will
-refuse to open the app. Clear the quarantine flag once, either in Terminal:
+Release builds are ad-hoc signed but **not notarized**, and a downloaded
+file carries the quarantine attribute, so macOS blocks the first launch:
+double-clicking the app (or right-click → Open) reports that it "cannot be
+opened" / cannot verify the developer. Allow it once:
+
+1. Double-click (or right-click → Open) **clitab**; in the warning dialog
+   click **Cancel** — not "Move to Trash".
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down to the **Security** section: a notice says the use of
+   clitab was blocked because it is not from an identified developer,
+   next to an **Open Anyway** button.
+4. Click **Open Anyway** and confirm with your password (or Touch ID).
+   The app launches; this is a one-time step.
+
+If you prefer the Terminal, the equivalent one-time command:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/clitab.app
 ```
 
-or via System Settings → **Privacy & Security** → scroll down → **Open
-Anyway**. (On macOS 15 Sequoia and later, right-click → Open no longer
-bypasses Gatekeeper for an ad-hoc signature like this one.)
+(On macOS 15 Sequoia and later, right-click → Open no longer bypasses
+Gatekeeper for a signature like this one — use **Open Anyway** above.)
 
 Building from source (`npm run package:macos`) needs no such step: the
 bundle is ad-hoc signed and never quarantined, so it opens directly.

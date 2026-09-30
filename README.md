@@ -39,6 +39,10 @@ parallel agents stays glanceable from whichever tab you are in.
 - **Attention flash** — a tab flashes when Claude Code asks for input or sends
   a notification (BEL / OSC 9). See [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) for the
   one-time hook setup.
+- **Tab dashboard** — with the optional Claude Code hooks (`CLAUDE_HOOKS.md`),
+  each tab shows what its session is doing: the running tool with a live
+  timer, the last turn's duration, and notifications waiting for you. Built on
+  a private OSC 7777 protocol other terminals simply ignore.
 - **Desktop-grade shortcuts** — a native menu drives ⌘T / ⌘W / ⌃Tab / ⌘1–9,
   so they work even when the terminal does not have keyboard focus. Closing a
   tab with a running process asks first.
@@ -98,23 +102,10 @@ Both builds are native; nothing needs Rosetta.
 Run `claude` in any tab like you would in a normal terminal — clitab picks up
 the session title from the escape sequences Claude Code already emits.
 
-For the attention flash, add a Notification hook to your Claude Code settings
-(`~/.claude/settings.json`) that rings the bell:
-
-```json
-{
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": ".*",
-        "hooks": [{ "type": "command", "command": "printf '\\a'" }]
-      }
-    ]
-  }
-}
-```
-
-Details and troubleshooting: [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md).
+The attention flash and the tab dashboard are powered by Claude Code hooks:
+add the configuration from [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) to your Claude
+Code settings (`~/.claude/settings.json`). That page has the details and
+troubleshooting.
 
 ## Shortcuts
 

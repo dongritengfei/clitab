@@ -7,6 +7,7 @@
 //! and means `list_tabs` survives a webview reload with the right titles.
 
 use super::lock;
+use crate::status::{Notice, TabStatus};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,13 @@ pub struct TabRecord {
     /// True when the title was set by a program (e.g. Claude Code) rather than
     /// derived from the working directory.
     pub has_program_title: bool,
+    /// Turn state reported via the OSC 7777 hook protocol; `None` until the
+    /// tab's session first speaks it (plain shell tabs never do).
+    pub status: Option<TabStatus>,
+    /// A Notification-hook message awaiting the user; orthogonal to `status`.
+    pub notice: Option<Notice>,
+    /// Epoch ms of the current turn's start, consumed by `end_turn`.
+    pub turn_start: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +44,9 @@ impl Registry {
             title: cwd.clone(),
             cwd,
             has_program_title: false,
+            status: None,
+            notice: None,
+            turn_start: None,
         };
         lock(&self.tabs).push(record.clone());
         record
@@ -79,6 +90,66 @@ impl Registry {
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
             tab.has_program_title = false;
             tab.title = tab.cwd.clone();
+        }
+    }
+
+    /// UserPromptSubmit: a turn began. Any stale notice is by definition
+    /// answered — the user just typed.
+    pub fn begin_turn(&self, id: &str, now_ms: u64) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.status = Some(TabStatus::Thinking { since: now_ms });
+            tab.turn_start = Some(now_ms);
+            tab.notice = None;
+        }
+    }
+
+    /// PreToolUse: a tool is running. When hooks are only partially installed
+    /// (no UserPromptSubmit), the first tool starts the clock so `end_turn`
+    /// can still report a duration.
+    pub fn set_tool(&self, id: &str, name: &str, now_ms: u64) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.status = Some(TabStatus::Tool {
+                name: name.to_string(),
+                since: now_ms,
+            });
+            if tab.turn_start.is_none() {
+                tab.turn_start = Some(now_ms);
+            }
+            tab.notice = None;
+        }
+    }
+
+    /// Stop: the turn ended. Duration is None when no start was ever
+    /// observed; the start mark is consumed either way.
+    pub fn end_turn(&self, id: &str, now_ms: u64) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            let duration = tab.turn_start.map(|start| now_ms.saturating_sub(start));
+            tab.status = Some(TabStatus::Done {
+                duration,
+                at: now_ms,
+            });
+            tab.turn_start = None;
+            tab.notice = None;
+        }
+    }
+
+    /// Notification: park a message for the user without touching the turn
+    /// state underneath.
+    pub fn set_notice(&self, id: &str, msg: Option<String>, now_ms: u64) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.notice = Some(Notice { msg, at: now_ms });
+        }
+    }
+
+    /// The user switched to the tab and saw the notice.
+    pub fn clear_notice(&self, id: &str) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.notice = None;
         }
     }
 
@@ -156,5 +227,119 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    use crate::status::{Notice, TabStatus};
+
+    fn status_fixture() -> Registry {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        registry
+    }
+
+    #[test]
+    fn turn_lifecycle_thinking_tool_done() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.status, Some(TabStatus::Thinking { since: 1000 }));
+        assert_eq!(tab.turn_start, Some(1000));
+
+        r.set_tool("t1", "Bash", 1500);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Tool { name: "Bash".into(), since: 1500 })
+        );
+        assert_eq!(tab.turn_start, Some(1000), "tool must not restart the clock");
+
+        r.end_turn("t1", 4200);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Done { duration: Some(3200), at: 4200 })
+        );
+        assert_eq!(tab.turn_start, None, "end_turn consumes the start mark");
+    }
+
+    /// Hooks may be only partially installed: without UserPromptSubmit the
+    /// first tool starts the clock, so Stop can still report a duration.
+    #[test]
+    fn tool_without_prompt_starts_the_clock() {
+        let r = status_fixture();
+        r.set_tool("t1", "Read", 500);
+        r.end_turn("t1", 900);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(400), at: 900 })
+        );
+    }
+
+    #[test]
+    fn stop_without_any_start_has_no_duration() {
+        let r = status_fixture();
+        r.end_turn("t1", 900);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: None, at: 900 })
+        );
+    }
+
+    #[test]
+    fn notice_is_orthogonal_to_status() {
+        let r = status_fixture();
+        r.set_tool("t1", "Bash", 100);
+        r.set_notice("t1", Some("needs permission".into()), 200);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Tool { name: "Bash".into(), since: 100 }),
+            "a notice must not clobber the turn state"
+        );
+        assert_eq!(
+            tab.notice,
+            Some(Notice { msg: Some("needs permission".into()), at: 200 })
+        );
+
+        r.clear_notice("t1");
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.notice, None);
+        assert!(matches!(tab.status, Some(TabStatus::Tool { .. })));
+    }
+
+    #[test]
+    fn turn_events_clear_the_notice() {
+        let r = status_fixture();
+        for apply in [
+            |r: &Registry| r.begin_turn("t1", 300),
+            |r: &Registry| r.set_tool("t1", "Bash", 300),
+            |r: &Registry| r.end_turn("t1", 300),
+        ] {
+            r.set_notice("t1", Some("stale".into()), 200);
+            apply(&r);
+            assert_eq!(r.get("t1").unwrap().notice, None);
+        }
+    }
+
+    #[test]
+    fn unknown_tab_status_ops_are_noops() {
+        let r = status_fixture();
+        r.begin_turn("nope", 1);
+        r.set_tool("nope", "Bash", 1);
+        r.end_turn("nope", 1);
+        r.set_notice("nope", None, 1);
+        r.clear_notice("nope");
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.status, None);
+        assert_eq!(tab.notice, None);
+    }
+
+    #[test]
+    fn fresh_tab_has_no_protocol_state() {
+        let r = status_fixture();
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.status, None);
+        assert_eq!(tab.notice, None);
+        assert_eq!(tab.turn_start, None);
     }
 }

@@ -316,6 +316,10 @@ impl PtySession {
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }
+            OscEvent::Clitab(_) => {
+                // Hook-protocol payload: wiring lands in the status-dashboard
+                // work (status.rs / handle_status). Accept as a no-op for now.
+            }
         }
     }
 

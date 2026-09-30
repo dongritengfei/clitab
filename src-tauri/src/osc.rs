@@ -22,6 +22,10 @@ pub enum OscEvent {
     CwdChanged(String),
     Bell,
     PromptReady,
+    /// OSC 7777: the clitab hook protocol. The payload is the raw text after
+    /// the first `;` (parameters rejoined losslessly); JSON semantics live in
+    /// `crate::status`, not here.
+    Clitab(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,7 +78,7 @@ impl OscParser {
                     0x1b => {
                         // Either the start of an `ESC \` (ST) terminator, or a
                         // nested OSC from truncated / binary output.
-                        self.push_param();
+                        self.flush_param();
                         self.state = State::InOscAfterEsc;
                     }
                     _ => {
@@ -114,16 +118,23 @@ impl OscParser {
         self.state = State::InOsc;
     }
 
+    /// A `;` inside the payload: always record the segment, even an empty
+    /// one, so a rejoined payload (title, JSON) keeps every separator.
     fn push_param(&mut self) {
+        self.params.push(std::mem::take(&mut self.buffer));
+    }
+
+    /// End-of-sequence flush: a trailing empty segment carries no information
+    /// and would corrupt a rejoined payload, so drop it.
+    fn flush_param(&mut self) {
         if !self.buffer.is_empty() {
-            self.params.push(self.buffer.clone());
-            self.buffer.clear();
+            self.push_param();
         }
     }
 
     /// Close the current OSC sequence and interpret it.
     fn finish_osc(&mut self) -> Vec<OscEvent> {
-        self.push_param();
+        self.flush_param();
         let event = Self::interpret(&self.params);
         self.reset();
         event.into_iter().collect()
@@ -145,12 +156,20 @@ impl OscParser {
             return None;
         }
         let code = str::from_utf8(&params[0]).ok()?;
-        let value = str::from_utf8(&params[1]).ok()?;
+        // The payload is everything after the first `;`, rejoined: `;` is a
+        // legal character inside titles, paths and OSC 7777 JSON, so the
+        // parameter split is only a framing convenience.
+        let parts: Option<Vec<&str>> = params[1..]
+            .iter()
+            .map(|p| str::from_utf8(p).ok())
+            .collect();
+        let value = parts?.join(";");
 
         match code {
-            "0" | "1" | "2" => Some(OscEvent::TitleChanged(value.to_string())),
-            "7" => Some(OscEvent::CwdChanged(parse_osc7_path(value))),
+            "0" | "1" | "2" => Some(OscEvent::TitleChanged(value)),
+            "7" => Some(OscEvent::CwdChanged(parse_osc7_path(&value))),
             "9" if value == "claude-done" => Some(OscEvent::PromptReady),
+            "7777" if !value.is_empty() => Some(OscEvent::Clitab(value)),
             _ => None,
         }
     }
@@ -369,5 +388,57 @@ mod tests {
         assert!(looks_like_path("/Users/yiyi/code"));
         assert!(looks_like_path("~/code"));
         assert!(!looks_like_path("✳ Fix the build"));
+    }
+
+    #[test]
+    fn osc7777_json_payload() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"stop\"}\x1b\\");
+        assert_eq!(events, vec![OscEvent::Clitab("{\"e\":\"stop\"}".into())]);
+    }
+
+    /// `;` is legal inside JSON strings; the parameter splitter must not eat
+    /// it, and consecutive semicolons must survive the rejoin.
+    #[test]
+    fn semicolons_inside_json_survive_rejoin() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"notify\",\"msg\":\"a;b;;c\"}\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::Clitab("{\"e\":\"notify\",\"msg\":\"a;b;;c\"}".into())]
+        );
+    }
+
+    #[test]
+    fn osc7777_empty_payload_is_ignored() {
+        let mut parser = OscParser::new();
+        assert!(parser.parse(b"\x1b]7777;\x07").is_empty());
+        assert!(parser.parse(b"\x1b]7777;\x1b\\").is_empty());
+        // The parser is still healthy afterwards.
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"prompt\"}\x07");
+        assert_eq!(events, vec![OscEvent::Clitab("{\"e\":\"prompt\"}".into())]);
+    }
+
+    #[test]
+    fn osc7777_split_across_reads() {
+        let mut parser = OscParser::new();
+        assert!(parser.parse(b"\x1b]7777;{\"e\":").is_empty());
+        let events = parser.parse(b"\"tool\",\"tool\":\"Bash\"}\x1b\\");
+        assert_eq!(
+            events,
+            vec![OscEvent::Clitab("{\"e\":\"tool\",\"tool\":\"Bash\"}".into())]
+        );
+    }
+
+    /// The rejoin also makes multi-semicolon titles faithful instead of
+    /// truncating at the first `;`.
+    #[test]
+    fn title_with_semicolon_keeps_full_payload() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]0;user@host;project\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::TitleChanged("user@host;project".into())]
+        );
     }
 }

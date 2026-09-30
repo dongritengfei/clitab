@@ -142,6 +142,10 @@ impl PtySession {
         // foreground, and cleared when its turn ends / the shell prompt returns.
         let program_active = Arc::new(AtomicBool::new(false));
 
+        // The attention watcher needs the registry too (enter_waiting), and
+        // the reader thread takes ownership of the original below.
+        let watcher_registry = Arc::clone(&registry);
+
         // Reader thread: pump PTY output into the renderer + OSC parser.
         {
             let tab_id = tab_id.clone();
@@ -172,6 +176,7 @@ impl PtySession {
             let running = Arc::clone(&running);
             let last_activity = Arc::clone(&last_activity);
             let program_active = Arc::clone(&program_active);
+            let registry = watcher_registry;
             thread::spawn(move || {
                 let mut flashed = false;
                 while running.load(Ordering::Relaxed) {
@@ -186,6 +191,7 @@ impl PtySession {
                     }
                     if !flashed {
                         flashed = true;
+                        crate::attention::enter_waiting(&app, &registry, &tab_id);
                         let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                     }
                 }
@@ -306,6 +312,7 @@ impl PtySession {
                 );
             }
             OscEvent::Bell => {
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
             }
             OscEvent::PromptReady => {
@@ -313,6 +320,9 @@ impl PtySession {
                 program_active.store(false, Ordering::Relaxed);
                 registry.clear_program_title(tab_id);
                 *lock(last_activity) = Instant::now();
+                // After clear_program_title: the notification then carries the
+                // same title the tab bar shows (the cwd it reverted to).
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }

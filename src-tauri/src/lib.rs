@@ -36,6 +36,7 @@ pub struct TabResponse {
     pub title: String,
     pub cwd: String,
     pub has_claude_title: bool,
+    pub waiting: bool,
 }
 
 impl From<TabRecord> for TabResponse {
@@ -45,6 +46,7 @@ impl From<TabRecord> for TabResponse {
             title: tab.title,
             cwd: tab.cwd,
             has_claude_title: tab.has_program_title,
+            waiting: tab.waiting,
         }
     }
 }

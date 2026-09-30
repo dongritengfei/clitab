@@ -75,6 +75,7 @@ impl TabManager {
 
         session.kill();
         self.registry.remove(tab_id);
+        crate::attention::update_badge(&self.app, &self.registry);
         Ok(())
     }
 
@@ -82,6 +83,7 @@ impl TabManager {
     pub fn remove_session(&self, tab_id: &str) {
         lock(&self.sessions).remove(tab_id);
         self.registry.remove(tab_id);
+        crate::attention::update_badge(&self.app, &self.registry);
     }
 
     /// Copy the handle out so the map lock is not held while we use it.
@@ -94,6 +96,8 @@ impl TabManager {
 
     pub fn write_input(&self, tab_id: &str, data: &[u8]) -> Result<(), ManagerError> {
         self.session(tab_id)?.write(data)?;
+        // Typing into the tab is the answer: it leaves the triage queue.
+        crate::attention::respond(&self.app, &self.registry, tab_id);
         Ok(())
     }
 

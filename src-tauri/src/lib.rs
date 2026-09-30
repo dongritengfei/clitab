@@ -1,3 +1,4 @@
+mod attention;
 mod menu;
 mod osc;
 mod pty;

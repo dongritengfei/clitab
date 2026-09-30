@@ -7,9 +7,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pty::manager::{ManagerError, TabManager};
 use pty::registry::TabRecord;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager, State};
-use tauri_plugin_dialog::DialogExt;
 
 /// Errors cross the IPC boundary as strings, so "the tab is gone" — which the
 /// renderer must tolerate silently — gets an explicit marker instead of being
@@ -157,15 +156,37 @@ pub fn run() {
                 }
             });
 
-            if let Err(e) = tab_manager.create_tab(None) {
-                // Without a PTY the window is useless, so say so out loud
-                // instead of showing an empty shell.
-                eprintln!("clitab: failed to start the initial terminal: {e}");
-                app.dialog()
-                    .message(format!("Could not start a terminal session:\n{e}"))
-                    .title("clitab")
-                    .show(|_| {});
+            let service_state = Arc::new(Mutex::new(services::ServiceState::default()));
+            #[cfg(target_os = "macos")]
+            {
+                // NSApp keeps the provider by unretained reference; leaking
+                // the singleton is the cheapest way to outlive this scope.
+                std::mem::forget(services::register(app.handle(), service_state.clone()));
             }
+
+            // The first tab is created shortly *after* startup: an app
+            // launched from Finder only receives the service request once the
+            // event loop runs, so waiting briefly lets that request become
+            // the first tab instead of stacking on an unwanted home tab.
+            // The wait must live on a thread — sleeping in `setup` would
+            // block the very event loop that delivers the request.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    services::STARTUP_GRACE_MS,
+                ));
+                let pending = pty::lock(&service_state).settle();
+                // A tab already exists only if the user beat the grace
+                // (e.g. ⌘T while the webview was loading); don't stack.
+                if !handle.state::<AppState>().tab_manager.list_tabs().is_empty() {
+                    return;
+                }
+                services::open_tab(
+                    &handle,
+                    pending.map(|p| p.to_string_lossy().into_owned()),
+                    false,
+                );
+            });
 
             Ok(())
         })

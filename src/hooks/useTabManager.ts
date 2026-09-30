@@ -11,6 +11,7 @@ import {
   type TabExitPayload,
   type TabFlashPayload,
   type TabResponse,
+  type TabStatusPayload,
   type TabTitlePayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
@@ -138,7 +139,16 @@ export function useTabManager(): TabManagerState {
 
   const switchTab = useCallback((tabId: string) => {
     setActiveTabId(tabId);
-    setTabs((prev) => prev.map((tab) => (tab.id === tabId ? { ...tab, flashing: false } : tab)));
+    // Seeing the tab acknowledges its notification: clear it here and in the
+    // registry, so a webview reload cannot resurrect an already-seen notice.
+    if (tabsRef.current.some((tab) => tab.id === tabId && tab.notice)) {
+      void invoke('ack_tab_notice', { tabId }).catch(() => {
+        /* the tab may already be gone */
+      });
+    }
+    setTabs((prev) =>
+      prev.map((tab) => (tab.id === tabId ? { ...tab, flashing: false, notice: null } : tab))
+    );
   }, []);
 
   const selectTabByIndex = useCallback(
@@ -309,6 +319,17 @@ export function useTabManager(): TabManagerState {
                   // Keep a program's title; otherwise the path is the title.
                   title: tab.hasClaudeTitle ? tab.title : payload.cwd,
                 }
+              : tab
+          )
+        );
+      }),
+      listen<TabStatusPayload>('tab-status', ({ payload }) => {
+        // The backend sends the tab's complete protocol state; replace both
+        // fields rather than merging, so a cleared notice really disappears.
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.id === payload.tab_id
+              ? { ...tab, status: payload.status, notice: payload.notice }
               : tab
           )
         );

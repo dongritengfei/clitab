@@ -34,6 +34,7 @@ Two processes, one tab identity (`tab_id`, a UUID) shared across the IPC boundar
 - `osc.rs` — byte-level OSC parser (title / cwd / BEL / `claude-done`), stateful across `parse()` calls so sequences split across PTY reads still decode. `looks_like_path()` classifies titles: path → cwd title, non-path → program (Claude) title, which drives the title-revert behavior.
 - `pty/shell_integration.rs` — per-tab rc-file wrappers (bash `--rcfile`, zsh `ZDOTDIR` with the user's `.zshenv`/`.zprofile`/`.zlogin` symlinked in) so cwd/turn-end reporting is injected without typing into the terminal. Files live in `$TMPDIR/clitab-<tab-id>` and are deleted in `PtySession::Drop`. Unsupported shells are left untouched.
 - `menu.rs` — native menu owns all keyboard shortcuts (⌘T/⌘W/⌃Tab/⌘1–9) so they work without webview focus; tab actions are forwarded to the renderer as a `menu-shortcut` event. Do not reimplement shortcuts as renderer keydown handlers.
+- `services.rs` — the Finder "New clitab Tab Here" NSServices integration: pasteboard-text → path classification, the `ServiceState` cold-start handshake (requests during the 400 ms startup grace become the initial tab's cwd), and the objc2-defined `ClitabServices` provider (macOS-gated). Backend-created tabs are announced to the renderer as a `tab-created` event carrying the same `TabResponse` shape as `create_tab`.
 
 Mutexes are locked via `pty::lock()`, which recovers from poisoning rather than panicking (a panic in a reader thread would silently kill a terminal).
 
@@ -47,7 +48,7 @@ Mutexes are locked via `pty::lock()`, which recovers from poisoning rather than 
 - **Byte transport is base64 in both directions** (PTY output events and input commands) because Tauri payloads are JSON; a number array would cost ~4× bandwidth.
 - **Re-attach dedup:** every `pty-output` chunk carries `seq` (absolute stream position); `attach_stream` returns the ring plus `replayEnd`. The renderer queues live chunks during attach, then drops/trims anything the replay already covered. When touching attach/replay code, preserve this protocol on both sides.
 - **Replay classification** (`Terminal.tsx` `classifyReplay`): a ring of repaint-style TUI output (many cursor-ups ⇒ Claude Code/ink) is replayed for scrollback then cleared with home+ED2; a ring ending in alt-screen (vim/less) is dropped entirely. Plain output replays as-is.
-- **Events (Rust → renderer):** `pty-output`, `tab-title`, `tab-cwd`, `tab-flash`, `prompt-ready`, `tab-exit`, `menu-shortcut`. `tab-exit` is also listened to inside Rust (`lib.rs`) so a shell that exits on its own is removed from the session map.
+- **Events (Rust → renderer):** `pty-output`, `tab-title`, `tab-cwd`, `tab-flash`, `prompt-ready`, `tab-exit`, `menu-shortcut`, `tab-created`. `tab-exit` is also listened to inside Rust (`lib.rs`) so a shell that exits on its own is removed from the session map.
 - The backend classifies whether a title is program-set and ships that verdict with the event; the renderer must not re-derive the heuristic (it would drift).
 
 ### Deliberate choices documented in code comments — read them before "fixing"

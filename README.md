@@ -32,6 +32,10 @@ parallel agents stays glanceable from whichever tab you are in.
 - **Real PTY tabs** — each tab spawns your `$SHELL` through a per-tab
   pseudo-terminal; tabs stay alive while hidden and keep their size. A new tab
   opens in the current tab's working directory.
+- **Open from Finder** — right-click a folder in Finder and choose
+  Services → "New clitab Tab Here" to open a tab in that directory. Works on
+  files (opens the containing folder) and on the Finder window background
+  (opens the window's folder), whether or not clitab is running.
 - **Automatic tab names** — the title is the working directory (reported by a
   shell-integration hook on every prompt), and switches to the session name
   when Claude Code sets a terminal title. It reverts to the directory when the

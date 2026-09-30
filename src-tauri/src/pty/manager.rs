@@ -131,6 +131,12 @@ impl TabManager {
             .unwrap_or(false)
     }
 
+    /// The renderer acknowledges a tab's notice by switching to it. Unknown
+    /// tabs are a silent no-op: the notice died with the tab.
+    pub fn ack_notice(&self, tab_id: &str) {
+        self.registry.clear_notice(tab_id);
+    }
+
     pub fn list_tabs(&self) -> Vec<TabRecord> {
         self.registry.list()
     }

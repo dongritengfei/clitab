@@ -3,6 +3,7 @@ use super::registry::{Registry, TabRecord};
 use super::session::{self, PtySession};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 
@@ -32,9 +33,13 @@ impl TabManager {
         }
     }
 
-    pub fn create_tab(&self) -> Result<TabRecord, ManagerError> {
+    /// `cwd` is the directory the new tab should start in — typically the
+    /// working directory of the tab that was active when the user asked for a
+    /// new one. `None` (app startup) or a directory that no longer exists
+    /// falls back to the default.
+    pub fn create_tab(&self, cwd: Option<String>) -> Result<TabRecord, ManagerError> {
         let tab_id = uuid::Uuid::new_v4().to_string();
-        let cwd = session::default_cwd().to_string_lossy().to_string();
+        let cwd = resolve_cwd(cwd).to_string_lossy().to_string();
 
         // Register the tab *before* spawning the shell: the reader thread can
         // emit a title/cwd within milliseconds of the process starting, and
@@ -128,5 +133,37 @@ impl TabManager {
 
     pub fn list_tabs(&self) -> Vec<TabRecord> {
         self.registry.list()
+    }
+}
+
+/// Where a new tab starts: the requested directory if it still exists (the
+/// source tab's cwd can be deleted out from under us), otherwise the default.
+fn resolve_cwd(requested: Option<String>) -> PathBuf {
+    if let Some(path) = requested {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    session::default_cwd()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_directory_wins_when_it_exists() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        assert_eq!(resolve_cwd(Some(dir.clone())), PathBuf::from(dir));
+    }
+
+    #[test]
+    fn missing_or_absent_request_falls_back_to_default() {
+        assert_eq!(
+            resolve_cwd(Some("/clitab-no-such-dir".into())),
+            session::default_cwd()
+        );
+        assert_eq!(resolve_cwd(None), session::default_cwd());
     }
 }

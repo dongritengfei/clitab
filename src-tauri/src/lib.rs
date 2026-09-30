@@ -57,11 +57,13 @@ pub struct AttachStreamResponse {
     pub replay_end: u64,
 }
 
+/// `cwd` is the directory the new tab should start in (the renderer passes the
+/// active tab's working directory); `None` or a stale path falls back to home.
 #[tauri::command]
-fn create_tab(state: State<'_, AppState>) -> Result<TabResponse, String> {
+fn create_tab(state: State<'_, AppState>, cwd: Option<String>) -> Result<TabResponse, String> {
     state
         .tab_manager
-        .create_tab()
+        .create_tab(cwd)
         .map(TabResponse::from)
         .map_err(|e| e.to_string())
 }
@@ -154,7 +156,7 @@ pub fn run() {
                 }
             });
 
-            if let Err(e) = tab_manager.create_tab() {
+            if let Err(e) = tab_manager.create_tab(None) {
                 // Without a PTY the window is useless, so say so out loud
                 // instead of showing an empty shell.
                 eprintln!("clitab: failed to start the initial terminal: {e}");

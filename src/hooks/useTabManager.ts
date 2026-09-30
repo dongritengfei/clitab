@@ -84,7 +84,11 @@ export function useTabManager(): TabManagerState {
 
   const createTab = useCallback(async () => {
     try {
-      const created = toTab(await invoke<TabResponse>('create_tab'));
+      // Inherit the working directory of whichever tab is active *at this
+      // moment* (after a close, that is the tab which took its place); the
+      // backend validates the path and falls back to home if it is gone.
+      const active = tabsRef.current.find((tab) => tab.id === activeTabRef.current);
+      const created = toTab(await invoke<TabResponse>('create_tab', { cwd: active?.cwd ?? null }));
       setTabs((prev) =>
         // A `list_tabs` snapshot taken after this tab existed can already
         // contain it; appending again would mount two views for one PTY.

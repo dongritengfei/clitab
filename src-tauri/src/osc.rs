@@ -46,6 +46,12 @@ pub struct OscParser {
     state: State,
     buffer: Vec<u8>,
     params: Vec<Vec<u8>>,
+    /// Bytes accumulated into `params` after the code parameter, including
+    /// the `;` separators between them — i.e. the length the rejoined
+    /// payload will have. The `buffer` cap alone cannot bound a
+    /// many-delimiter sequence, because every `;` empties the buffer; this
+    /// runs across the whole sequence instead.
+    payload_len: usize,
 }
 
 impl OscParser {
@@ -82,7 +88,9 @@ impl OscParser {
                         self.state = State::InOscAfterEsc;
                     }
                     _ => {
-                        if self.buffer.len() >= MAX_OSC_LEN {
+                        if self.buffer.len() >= MAX_OSC_LEN
+                            || self.payload_len + self.buffer.len() > MAX_OSC_LEN
+                        {
                             // Runaway sequence: drop it and resynchronise.
                             self.abort_osc();
                         } else {
@@ -115,13 +123,26 @@ impl OscParser {
     fn begin_osc(&mut self) {
         self.buffer.clear();
         self.params.clear();
+        self.payload_len = 0;
         self.state = State::InOsc;
     }
 
     /// A `;` inside the payload: always record the segment, even an empty
     /// one, so a rejoined payload (title, JSON) keeps every separator.
     fn push_param(&mut self) {
-        self.params.push(std::mem::take(&mut self.buffer));
+        let param = std::mem::take(&mut self.buffer);
+        match self.params.len() {
+            // The code parameter is framing, not payload.
+            0 => {}
+            // First payload segment: no separator precedes it.
+            1 => self.payload_len += param.len(),
+            _ => self.payload_len += param.len() + 1,
+        }
+        self.params.push(param);
+        if self.payload_len > MAX_OSC_LEN {
+            // Runaway many-delimiter sequence: drop it and resynchronise.
+            self.abort_osc();
+        }
     }
 
     /// End-of-sequence flush: a trailing empty segment carries no information
@@ -148,6 +169,7 @@ impl OscParser {
     fn reset(&mut self) {
         self.buffer.clear();
         self.params.clear();
+        self.payload_len = 0;
         self.state = State::Ground;
     }
 
@@ -359,6 +381,27 @@ mod tests {
         assert!(parser.parse(&prefixed).is_empty());
         assert!(parser.buffer.len() <= MAX_OSC_LEN);
         // The runaway payload was dropped, so a fresh sequence still parses.
+        let events = parser.parse(b"\x1b]0;OK\x07");
+        assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
+    }
+
+    /// A many-delimiter sequence must not accumulate without bounds: the cap
+    /// has to hold across parameter separators, not just within one parameter
+    /// (an unterminated `ESC ] 7777 ; ; ; …` stream must not pin every
+    /// segment forever).
+    #[test]
+    fn semicolon_run_osc_is_capped() {
+        let mut parser = OscParser::new();
+        let mut flood = vec![0x1b_u8, b']'];
+        flood.extend_from_slice(b"7777");
+        flood.resize(flood.len() + MAX_OSC_LEN * 50, b';');
+        assert!(parser.parse(&flood).is_empty());
+        assert!(
+            parser.params.len() <= MAX_OSC_LEN + 2,
+            "params grew to {} segments",
+            parser.params.len()
+        );
+        // The flood was dropped, so a fresh sequence still parses.
         let events = parser.parse(b"\x1b]0;OK\x07");
         assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
     }

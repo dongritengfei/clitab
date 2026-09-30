@@ -122,10 +122,15 @@ impl Registry {
     }
 
     /// Stop: the turn ended. Duration is None when no start was ever
-    /// observed; the start mark is consumed either way.
+    /// observed; the start mark is consumed either way. A duplicate Stop
+    /// (hooks fire once per settings level) finds no start mark and an
+    /// already-`Done` status, and must not clobber the first duration.
     pub fn end_turn(&self, id: &str, now_ms: u64) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            if tab.turn_start.is_none() && matches!(tab.status, Some(TabStatus::Done { .. })) {
+                return;
+            }
             let duration = tab.turn_start.map(|start| now_ms.saturating_sub(start));
             tab.status = Some(TabStatus::Done {
                 duration,
@@ -282,6 +287,21 @@ mod tests {
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: None, at: 900 })
+        );
+    }
+
+    /// Claude Code merges hooks across settings levels, so one turn can
+    /// receive two Stop events. The second must not erase the duration the
+    /// first one computed.
+    #[test]
+    fn duplicate_stop_keeps_first_duration() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000);
+        r.end_turn("t1", 4200);
+        r.end_turn("t1", 4300);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(3200), at: 4200 })
         );
     }
 

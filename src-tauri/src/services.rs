@@ -94,6 +94,40 @@ pub fn classify_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Create a tab from outside the renderer (startup thread or Finder service)
+/// and announce it. The renderer merges `tab-created` with its `list_tabs`
+/// snapshot using the same id-dedup as its own `createTab`, so the order of
+/// "event" vs. "webview mounted" does not matter. `focus` additionally brings
+/// the window to the front — wanted for the service path, not for startup
+/// (the window is already coming up).
+pub fn open_tab(app: &tauri::AppHandle, cwd: Option<String>, focus: bool) {
+    use tauri::{Emitter, Manager};
+    use tauri_plugin_dialog::DialogExt;
+
+    let manager = &app.state::<crate::AppState>().tab_manager;
+    match manager.create_tab(cwd) {
+        Ok(record) => {
+            let _ = app.emit("tab-created", crate::TabResponse::from(record));
+            if focus {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        Err(e) => {
+            // Same contract as the old synchronous startup path: without a
+            // PTY the window is useless, so say so out loud.
+            eprintln!("clitab: failed to open a terminal tab: {e}");
+            app.dialog()
+                .message(format!("Could not start a terminal session:\n{e}"))
+                .title("clitab")
+                .show(|_| {});
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,3 +207,98 @@ mod tests {
         assert_eq!(state.settle(), None);
     }
 }
+
+/// The NSServices provider: an ObjC class created at runtime with objc2.
+/// Registered from `lib.rs` setup; `Info.plist` declares the matching
+/// `openTab` service so Finder shows "New clitab Tab Here".
+#[cfg(target_os = "macos")]
+mod provider {
+    use super::{classify_path, open_tab, target_from_raw, ServiceState};
+    use objc2::rc::Retained;
+    use objc2::runtime::{Bool, NSObject};
+    use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker};
+    use objc2_app_kit::{
+        NSApplication, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString,
+    };
+    use objc2_foundation::NSString;
+    use std::sync::{Arc, Mutex};
+    use tauri::AppHandle;
+
+    pub(crate) struct ProviderIvars {
+        app: AppHandle,
+        state: Arc<Mutex<ServiceState>>,
+    }
+
+    define_class!(
+        // SAFETY: `NSObject` has no subclassing requirements, the ivars are
+        // `Send + Sync`, and the class does not implement `Drop`. Left
+        // any-thread (not `MainThreadOnly`) so the type stays `Send + Sync`
+        // for the caller that keeps it alive.
+        #[unsafe(super(NSObject))]
+        #[name = "ClitabServices"]
+        #[ivars = ProviderIvars]
+        pub(crate) struct ServicesProvider;
+
+        impl ServicesProvider {
+            /// Finder → Services → "New clitab Tab Here". Returning `NO`
+            /// means "not handled" (no usable path on the pasteboard).
+            #[unsafe(method(openTab:userData:))]
+            fn open_tab_service(&self, pboard: &NSPasteboard, _user_data: Option<&NSString>) -> Bool {
+                let Some(path) = read_pasteboard_path(pboard)
+                    .as_deref()
+                    .and_then(target_from_raw)
+                    .and_then(|p| classify_path(&p))
+                else {
+                    return Bool::NO;
+                };
+                let ivars = self.ivars();
+                // Settled → open now; still within the startup grace → stash
+                // for the startup thread, which turns it into the first tab.
+                if let Some(path) = crate::pty::lock(&ivars.state).offer(path) {
+                    open_tab(&ivars.app, Some(path.to_string_lossy().into_owned()), true);
+                }
+                Bool::YES
+            }
+        }
+    );
+
+    impl ServicesProvider {
+        fn new(app: AppHandle, state: Arc<Mutex<ServiceState>>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(ProviderIvars { app, state });
+            // SAFETY: plain `NSObject` initialization of a fresh allocation.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// First usable path on the pasteboard: the file URL (what Finder writes
+    /// for file selections) or, failing that, the plain-text path string
+    /// (both types are declared in `Info.plist`'s `NSSendTypes`).
+    fn read_pasteboard_path(pboard: &NSPasteboard) -> Option<String> {
+        // SAFETY: reading two `extern static` pasteboard-type constants.
+        let (file_url, string) = unsafe { (&*NSPasteboardTypeFileURL, &*NSPasteboardTypeString) };
+        pboard
+            .stringForType(file_url)
+            .or_else(|| pboard.stringForType(string))
+            .map(|s| s.to_string())
+    }
+
+    /// Make `NSApp` route service requests to a fresh provider. Must run on
+    /// the main thread before the event loop starts pumping (Tauri `setup`).
+    /// The caller must keep the returned provider alive: `servicesProvider`
+    /// is an unretained reference.
+    pub(crate) fn register(
+        app: &AppHandle,
+        state: Arc<Mutex<ServiceState>>,
+    ) -> Retained<ServicesProvider> {
+        let mtm =
+            MainThreadMarker::new().expect("services registration must happen on the main thread");
+        let provider = ServicesProvider::new(app.clone(), state);
+        // SAFETY: main thread (marker above); the provider is handed back to
+        // the caller, so it outlives this assignment.
+        unsafe { NSApplication::sharedApplication(mtm).setServicesProvider(Some(&provider)) };
+        provider
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use provider::register;

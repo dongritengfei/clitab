@@ -29,7 +29,7 @@ pub struct AppState {
 
 /// Tab metadata handed to the renderer. `camelCase` so it lines up with the
 /// `Tab` type in `src/types.ts` without a mapping step.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabResponse {
     pub id: String,

@@ -18,7 +18,7 @@
 - **不碰** `src-tauri/src/pty/shell_integration.rs`;`OSC 9;claude-done` 与 BEL 的现有语义不变;`stop` 事件不得触碰标题/`program_active`/`PromptReady` 逻辑。
 - 不在 renderer 重新实现快捷键;不引入 WebGL(项目既定选择,见 CLAUDE.md)。
 - `README.md` 与 `README.zh-CN.md` 必须同步修改。
-- 文档中每条 hook 命令必须保证退出码为 0(`|| true` / `; true` 收尾),且写 `/dev/tty` 而非 stdout(PreToolUse 的 stdout 会被 Claude Code 当决策 JSON 解析)。
+- 文档中每条 hook 命令必须保证退出码为 0(`; true` 收尾),且写 **ancestor tty `/dev/$t`**(`t=$(ps -o tty= -p $PPID | tr -d ' ')`,守卫 `[ -n "$t" ] && [ "$t" != '??' ]`;Task 1 探针裁定:hook 无控制终端,/dev/tty 不可写;stdout 被 Claude Code 捕获,PreToolUse 的 stdout 还会被当决策 JSON 解析)。
 - `ack_tab_notice` 对不存在的 tab 静默成功(不返回 `TAB_GONE`)。
 - 提交信息风格沿用仓库现状(如 `feat: ...` / `docs: ...`,首行小写简短)。
 
@@ -1299,7 +1299,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "printf '\\033]7777;{\"e\":\"prompt\"}\\033\\\\' >/dev/tty 2>/dev/null || true"
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;{\"e\":\"prompt\"}\\033\\\\' > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -1310,7 +1310,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" >/dev/tty 2>/dev/null; true"
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -1320,7 +1320,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "printf '\\033]7777;{\"e\":\"stop\"}\\033\\\\' >/dev/tty 2>/dev/null || true"
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;{\"e\":\"stop\"}\\033\\\\' > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -1331,7 +1331,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "j=$(jq -c '{e:\"notify\",msg:.message}' 2>/dev/null || printf '{\"e\":\"notify\"}'); printf '\\033]7777;%s\\033\\\\' \"$j\" >/dev/tty 2>/dev/null || true"
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"notify\",msg:.message}' 2>/dev/null || printf '{\"e\":\"notify\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -1343,22 +1343,28 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 ## How it works
 
 - Each hook `printf`s one JSON payload wrapped in `ESC ] 7777 ; … ESC \` to
-  **`/dev/tty`** — the tab's PTY. Not stdout: Claude Code parses some hooks'
-  stdout as decision JSON, and dashboard bytes there would be noise at best.
-- The PTY itself routes the event to the right tab, so hooks need no tab id.
+  **the tty device Claude Code itself is running on**: hooks are spawned
+  without a controlling terminal (`/dev/tty` fails) and their stdout is
+  captured by Claude Code, so the only reliable transport is the parent's
+  tty, found with `ps -o tty= -p $PPID` and written as `/dev/$t`.
+- That tty *is* the clitab tab, so events reach the right tab without any
+  tab id — and if Claude runs detached (no tty), the guard clause makes the
+  hook a silent no-op.
 - Events: `{"e":"prompt"}` turn start · `{"e":"tool","tool":"Bash"}` running a
   tool · `{"e":"stop"}` turn end (clitab computes the duration) ·
   `{"e":"notify","msg":"…"}` needs attention — flashes the tab and shows the
   message until you switch to it.
-- Every command ends in `|| true` / `; true`: a failing hook must never block
-  Claude Code. Missing jq produces an empty payload, which clitab ignores.
+- Every command ends in `; true`: a failing hook must never block Claude
+  Code. Missing jq produces an empty payload, which clitab ignores.
 
-## Legacy configs keep working
+## Legacy notes
 
-The older setup — a `Notification` hook running `printf '\a'` (BEL flash) — is
-still supported, as is the shell-integration `OSC 9;claude-done` title revert.
-The new `Notification` hook above **replaces** the BEL one (clitab flashes on
-`notify` itself); remove the old entry to avoid a double flash.
+- The shell-integration `OSC 9;claude-done` title revert is unaffected and
+  keeps working.
+- The old `Notification` hook running `printf '\a'` (BEL flash) wrote to
+  stdout — current Claude Code versions capture hook stdout instead of
+  passing it to the terminal, so that setup is likely inert. The new
+  `Notification` hook above replaces it.
 
 ## Troubleshooting
 
@@ -1370,9 +1376,10 @@ The new `Notification` hook above **replaces** the BEL one (clitab flashes on
    (`jq . ~/.claude/settings.json`).
 2. **Timer/duration works but no tool names or notice text** — jq is missing;
    install it (`brew install jq`) or accept the degraded display.
-3. **Manual printf works but hooks don't** — Claude Code may be older than
-   v1.0.24 (no hooks), or your setup detaches hooks from the controlling
-   terminal. Check `claude --version` and file an issue with it.
+3. **Manual printf works but hooks don't** — check `claude --version`
+   (hooks need v1.0.24+), and make sure Claude runs directly in the tab:
+   the transport needs Claude's process to have the tab's tty
+   (`ps -o tty= -p <claude-pid>` must not show `??`).
 ````
 
 - [ ] **Step 2: 验证文档里的 JSON 块可解析**
@@ -1383,7 +1390,7 @@ The new `Notification` hook above **replaces** the BEL one (clitab flashes on
 jq -e '.hooks | keys' /tmp/hooks-block.json
 ```
 
-Expected: 输出含 `"Notification"`, `"PreToolUse"`, `"Stop"`, `"UserPromptSubmit"` 四个键;再把每条 `command` 字符串拷进 shell 跑一次(`echo '{"tool_name":"Bash"}' | <command>` 形式),确认退出码 0。
+Expected: 输出含 `"Notification"`, `"PreToolUse"`, `"Stop"`, `"UserPromptSubmit"` 四个键;再把每条 `command` 字符串拷进 shell 跑一次(`echo '{"tool_name":"Bash"}' | <command>` 形式),确认退出码 0——在无 tty 的 shell(如 CI、本会话的 Bash 工具)里守卫子句应使其静默 no-op,这正是预期。
 
 - [ ] **Step 3: README.md 特性条目**
 

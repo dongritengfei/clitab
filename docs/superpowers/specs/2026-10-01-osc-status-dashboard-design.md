@@ -108,12 +108,13 @@ Claude Code 还活着。
 
 ## 第 4 节:Hook 配置与文档
 
-四个 hook 命令,全部写 `/dev/tty`、全部 `2>/dev/null || true` 兜底
-(hook 失败绝不阻塞 Claude Code):
+四个 hook 命令,全部写 **claude 的控制终端 `/dev/$t`**
+(`t=$(ps -o tty= -p $PPID)`,带 `[ -n "$t" ] && [ "$t" != '??' ]` 守卫),
+全部 `2>/dev/null; true` 收尾(hook 失败绝不阻塞 Claude Code):
 
 | Hook | 命令要点 | jq |
 |---|---|---|
-| UserPromptSubmit | 静态 `printf '\033]7777;{"e":"prompt"}\033\\' >/dev/tty` | 不需要 |
+| UserPromptSubmit | 静态 `printf '\033]7777;{"e":"prompt"}\033\\' >/dev/$t` | 不需要 |
 | Stop | 静态 `{"e":"stop"}`,同上 | 不需要 |
 | PreToolUse | `jq -c '{e:"tool",tool:.tool_name}'` 读 stdin,结果塞进 printf;jq 缺失/坏 JSON → 空载荷 → Rust 静默忽略 | 需要,可降级 |
 | Notification | `jq -c '{e:"notify",msg:.message}'`;jq 缺失降级发 `{"e":"notify"}`(无 msg) | 需要,可降级 |
@@ -123,21 +124,24 @@ notify 时触发。
 
 文档:
 - `CLAUDE_HOOKS.md` 重写:完整 settings.json 四 hook 配置块、jq 可选
-  说明、`/dev/tty` 排障;明确旧配置(BEL / `claude-done` OSC 9)继续有效。
+  说明、ancestor-tty 传输的原理与排障;说明旧配置的现状(见探针结论)。
 - `README.md` + `README.zh-CN.md`:特性区加"标签仪表盘"条目,两份同步。
 
-## 风险与早期探针
+## 风险与早期探针(已于 2026-10-01 实测,探针在 claude 2.1.285 / macOS 上运行)
 
-实现计划第一步是两个探针,失败则回到设计:
-
-1. **`/dev/tty` 在 hook 执行环境可写**——理论上 hook 继承 Claude Code 的
-   控制终端,必须实测。备选:stdout(仅对 Notification/Stop 安全,
-   PreToolUse 的 stdout 会被 Claude Code 当 hook 决策 JSON 解析)或
-   shell 集成注入环境变量指路。
-2. **Stop hook 是否真的触发**——现有 `CLAUDE_HOOKS.md` 末尾"Stop 可能不
-   支持 command hooks"与官方文档矛盾,需实测。若真不支持:`stop` 退化,
-   耗时由 shell 集成 `claude-done` 兜底(会话级而非回合级,价值大减),
-   届时重新讨论。
+1. **`/dev/tty` 在 hook 执行环境不可写——已证伪,传输改为 ancestor-tty。**
+   实测:Claude Code 派生 hook 进程时不给控制终端(`ps` 显示 `TTY=??`),
+   `/dev/tty` 打开失败;hook stdout 也不透传到终端(canary 零命中)。
+   **可行传输**:hook 用 `ps -o tty= -p $PPID` 取父进程(claude)的 tty
+   设备名(如 `ttys005`),直接写 `/dev/$t`——canary 精确到达 pty 一次。
+   tab 寻址依然成立:每个 claude 的 tty 就是它所在的标签。tty 不可得时
+   (claude 被 detached 运行)守卫子句静默降级。
+2. **Stop hook 支持 command hook——已确认。**探针中 `stop-hook` 稳定触发,
+   旧文档"Stop 可能不支持"的说法作废。
+3. **附带发现**:旧版 `CLAUDE_HOOKS.md` 的 BEL-over-stdout 方案
+   (`printf '\a'`)在 claude 2.1.285 上大概率无效(stdout 被捕获,不到
+   终端);shell 集成的 `claude-done`(OSC 9)不受影响,因为那是 shell
+   自己写 stdout,shell 的 stdout 就是 pty。文档重写时如实说明。
 
 ## 明确不碰
 

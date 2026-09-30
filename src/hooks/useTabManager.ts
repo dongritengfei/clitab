@@ -357,6 +357,18 @@ export function useTabManager(): TabManagerState {
             actions.cycleTab(-1);
             break;
         }
+      }),
+      // A tab the backend created itself: the delayed startup tab, or the
+      // Finder "New clitab Tab Here" service. Same id-dedup as createTab —
+      // the mount-time list_tabs snapshot may already contain it.
+      listen<TabResponse>('tab-created', ({ payload }) => {
+        const created = toTab(payload);
+        setTabs((prev) =>
+          prev.some((tab) => tab.id === created.id)
+            ? prev.map((tab) => (tab.id === created.id ? created : tab))
+            : [...prev, created]
+        );
+        setActiveTabId(created.id);
       })
     );
 

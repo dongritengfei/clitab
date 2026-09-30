@@ -108,6 +108,19 @@ button:focus-visible {
   }
 }
 
+/* Steady amber dot: the tab is in the waiting-for-input triage queue. The
+   flash animation means "just rang"; the dot survives switching away and
+   only goes out when the user types into that tab. */
+.waiting-dot {
+  flex-shrink: 0;
+  align-self: flex-start;
+  width: 6px;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 50%;
+  background: #fab387;
+}
+
 /* Position number, doubling as the ⌘<number> switch hint. Quiet by default;
    the title stays the prominent part of the tab. */
 .tab-index {

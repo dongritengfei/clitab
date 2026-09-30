@@ -19,6 +19,8 @@ const CWD_CHAR_WIDTH = 6.1;
 /** Space reserved for the non-text parts of a row: 3px border-left +
  *  16px/4px padding + 16px badge + 2×4px gaps + 20px close button. */
 const CHROME_WIDTH = 67;
+/** Extra width of the waiting dot when present: 6px dot + 4px gap. */
+const WAITING_DOT_WIDTH = 10;
 
 /**
  * Shorten a path from the left: the tail is what identifies a tab, so
@@ -74,18 +76,22 @@ export const TabItem: React.FC<TabItemProps> = ({
   // title; when the title already is the cwd, a second line is pure noise.
   const showCwd = tab.cwd !== '' && tab.cwd !== tab.title;
 
+  // The dot only costs width while it is there; folding it into the chrome
+  // budget keeps the title ellipsis accurate either way.
+  const chromeWidth = CHROME_WIDTH + (tab.waiting ? WAITING_DOT_WIDTH : 0);
+
   useLayoutEffect(() => {
     const container = containerRef.current;
     const available = container
-      ? Math.floor((container.offsetWidth - CHROME_WIDTH) / CHAR_WIDTH)
+      ? Math.floor((container.offsetWidth - chromeWidth) / CHAR_WIDTH)
       : 0;
     setDisplayTitle(isPath && container ? shortenPath(tab.title, available) : tab.title);
 
     const cwdAvailable = container
-      ? Math.floor((container.offsetWidth - CHROME_WIDTH) / CWD_CHAR_WIDTH)
+      ? Math.floor((container.offsetWidth - chromeWidth) / CWD_CHAR_WIDTH)
       : 0;
     setDisplayCwd(container ? shortenPath(tab.cwd, cwdAvailable) : tab.cwd);
-  }, [tab.title, tab.cwd, isPath]);
+  }, [tab.title, tab.cwd, isPath, chromeWidth]);
 
   // ⌘9 targets the last tab (macOS convention), so with more than 9 tabs
   // positions 9..n-1 have no shortcut of their own and get no badge.
@@ -94,7 +100,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   return (
     <div
       ref={containerRef}
-      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''}`}
+      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''} ${tab.waiting ? 'waiting' : ''}`}
       // Tabs are switched with the keyboard too, so make them reachable.
       role="tab"
       id={`tab-${tab.id}`}
@@ -128,6 +134,7 @@ export const TabItem: React.FC<TabItemProps> = ({
       <span className="tab-index" aria-hidden="true">
         {badge ?? ''}
       </span>
+      {tab.waiting && <span className="waiting-dot" aria-hidden="true" />}
       <div className="tab-text">
         <span className="tab-title" title={tab.title}>
           {displayTitle}

@@ -6,6 +6,9 @@ export interface Tab {
   hasClaudeTitle: boolean;
   /** Renderer-only: the tab is asking for attention. */
   flashing: boolean;
+  /** Backend-owned: the tab is waiting for input (triage queue). Cleared
+   *  only by typing into it, never by switching. */
+  waiting: boolean;
 }
 
 /** Shape returned by the `create_tab` / `list_tabs` commands. */
@@ -14,6 +17,7 @@ export interface TabResponse {
   title: string;
   cwd: string;
   hasClaudeTitle: boolean;
+  waiting: boolean;
 }
 
 export interface PtyOutputPayload {
@@ -59,6 +63,16 @@ export interface TabExitPayload {
 /** Emitted by the native menu when a tab accelerator is pressed. */
 export interface MenuShortcutPayload {
   id: string;
+}
+
+export interface TabWaitingPayload {
+  tab_id: string;
+  waiting: boolean;
+}
+
+/** Emitted when the user clicks a "Waiting for input" notification. */
+export interface FocusTabPayload {
+  tab_id: string;
 }
 
 /**

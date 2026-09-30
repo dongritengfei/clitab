@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   TAB_GONE,
   type AttachStreamResponse,
+  type FocusTabPayload,
   type MenuShortcutPayload,
   type PtyOutputPayload,
   type Tab,
@@ -12,6 +13,7 @@ import {
   type TabFlashPayload,
   type TabResponse,
   type TabTitlePayload,
+  type TabWaitingPayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
 
@@ -160,6 +162,21 @@ export function useTabManager(): TabManagerState {
     [switchTab]
   );
 
+  // ⌘J: triage. Round-robin from the tab *after* the active one; the active
+  // tab is never a target (you are already looking at it). An empty queue
+  // does nothing at all — no focus change, no toast.
+  const jumpToNextWaiting = useCallback(() => {
+    const list = tabsRef.current;
+    const active = list.findIndex((tab) => tab.id === activeTabRef.current);
+    for (let step = 1; step < list.length; step++) {
+      const candidate = list[(active + step + list.length) % list.length];
+      if (candidate?.waiting) {
+        switchTab(candidate.id);
+        return;
+      }
+    }
+  }, [switchTab]);
+
   const attachTab = useCallback(
     async (tabId: string, handler: OutputHandler) => {
       // Anything arriving while we catch up is queued, so the replay is always
@@ -243,7 +260,7 @@ export function useTabManager(): TabManagerState {
 
   // The event listeners below are registered once for the lifetime of the app,
   // so they call through a ref that always points at the freshest closures.
-  const actions = { createTab, closeActiveTab, selectTabByIndex, cycleTab };
+  const actions = { createTab, closeActiveTab, selectTabByIndex, cycleTab, switchTab, jumpToNextWaiting };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
 
@@ -329,6 +346,20 @@ export function useTabManager(): TabManagerState {
           )
         );
       }),
+      listen<TabWaitingPayload>('tab-waiting', ({ payload }) => {
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.id === payload.tab_id ? { ...tab, waiting: payload.waiting } : tab
+          )
+        );
+      }),
+      listen<FocusTabPayload>('focus-tab', ({ payload }) => {
+        // The tab may have been closed while its notification sat in the
+        // notification center; switching to a ghost would blank the UI.
+        if (tabsRef.current.some((tab) => tab.id === payload.tab_id)) {
+          actionsRef.current.switchTab(payload.tab_id);
+        }
+      }),
       listen<TabExitPayload>('tab-exit', ({ payload }) => {
         // The shell is gone; the backend has already dropped the session.
         abandonTab(payload.tab_id);
@@ -355,6 +386,9 @@ export function useTabManager(): TabManagerState {
             break;
           case 'prev-tab':
             actions.cycleTab(-1);
+            break;
+          case 'next-waiting':
+            actions.jumpToNextWaiting();
             break;
         }
       }),

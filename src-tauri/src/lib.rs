@@ -1,6 +1,7 @@
 mod menu;
 mod osc;
 mod pty;
+mod status;
 mod services;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};

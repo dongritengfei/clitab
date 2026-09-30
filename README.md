@@ -43,6 +43,11 @@ parallel agents stays glanceable from whichever tab you are in.
 - **Attention flash** — a tab flashes when Claude Code asks for input or sends
   a notification (BEL / OSC 9). See [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) for the
   one-time hook setup.
+- **Attention triage** — a session that needs input joins a waiting queue:
+  the Dock badge counts them, `⌘J` jumps to the next one, and while clitab
+  is in the background a macOS notification announces each; clicking a
+  notification goes straight to that tab. A tab leaves the queue when you
+  type in it — switching alone does not.
 - **Desktop-grade shortcuts** — a native menu drives ⌘T / ⌘W / ⌃Tab / ⌘1–9,
   so they work even when the terminal does not have keyboard focus. Closing a
   tab with a running process asks first.
@@ -130,9 +135,13 @@ the terminal does not have keyboard focus.
 | `⌘T` | New tab |
 | `⌘W` | Close tab (asks first if a process is still running) |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
+| `⌘J` | Jump to the next tab waiting for input |
 | `⌘1` … `⌘8` | Jump to tab 1–8 |
 | `⌘9` | Jump to the last tab |
 | `⌘C` / `⌘V` / `⌘A` | Copy / paste / select all |
+
+> Notifications appear only while clitab is in the background. If they never
+> show up, check System Settings → Notifications → clitab.
 
 In the tab list, arrow keys / Home / End move between tabs.
 

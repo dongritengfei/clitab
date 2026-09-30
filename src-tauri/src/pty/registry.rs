@@ -17,6 +17,10 @@ pub struct TabRecord {
     /// True when the title was set by a program (e.g. Claude Code) rather than
     /// derived from the working directory.
     pub has_program_title: bool,
+    /// True while the tab is waiting for user input — the triage queue.
+    /// Set at every `tab-flash` trigger; cleared only when the user types
+    /// into the tab (`pty_input`). Switching tabs does NOT clear it.
+    pub waiting: bool,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +40,7 @@ impl Registry {
             title: cwd.clone(),
             cwd,
             has_program_title: false,
+            waiting: false,
         };
         lock(&self.tabs).push(record.clone());
         record
@@ -80,6 +85,38 @@ impl Registry {
             tab.has_program_title = false;
             tab.title = tab.cwd.clone();
         }
+    }
+
+    /// Mark a tab as waiting for input. Returns true only on the
+    /// false→true transition, so repeated signals (BEL spam, the idle
+    /// watcher re-firing) notify exactly once per queue entry.
+    pub fn set_waiting(&self, id: &str) -> bool {
+        let mut tabs = lock(&self.tabs);
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if !tab.waiting => {
+                tab.waiting = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take a tab out of the waiting queue (the user typed in it). Returns
+    /// true only on the true→false transition.
+    pub fn clear_waiting(&self, id: &str) -> bool {
+        let mut tabs = lock(&self.tabs);
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.waiting => {
+                tab.waiting = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many tabs are in the triage queue; drives the Dock badge.
+    pub fn waiting_count(&self) -> usize {
+        lock(&self.tabs).iter().filter(|t| t.waiting).count()
     }
 
     pub fn list(&self) -> Vec<TabRecord> {
@@ -139,6 +176,41 @@ mod tests {
         registry.clear_program_title("nope");
         assert!(!registry.remove("nope"));
         assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn waiting_transitions_fire_only_once() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        assert!(registry.set_waiting("t1"));
+        assert!(!registry.set_waiting("t1"), "second signal is not a transition");
+        assert_eq!(registry.waiting_count(), 1);
+        assert!(registry.clear_waiting("t1"));
+        assert!(!registry.clear_waiting("t1"), "already out of the queue");
+        assert_eq!(registry.waiting_count(), 0);
+        assert!(
+            registry.set_waiting("t1"),
+            "responding and ringing again re-enters the queue"
+        );
+    }
+
+    #[test]
+    fn removed_tabs_leave_the_queue() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/a".into());
+        registry.insert("t2".into(), "/b".into());
+        registry.set_waiting("t1");
+        registry.set_waiting("t2");
+        registry.remove("t1");
+        assert_eq!(registry.waiting_count(), 1);
+    }
+
+    #[test]
+    fn unknown_tab_waiting_is_ignored() {
+        let registry = Registry::new();
+        assert!(!registry.set_waiting("nope"));
+        assert!(!registry.clear_waiting("nope"));
+        assert_eq!(registry.waiting_count(), 0);
     }
 
     #[test]

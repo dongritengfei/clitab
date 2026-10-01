@@ -220,7 +220,7 @@ mod provider {
     use objc2_app_kit::{
         NSApplication, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString,
     };
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSString, NSURL};
     use std::sync::{Arc, Mutex};
     use tauri::AppHandle;
 
@@ -240,10 +240,19 @@ mod provider {
         pub(crate) struct ServicesProvider;
 
         impl ServicesProvider {
-            /// Finder → Services → "New clitab Tab Here". Returning `NO`
-            /// means "not handled" (no usable path on the pasteboard).
-            #[unsafe(method(openTab:userData:))]
-            fn open_tab_service(&self, pboard: &NSPasteboard, _user_data: Option<&NSString>) -> Bool {
+            /// Finder → Services → "New clitab Tab Here". The selector MUST
+            /// be the three-argument `openTab:userData:error:`: AppKit only
+            /// dispatches to `<name>:userData:error:` (or `<name>::`) — the
+            /// two-argument form registers fine and shows the menu item but
+            /// is never invoked. The error out-param stays untouched:
+            /// returning `NO` ("not handled") is the spec'd failure mode.
+            #[unsafe(method(openTab:userData:error:))]
+            fn open_tab_service(
+                &self,
+                pboard: &NSPasteboard,
+                _user_data: Option<&NSString>,
+                _error: *mut *mut NSString,
+            ) -> Bool {
                 let Some(path) = read_pasteboard_path(pboard)
                     .as_deref()
                     .and_then(target_from_raw)
@@ -276,10 +285,75 @@ mod provider {
     fn read_pasteboard_path(pboard: &NSPasteboard) -> Option<String> {
         // SAFETY: reading two `extern static` pasteboard-type constants.
         let (file_url, string) = unsafe { (&*NSPasteboardTypeFileURL, &*NSPasteboardTypeString) };
-        pboard
+        let fu = pboard
             .stringForType(file_url)
-            .or_else(|| pboard.stringForType(string))
             .map(|s| s.to_string())
+            // The services pasteboard carries file *reference* URLs
+            // (file:///.file/id=…); only NSURL resolves those to a path.
+            .map(|raw| resolve_file_url(&raw).unwrap_or(raw));
+        let st = pboard.stringForType(string).map(|s| s.to_string());
+        fu.or(st)
+    }
+
+    /// Resolve a URL string to a filesystem path through NSURL, which
+    /// understands both the file-reference URLs (`file:///.file/id=<vol>.<fid>`)
+    /// that services pasteboards actually carry and percent-encoding in
+    /// ordinary `file://` URLs. `None` when the string does not parse as a
+    /// URL or carries no path; callers fall back to the pure string parser.
+    fn resolve_file_url(raw: &str) -> Option<String> {
+        let url = NSURL::URLWithString(&NSString::from_str(raw))?;
+        url.path().map(|p| p.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ServicesProvider;
+        use objc2::runtime::Bool;
+        use objc2::{msg_send, sel, ClassType};
+
+        /// The services pasteboard carries file *reference* URLs
+        /// (`file:///.file/id=<vol>.<fid>`) — verified on macOS 15 with real
+        /// Finder clicks. String surgery turns those into garbage (`/.file`);
+        /// only NSURL resolves them to the actual path, and it percent-decodes
+        /// while at it.
+        #[test]
+        fn file_urls_resolve_through_nsurl() {
+            use super::resolve_file_url;
+            use objc2_foundation::{NSString, NSURL};
+            assert_eq!(resolve_file_url("file:///tmp").as_deref(), Some("/tmp"));
+            assert_eq!(
+                resolve_file_url("file:///tmp/a%20b").as_deref(),
+                Some("/tmp/a b")
+            );
+            // The field failure, pinned end to end: convert a path URL to
+            // the file-reference form the services pasteboard actually
+            // carries (file:///.file/id=…), then resolve it back.
+            let reference = NSURL::fileURLWithPath(&NSString::from_str("/tmp"))
+                .fileReferenceURL().unwrap()
+                .absoluteString().unwrap()
+                .to_string();
+            assert!(reference.starts_with("file:///.file/id="), "{reference}");
+            assert_eq!(resolve_file_url(&reference).as_deref(), Some("/tmp"));
+        }
+
+        /// AppKit dispatches a service only to `<name>:userData:error:` (or
+        /// the unnamed `<name>::` fallback) — a provider exposing only the
+        /// two-argument `<name>:userData:` form shows the Finder menu item
+        /// but is never invoked (verified on macOS 15: real Finder clicks
+        /// produced zero handler calls). Pin the selector the dispatcher
+        /// actually looks up.
+        #[test]
+        fn provider_implements_the_dispatched_service_selector() {
+            let cls = ServicesProvider::class();
+            // SAFETY: plain `+instancesRespondToSelector:` query on a
+            // registered class object.
+            let responds: Bool =
+                unsafe { msg_send![cls, instancesRespondToSelector: sel!(openTab:userData:error:)] };
+            assert!(
+                responds.as_bool(),
+                "AppKit never dispatches to a provider lacking openTab:userData:error:"
+            );
+        }
     }
 
     /// Make `NSApp` route service requests to a fresh provider. Must run on

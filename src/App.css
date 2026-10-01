@@ -165,6 +165,31 @@ button:focus-visible {
   min-width: 0;
 }
 
+/* Third line: the Claude turn dashboard (OSC 7777 hook protocol). Rendered
+   only once a tab reports protocol state; fixed height, so the done line's
+   fade-out never shifts the rows below it. */
+.tab-status {
+  font-size: 11px;
+  line-height: 14px;
+  min-height: 14px;
+  color: #a6adc8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.6s ease;
+}
+
+.tab-status.done-hidden {
+  opacity: 0;
+}
+
+/* A pending notification outranks the turn state and asks for attention. */
+.tab-status.notice {
+  color: #f9e2af;
+}
+
 .tab-close {
   background: none;
   border: none;

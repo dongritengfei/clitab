@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Tab } from '../types';
 
 interface TabItemProps {
@@ -21,6 +21,9 @@ const CWD_CHAR_WIDTH = 6.1;
 const CHROME_WIDTH = 67;
 /** Extra width of the waiting dot when present: 6px dot + 4px gap. */
 const WAITING_DOT_WIDTH = 10;
+
+/** The done line lingers this long, then fades (see .tab-status.done-hidden). */
+const DONE_FADE_MS = 6000;
 
 /**
  * Shorten a path from the left: the tail is what identifies a tab, so
@@ -55,6 +58,20 @@ export function shortenPath(path: string, availableChars: number): string {
   // Restore the leading slash for absolute paths (already budgeted above).
   const joined = (absolute ? '/' : '') + tail.join('/');
   return `…${joined}`;
+}
+
+/**
+ * Human duration for the status line: `42s`, `1m 05s`, `1h 02m`. Negative
+ * input (clock skew between the backend timestamp and Date.now) clamps to 0.
+ */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  return `${seconds}s`;
 }
 
 export const TabItem: React.FC<TabItemProps> = ({
@@ -92,6 +109,43 @@ export const TabItem: React.FC<TabItemProps> = ({
       : 0;
     setDisplayCwd(container ? shortenPath(tab.cwd, cwdAvailable) : tab.cwd);
   }, [tab.title, tab.cwd, isPath, chromeWidth]);
+
+  // Live elapsed timer: only mounted while a turn is actually ticking, so
+  // idle tabs cost nothing.
+  const ticking = tab.status?.kind === 'thinking' || tab.status?.kind === 'tool';
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [ticking]);
+
+  // The done line fades out a few seconds after the turn ended; any newer
+  // status (or a new done with a different `at`) cancels the fade.
+  const doneAt = tab.status?.kind === 'done' ? tab.status.at : null;
+  const [doneFaded, setDoneFaded] = useState(false);
+  useEffect(() => {
+    setDoneFaded(false);
+    if (doneAt === null) return;
+    const timer = setTimeout(() => setDoneFaded(true), DONE_FADE_MS);
+    return () => clearTimeout(timer);
+  }, [doneAt]);
+
+  // Status-line content. A pending notification outranks the turn state; the
+  // row itself exists only once this tab has spoken the protocol, so plain
+  // shell tabs keep their exact current layout.
+  const hasStatusRow = tab.status !== null || tab.notice !== null;
+  let statusText = '';
+  if (tab.notice) {
+    statusText = `⚠ ${tab.notice.msg ?? 'Claude needs attention'}`;
+  } else if (tab.status?.kind === 'tool') {
+    statusText = `⚙ ${tab.status.name} · ${formatDuration(now - tab.status.since)}`;
+  } else if (tab.status?.kind === 'thinking') {
+    statusText = `⏳ ${formatDuration(now - tab.status.since)}`;
+  } else if (tab.status?.kind === 'done') {
+    statusText = `✓ ${tab.status.duration != null ? formatDuration(tab.status.duration) : 'done'}`;
+  }
 
   // ⌘9 targets the last tab (macOS convention), so with more than 9 tabs
   // positions 9..n-1 have no shortcut of their own and get no badge.
@@ -139,6 +193,13 @@ export const TabItem: React.FC<TabItemProps> = ({
         <span className="tab-title" title={tab.title}>
           {displayTitle}
         </span>
+        {hasStatusRow && (
+          <span
+            className={`tab-status${tab.notice ? ' notice' : ''}${doneFaded && !tab.notice ? ' done-hidden' : ''}`}
+          >
+            {statusText}
+          </span>
+        )}
         {showCwd && (
           <span className="tab-cwd" title={tab.cwd}>
             {displayCwd}

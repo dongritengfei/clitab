@@ -3,11 +3,13 @@ mod menu;
 mod osc;
 mod pty;
 mod services;
+mod status;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pty::manager::{ManagerError, TabManager};
 use pty::registry::TabRecord;
 use serde::{Deserialize, Serialize};
+use status::{Notice, TabStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager, State};
 
@@ -36,6 +38,10 @@ pub struct TabResponse {
     pub title: String,
     pub cwd: String,
     pub has_claude_title: bool,
+    /// Hook-protocol turn state; null until the tab's session speaks it.
+    pub status: Option<TabStatus>,
+    /// Notification awaiting the user; null once acknowledged.
+    pub notice: Option<Notice>,
     pub waiting: bool,
 }
 
@@ -46,6 +52,9 @@ impl From<TabRecord> for TabResponse {
             title: tab.title,
             cwd: tab.cwd,
             has_claude_title: tab.has_program_title,
+            status: tab.status,
+            notice: tab.notice,
+            // `turn_start` is deliberately not exposed: backend-internal.
             waiting: tab.waiting,
         }
     }
@@ -138,6 +147,14 @@ fn has_active_process(state: State<'_, AppState>, tab_id: String) -> Result<bool
     Ok(state.tab_manager.has_active_process(&tab_id))
 }
 
+/// The user switched to this tab, so its notification has been seen. Never
+/// errors on an unknown tab: a stale ack is harmless.
+#[tauri::command]
+fn ack_tab_notice(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
+    state.tab_manager.ack_notice(&tab_id);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -201,7 +218,8 @@ pub fn run() {
             resize_pty,
             attach_stream,
             detach_tab,
-            has_active_process
+            has_active_process,
+            ack_tab_notice
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -234,5 +252,55 @@ mod tests {
             "other failures must not match: {real}"
         );
         assert!(real.contains("boom"), "{real}");
+    }
+
+    use crate::status::{Notice, TabStatus};
+
+    /// Pins the IPC contract for `src/types.ts`: camelCase, `kind`-tagged
+    /// status, nulls (not absent keys) for missing protocol state, and the
+    /// backend-internal `turn_start` never leaks.
+    #[test]
+    fn tab_response_serializes_protocol_state() {
+        let record = TabRecord {
+            id: "t1".into(),
+            title: "Fix build".into(),
+            cwd: "/tmp".into(),
+            has_program_title: true,
+            waiting: false,
+            status: Some(TabStatus::Tool {
+                name: "Bash".into(),
+                since: 1700000000000,
+            }),
+            notice: None,
+            turn_start: Some(1700000000000),
+        };
+        let json = serde_json::to_value(TabResponse::from(record)).unwrap();
+        assert_eq!(
+            json["status"],
+            serde_json::json!({"kind": "tool", "name": "Bash", "since": 1700000000000u64})
+        );
+        assert_eq!(json["notice"], serde_json::Value::Null);
+        assert_eq!(json["waiting"], serde_json::json!(false));
+        assert!(json.get("turnStart").is_none());
+
+        let idle = TabRecord {
+            id: "t2".into(),
+            title: "/tmp".into(),
+            cwd: "/tmp".into(),
+            has_program_title: false,
+            waiting: false,
+            status: None,
+            notice: Some(Notice {
+                msg: Some("needs permission".into()),
+                at: 5,
+            }),
+            turn_start: None,
+        };
+        let json = serde_json::to_value(TabResponse::from(idle)).unwrap();
+        assert_eq!(json["status"], serde_json::Value::Null);
+        assert_eq!(
+            json["notice"],
+            serde_json::json!({"msg": "needs permission", "at": 5})
+        );
     }
 }

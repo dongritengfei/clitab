@@ -39,6 +39,9 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 - **关注分诊** — 需要你输入的会话进入等待队列:Dock 角标计数,⌘J 跳到
   下一个;clitab 在后台时每次进入等待弹一条 macOS 通知,点击通知直达
   对应标签。在该标签敲键盘才离开队列——仅切换不清除。
+- **标签仪表盘** — 配置可选的 Claude Code hooks(见 `CLAUDE_HOOKS.md`)后,
+  每个标签会显示会话正在做什么:当前工具与实时计时、上一回合耗时、
+  等待处理的通知。基于私有 OSC 7777 协议,其他终端会静默忽略。
 - **桌面级快捷键** — 原生菜单驱动 ⌘T / ⌘W / ⌃Tab / ⌘1–9,
   即使终端没有键盘焦点也能生效。关闭仍有进程在跑的标签时会先询问。
 - **点击标签即刻输入** — 激活标签会把光标送进对应终端,无需再点一次。
@@ -88,23 +91,9 @@ xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
 在任意标签里像普通终端一样运行 `claude` 即可 —— clitab 会从 Claude Code
 本来就会发出的转义序列中捕获会话标题。
 
-要启用关注闪烁,在 Claude Code 设置(`~/.claude/settings.json`)里加一个
-Notification 钩子,让终端响铃:
-
-```json
-{
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": ".*",
-        "hooks": [{ "type": "command", "command": "printf '\\a'" }]
-      }
-    ]
-  }
-}
-```
-
-细节与排错见 [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md)。
+关注闪烁与标签仪表盘由 Claude Code hooks 驱动:把
+[CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) 里的配置加进 Claude Code 设置
+(`~/.claude/settings.json`)即可,细节与排错也在该页。
 
 ## 快捷键
 

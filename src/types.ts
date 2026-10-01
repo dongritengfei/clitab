@@ -1,9 +1,29 @@
+/**
+ * Turn state reported via the OSC 7777 hook protocol. `kind` discriminates;
+ * all timestamps are epoch milliseconds from the backend's clock. Mirrors
+ * `TabStatus` in `src-tauri/src/status.rs`.
+ */
+export type TabStatus =
+  | { kind: 'thinking'; since: number }
+  | { kind: 'tool'; name: string; since: number }
+  | { kind: 'done'; duration: number | null; at: number };
+
+/** A Notification-hook message awaiting the user. Mirrors `Notice` in Rust. */
+export interface TabNotice {
+  msg: string | null;
+  at: number;
+}
+
 export interface Tab {
   id: string;
   title: string;
   cwd: string;
   /** True when a program (e.g. Claude Code) owns the title, not the cwd. */
   hasClaudeTitle: boolean;
+  /** Hook-protocol turn state; null until this tab's session speaks it. */
+  status: TabStatus | null;
+  /** Notification awaiting the user; null once seen or superseded. */
+  notice: TabNotice | null;
   /** Renderer-only: the tab is asking for attention. */
   flashing: boolean;
   /** Backend-owned: the tab is waiting for input (triage queue). Cleared
@@ -17,6 +37,10 @@ export interface TabResponse {
   title: string;
   cwd: string;
   hasClaudeTitle: boolean;
+  /** Hook-protocol turn state; null until this tab's session speaks it. */
+  status: TabStatus | null;
+  /** Notification awaiting the user; null once acknowledged. */
+  notice: TabNotice | null;
   waiting: boolean;
 }
 
@@ -53,6 +77,13 @@ export interface TabCwdPayload {
 
 export interface TabFlashPayload {
   tab_id: string;
+}
+
+/** Full replacement state for one tab's protocol fields. */
+export interface TabStatusPayload {
+  tab_id: string;
+  status: TabStatus | null;
+  notice: TabNotice | null;
 }
 
 export interface TabExitPayload {

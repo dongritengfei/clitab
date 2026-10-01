@@ -12,8 +12,9 @@
 //!     false→true transition. It is posted through `UNUserNotificationCenter`
 //!     (the deprecated `NSUserNotificationCenter` no longer delivers on
 //!     modern macOS); posting is async and the request identifier is the tab
-//!     id, so a re-ring replaces the tab's existing banner instead of
-//!     stacking a second. Clicks come back through the delegate installed by
+//!     id plus an episode suffix, because UN presents a notification only
+//!     while its identifier is new — a bare tab id would make every re-ring
+//!     a silent update. Clicks come back through the delegate installed by
 //!     [`init_notifications`], focusing the window and routing to the tab
 //!     via `focus-tab`.
 //!
@@ -81,8 +82,10 @@ pub fn respond(app: &AppHandle, registry: &Registry, tab_id: &str) {
 
 /// Post the "waiting for input" banner. Runs on whichever reader thread
 /// rang: `addNotificationRequest` is async and nothing blocks on the user's
-/// answer. The identifier is the tab id, so Notification Center keeps one
-/// thread per tab and the delegate reads it back as the click-routing key.
+/// answer. The identifier is the tab id plus `#` and the epoch in millis —
+/// UN updates an already-delivered identifier silently instead of
+/// presenting it again, so each episode needs a fresh one. The delegate
+/// splits the suffix back off as the click-routing key.
 #[cfg(target_os = "macos")]
 fn post_notification(tab_id: &str, title: &str) {
     use block2::RcBlock;
@@ -92,11 +95,20 @@ fn post_notification(tab_id: &str, title: &str) {
         UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter,
     };
 
+    // UN presents a notification only when its identifier is new: re-adding
+    // one already delivered updates the old entry silently, even after
+    // removing it first. An episode suffix keeps every ring presentable;
+    // the delegate strips it back off to route the click.
+    let episode = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let identifier = NSString::from_str(&format!("{tab_id}#{episode}"));
     let content = UNMutableNotificationContent::init(UNMutableNotificationContent::alloc());
     content.setTitle(&NSString::from_str(title));
     content.setBody(&NSString::from_str("Waiting for input"));
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-        &NSString::from_str(tab_id),
+        &identifier,
         &content,
         None, // no trigger: deliver immediately
     );
@@ -190,10 +202,17 @@ mod notification_delegate {
                 response: &UNNotificationResponse,
                 completion_handler: &DynBlock<dyn Fn()>,
             ) {
-                let tab_id = response
+                // The identifier carries an episode suffix (see
+                // `post_notification`); the part before it is the tab id.
+                let identifier = response
                     .notification()
                     .request()
                     .identifier()
+                    .to_string();
+                let tab_id = identifier
+                    .split('#')
+                    .next()
+                    .unwrap_or(&identifier)
                     .to_string();
                 let ivars = self.ivars();
                 let app = ivars.app.clone();

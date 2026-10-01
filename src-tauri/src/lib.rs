@@ -182,6 +182,9 @@ pub fn run() {
                 // NSApp keeps the provider by unretained reference; leaking
                 // the singleton is the cheapest way to outlive this scope.
                 std::mem::forget(services::register(app.handle(), service_state.clone()));
+                // UNUserNotificationCenter keeps its delegate by weak
+                // reference: leak the singleton the same way.
+                std::mem::forget(attention::init_notifications(app.handle()));
             }
 
             // The first tab is created shortly *after* startup: an app

@@ -9,16 +9,18 @@
 //!   * the badge is the count of waiting tabs, recomputed on every change so
 //!     it stays correct across a webview reload;
 //!   * a notification fires only while the main window is unfocused, one per
-//!     false→true transition. Its thread blocks in `send_notification` until
-//!     the user clicks or dismisses; a click focuses the window and routes
-//!     back to the tab via `focus-tab`.
+//!     false→true transition. It is posted through `UNUserNotificationCenter`
+//!     (the deprecated `NSUserNotificationCenter` no longer delivers on
+//!     modern macOS); posting is async and the request identifier is the tab
+//!     id, so a re-ring replaces the tab's existing banner instead of
+//!     stacking a second. Clicks come back through the delegate installed by
+//!     [`init_notifications`], focusing the window and routing to the tab
+//!     via `focus-tab`.
 //!
 //! Locking: only the registry lock is ever taken here — never the session
 //! map — preserving the "two locks, never held together" invariant.
 
 use crate::pty::registry::Registry;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// The window label in `tauri.conf.json`; must match `app.windows[].label`.
@@ -62,13 +64,7 @@ pub fn enter_waiting(app: &AppHandle, registry: &Registry, tab_id: &str) {
         .get(tab_id)
         .map(|tab| tab.title)
         .unwrap_or_else(|| "clitab".to_string());
-    // A notification already sitting in Notification Center routes a click
-    // to this same tab; stacking a second one would only add another thread
-    // blocked in `wait_for_click` and another polling timer on the main
-    // runloop, for as long as the user leaves both unattended.
-    if notification_begin(tab_id) {
-        spawn_notification(app.clone(), tab_id.to_string(), title);
-    }
+    post_notification(tab_id, &title);
 }
 
 /// The user typed into this tab: it answered, leave the queue.
@@ -83,52 +79,147 @@ pub fn respond(app: &AppHandle, registry: &Registry, tab_id: &str) {
     update_badge(app, registry);
 }
 
-/// One thread per notification: `send_notification` blocks (condvar inside
-/// `mac-notification-sys`) until the user clicks or dismisses it, and the
-/// response is what routes the click back to `tab_id`.
+/// Post the "waiting for input" banner. Runs on whichever reader thread
+/// rang: `addNotificationRequest` is async and nothing blocks on the user's
+/// answer. The identifier is the tab id, so Notification Center keeps one
+/// thread per tab and the delegate reads it back as the click-routing key.
 #[cfg(target_os = "macos")]
-fn spawn_notification(app: AppHandle, tab_id: String, title: String) {
-    std::thread::spawn(move || {
-        use mac_notification_sys::{Notification, NotificationResponse};
-        let response = Notification::new()
-            .title(&title)
-            .message("Waiting for input")
-            .wait_for_click(true)
-            .send();
-        if matches!(response, Ok(NotificationResponse::Click)) {
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
-                let _ = window.set_focus();
-            }
-            // The tab may be gone by now; the renderer guards on its mirror.
-            let _ = app.emit("focus-tab", serde_json::json!({ "tab_id": tab_id.as_str() }));
+fn post_notification(tab_id: &str, title: &str) {
+    use block2::RcBlock;
+    use objc2::AnyThread;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_user_notifications::{
+        UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter,
+    };
+
+    let content = UNMutableNotificationContent::init(UNMutableNotificationContent::alloc());
+    content.setTitle(&NSString::from_str(title));
+    content.setBody(&NSString::from_str("Waiting for input"));
+    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+        &NSString::from_str(tab_id),
+        &content,
+        None, // no trigger: deliver immediately
+    );
+    let done: RcBlock<dyn Fn(*mut NSError)> = RcBlock::new(|error: *mut NSError| {
+        if !error.is_null() {
+            // The previous sender silently stopped delivering and nobody
+            // noticed; leave a breadcrumb in stderr.
+            eprintln!("clitab: notification post failed");
         }
-        // Clicked, dismissed, or polled away: free the slot either way so a
-        // later ring of the same tab can notify again.
-        notification_end(&tab_id);
     });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .addNotificationRequest_withCompletionHandler(&request, Some(&done));
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_notification(_app: AppHandle, tab_id: String, _title: String) {
-    notification_end(&tab_id);
+fn post_notification(_tab_id: &str, _title: &str) {}
+
+/// Install the click delegate and ask for banner permission. Called from
+/// `lib.rs` setup: the permission prompt should surface at launch, in the
+/// foreground — never mid-session while the app is in the background.
+///
+/// `setDelegate` is a weak property, so the caller must keep the returned
+/// singleton alive for the process lifetime (leaked in setup, the same deal
+/// as the services provider).
+#[cfg(target_os = "macos")]
+pub(crate) fn init_notifications(
+    app: &AppHandle,
+) -> objc2::rc::Retained<notification_delegate::NotificationDelegate> {
+    use block2::RcBlock;
+    use objc2::runtime::{Bool, ProtocolObject};
+    use objc2_foundation::NSError;
+    use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
+
+    let delegate = notification_delegate::NotificationDelegate::new(app.clone());
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+    let done: RcBlock<dyn Fn(Bool, *mut NSError)> =
+        RcBlock::new(|_granted: Bool, _error: *mut NSError| {
+            // A denial is visible and reversible in System Settings; banners
+            // simply never appear and the rest of the queue (flash, badge,
+            // ⌘J) keeps working.
+        });
+    center.requestAuthorizationWithOptions_completionHandler(
+        UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+        &done,
+    );
+    delegate
 }
 
-/// Tabs whose notification is still pending: blocked in `wait_for_click`
-/// until the user clicks or dismisses it, which can outlive the waiting
-/// episode itself (typing clears the queue but not Notification Center).
-fn in_flight() -> &'static Mutex<HashSet<String>> {
-    static SLOTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
-}
+/// The `UNUserNotificationCenter` delegate: an ObjC class created at runtime
+/// with objc2, mirroring the services provider's pattern.
+#[cfg(target_os = "macos")]
+mod notification_delegate {
+    use super::MAIN_WINDOW;
+    use block2::DynBlock;
+    use objc2::rc::Retained;
+    use objc2::runtime::{NSObject, NSObjectProtocol};
+    use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+    use objc2_user_notifications::{
+        UNNotificationResponse, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    };
+    use tauri::{AppHandle, Emitter, Manager};
 
-/// Reserve the tab's notification slot; false when one is already pending.
-fn notification_begin(tab_id: &str) -> bool {
-    crate::pty::lock(in_flight()).insert(tab_id.to_string())
-}
+    pub(crate) struct DelegateIvars {
+        app: AppHandle,
+    }
 
-/// Release the slot once the notification thread has stopped waiting.
-fn notification_end(tab_id: &str) {
-    crate::pty::lock(in_flight()).remove(tab_id);
+    define_class!(
+        // SAFETY: `NSObject` has no subclassing requirements, the ivars are
+        // `Send + Sync`, and the class does not implement `Drop`. Left
+        // any-thread like the services provider: UN delivers delegate calls
+        // on its own queue, and the click routing hops to the main thread
+        // explicitly.
+        #[unsafe(super(NSObject))]
+        #[name = "ClitabNotificationDelegate"]
+        #[ivars = DelegateIvars]
+        pub(crate) struct NotificationDelegate;
+
+        // Required superclass conformance of the delegate protocol.
+        unsafe impl NSObjectProtocol for NotificationDelegate {}
+
+        unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
+            /// The user clicked the banner (dismissing one delivers no
+            /// response). The completion handler must be called or UN
+            /// considers the interaction unprocessed.
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            fn did_receive_response(
+                &self,
+                _center: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                completion_handler: &DynBlock<dyn Fn()>,
+            ) {
+                let tab_id = response
+                    .notification()
+                    .request()
+                    .identifier()
+                    .to_string();
+                let ivars = self.ivars();
+                let app = ivars.app.clone();
+                // Window work belongs on the main thread; UN calls this
+                // delegate on its own queue.
+                let _ = ivars.app.run_on_main_thread(move || {
+                    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                        let _ = window.set_focus();
+                    }
+                    // The tab may be gone by now; the renderer guards on its
+                    // mirror.
+                    let _ = app
+                        .emit("focus-tab", serde_json::json!({ "tab_id": tab_id.as_str() }));
+                });
+                completion_handler.call(());
+            }
+        }
+    );
+
+    impl NotificationDelegate {
+        pub(crate) fn new(app: AppHandle) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(DelegateIvars { app });
+            // SAFETY: plain `NSObject` initialization of a fresh allocation.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,22 +231,5 @@ mod tests {
         assert_eq!(badge_for(0), None);
         assert_eq!(badge_for(1), Some(1));
         assert_eq!(badge_for(3), Some(3));
-    }
-
-    #[test]
-    fn one_pending_notification_per_tab() {
-        let id = "dedupe-slot-test";
-        notification_end(id); // clear any residue from an earlier run
-        assert!(notification_begin(id), "first ring reserves the slot");
-        assert!(
-            !notification_begin(id),
-            "a ring while that notification is still pending must not stack a second"
-        );
-        notification_end(id);
-        assert!(
-            notification_begin(id),
-            "once the notification is answered the tab may notify again"
-        );
-        notification_end(id);
     }
 }

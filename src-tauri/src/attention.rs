@@ -17,6 +17,8 @@
 //! map — preserving the "two locks, never held together" invariant.
 
 use crate::pty::registry::Registry;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// The window label in `tauri.conf.json`; must match `app.windows[].label`.
@@ -60,7 +62,13 @@ pub fn enter_waiting(app: &AppHandle, registry: &Registry, tab_id: &str) {
         .get(tab_id)
         .map(|tab| tab.title)
         .unwrap_or_else(|| "clitab".to_string());
-    spawn_notification(app.clone(), tab_id.to_string(), title);
+    // A notification already sitting in Notification Center routes a click
+    // to this same tab; stacking a second one would only add another thread
+    // blocked in `wait_for_click` and another polling timer on the main
+    // runloop, for as long as the user leaves both unattended.
+    if notification_begin(tab_id) {
+        spawn_notification(app.clone(), tab_id.to_string(), title);
+    }
 }
 
 /// The user typed into this tab: it answered, leave the queue.
@@ -92,13 +100,36 @@ fn spawn_notification(app: AppHandle, tab_id: String, title: String) {
                 let _ = window.set_focus();
             }
             // The tab may be gone by now; the renderer guards on its mirror.
-            let _ = app.emit("focus-tab", serde_json::json!({ "tab_id": tab_id }));
+            let _ = app.emit("focus-tab", serde_json::json!({ "tab_id": tab_id.as_str() }));
         }
+        // Clicked, dismissed, or polled away: free the slot either way so a
+        // later ring of the same tab can notify again.
+        notification_end(&tab_id);
     });
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_notification(_app: AppHandle, _tab_id: String, _title: String) {}
+fn spawn_notification(_app: AppHandle, tab_id: String, _title: String) {
+    notification_end(&tab_id);
+}
+
+/// Tabs whose notification is still pending: blocked in `wait_for_click`
+/// until the user clicks or dismisses it, which can outlive the waiting
+/// episode itself (typing clears the queue but not Notification Center).
+fn in_flight() -> &'static Mutex<HashSet<String>> {
+    static SLOTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Reserve the tab's notification slot; false when one is already pending.
+fn notification_begin(tab_id: &str) -> bool {
+    crate::pty::lock(in_flight()).insert(tab_id.to_string())
+}
+
+/// Release the slot once the notification thread has stopped waiting.
+fn notification_end(tab_id: &str) {
+    crate::pty::lock(in_flight()).remove(tab_id);
+}
 
 #[cfg(test)]
 mod tests {
@@ -109,5 +140,22 @@ mod tests {
         assert_eq!(badge_for(0), None);
         assert_eq!(badge_for(1), Some(1));
         assert_eq!(badge_for(3), Some(3));
+    }
+
+    #[test]
+    fn one_pending_notification_per_tab() {
+        let id = "dedupe-slot-test";
+        notification_end(id); // clear any residue from an earlier run
+        assert!(notification_begin(id), "first ring reserves the slot");
+        assert!(
+            !notification_begin(id),
+            "a ring while that notification is still pending must not stack a second"
+        );
+        notification_end(id);
+        assert!(
+            notification_begin(id),
+            "once the notification is answered the tab may notify again"
+        );
+        notification_end(id);
     }
 }

@@ -188,7 +188,7 @@ export const TabItem: React.FC<TabItemProps> = ({
         </span>
         {hasStatusRow && (
           <span
-            className={`tab-status${tab.notice ? ' notice' : ''}${doneFaded ? ' done-hidden' : ''}`}
+            className={`tab-status${tab.notice ? ' notice' : ''}${doneFaded && !tab.notice ? ' done-hidden' : ''}`}
           >
             {statusText}
           </span>

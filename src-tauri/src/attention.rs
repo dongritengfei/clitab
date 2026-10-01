@@ -80,6 +80,16 @@ pub fn respond(app: &AppHandle, registry: &Registry, tab_id: &str) {
     update_badge(app, registry);
 }
 
+/// `UNUserNotificationCenter` exists only for bundled apps: calling into it
+/// from a bare binary — the one `tauri dev` spawns, or `cargo test` —
+/// segfaults. The bundle identifier is the cheapest proxy for "running as
+/// an app"; without it the queue keeps working minus notifications.
+#[cfg(target_os = "macos")]
+fn notifications_enabled() -> bool {
+    use objc2_foundation::NSBundle;
+    NSBundle::mainBundle().bundleIdentifier().is_some()
+}
+
 /// Post the "waiting for input" banner. Runs on whichever reader thread
 /// rang: `addNotificationRequest` is async and nothing blocks on the user's
 /// answer. The identifier is the tab id plus `#` and the epoch in millis —
@@ -88,6 +98,9 @@ pub fn respond(app: &AppHandle, registry: &Registry, tab_id: &str) {
 /// splits the suffix back off as the click-routing key.
 #[cfg(target_os = "macos")]
 fn post_notification(tab_id: &str, title: &str) {
+    if !notifications_enabled() {
+        return;
+    }
     use block2::RcBlock;
     use objc2::AnyThread;
     use objc2_foundation::{NSError, NSString};
@@ -143,6 +156,11 @@ pub(crate) fn init_notifications(
     use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
 
     let delegate = notification_delegate::NotificationDelegate::new(app.clone());
+    if !notifications_enabled() {
+        // Dev / test process: no bundle, no UN. The queue (flash, badge,
+        // ⌘J) is untouched; only banners are absent.
+        return delegate;
+    }
     let center = UNUserNotificationCenter::currentNotificationCenter();
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
@@ -250,5 +268,14 @@ mod tests {
         assert_eq!(badge_for(0), None);
         assert_eq!(badge_for(1), Some(1));
         assert_eq!(badge_for(3), Some(3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unbundled_process_reads_notifications_disabled() {
+        // `cargo test` runs without an app bundle — the same condition as
+        // the bare binary `tauri dev` spawns, where UNUserNotificationCenter
+        // segfaults. The gate must read false here.
+        assert!(!notifications_enabled());
     }
 }

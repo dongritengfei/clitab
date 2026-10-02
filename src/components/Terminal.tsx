@@ -132,10 +132,11 @@ export const Terminal: React.FC<TerminalProps> = ({
       allowProposedApi: true,
       cursorBlink: true,
       fontSize: 14,
-      // JetBrains Mono and the Nerd symbol fallback are bundled with the app
+      // JetBrains Mono and the Nerd-patched fallback are bundled with the app
       // (see main.tsx / App.css), so the stack resolves the same everywhere —
-      // Ghostty-like metrics, and powerline/devicon PUA glyphs always render.
-      fontFamily: '"JetBrains Mono", "Symbols Nerd Font Mono", Menlo, monospace',
+      // Ghostty-like metrics, and powerline/devicon PUA glyphs always render
+      // inside a single cell.
+      fontFamily: '"JetBrains Mono", "JetBrainsMono Nerd Font Mono", Menlo, monospace',
       scrollback: 5000,
       theme: {
         background: '#1e1e2e',

@@ -127,6 +127,9 @@ export const Terminal: React.FC<TerminalProps> = ({
     let resizeTimer: number | undefined;
 
     const term = new XTerm({
+      // registerDecoration (the timeline jump highlight) is proposed API;
+      // without this flag the call throws instead of returning a decoration.
+      allowProposedApi: true,
       cursorBlink: true,
       fontSize: 14,
       // JetBrains Mono and the Nerd symbol fallback are bundled with the app

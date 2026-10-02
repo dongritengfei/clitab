@@ -1,8 +1,13 @@
 import { useCallback } from 'react';
 import { TabList } from './components/TabList';
 import { Terminal } from './components/Terminal';
+import { TimelinePanel } from './components/TimelinePanel';
 import { useTabManager } from './hooks/useTabManager';
+import type { TimelineEvent } from './lib/timeline';
 import './App.css';
+
+/** Stable empty array, so an eventless panel does not re-render every tick. */
+const NO_EVENTS: TimelineEvent[] = [];
 
 function App() {
   const {
@@ -17,6 +22,9 @@ function App() {
     detachTab,
     writeInput,
     resizePty,
+    timelines,
+    staleEvents,
+    navigateToEvent,
   } = useTabManager();
 
   // Clicking (or pressing Enter/Space on) a tab must land the caret in its
@@ -81,6 +89,14 @@ function App() {
           ))
         )}
       </div>
+      <TimelinePanel
+        tabId={activeTabId}
+        events={activeTabId ? timelines[activeTabId] ?? NO_EVENTS : NO_EVENTS}
+        isStale={(eventId) => activeTabId !== null && staleEvents.has(`${activeTabId}:${eventId}`)}
+        onNavigate={(eventId) => {
+          if (activeTabId) navigateToEvent(activeTabId, eventId);
+        }}
+      />
     </div>
   );
 }

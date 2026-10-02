@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import { registerTerm, unregisterTerm } from '../lib/termRegistry';
 
 interface TerminalProps {
   tabId: string;
@@ -146,6 +147,7 @@ export const Terminal: React.FC<TerminalProps> = ({
     term.open(container);
     fitRef.current = fitAddon;
     termRef.current = term;
+    registerTerm(tabId, term);
 
     // No WebGL renderer, on purpose. Every tab keeps its terminal mounted (hidden
     // ones use `visibility: hidden` so they stay measurable), so one GL context
@@ -367,6 +369,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       callbacks.current.detach(tabId);
       if (fitRef.current === fitAddon) fitRef.current = null;
       if (termRef.current === term) termRef.current = null;
+      unregisterTerm(tabId, term);
       term.dispose();
     };
   }, [tabId]);

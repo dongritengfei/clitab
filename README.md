@@ -30,7 +30,12 @@ parallel agents stays glanceable from whichever tab you are in.
 ## Features
 
 - **Real PTY tabs** — each tab spawns your `$SHELL` through a per-tab
-  pseudo-terminal; tabs stay alive while hidden and keep their size.
+  pseudo-terminal; tabs stay alive while hidden and keep their size. A new tab
+  opens in the current tab's working directory.
+- **Open from Finder** — right-click a folder in Finder and choose
+  Services → "New clitab Tab Here" to open a tab in that directory. Works on
+  files (opens the containing folder) and on the Finder window background
+  (opens the window's folder), whether or not clitab is running.
 - **Automatic tab names** — the title is the working directory (reported by a
   shell-integration hook on every prompt), and switches to the session name
   when Claude Code sets a terminal title. It reverts to the directory when the
@@ -38,6 +43,20 @@ parallel agents stays glanceable from whichever tab you are in.
 - **Attention flash** — a tab flashes when Claude Code asks for input or sends
   a notification (BEL / OSC 9). See [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) for the
   one-time hook setup.
+- **Attention triage** — a session that needs input joins a waiting queue:
+  the Dock badge counts them, `⌘J` jumps to the next one, and while clitab
+  is in the background a macOS notification announces each; clicking a
+  notification goes straight to that tab. A tab leaves the queue when you
+  type in it — switching alone does not.
+- **Tab dashboard** — with the optional Claude Code hooks (`CLAUDE_HOOKS.md`),
+  each tab shows what its session is doing: the running tool with a live
+  timer, the last turn's duration, and notifications waiting for you. Built on
+  a private OSC 7777 protocol other terminals simply ignore.
+- **Session timeline** — the right-hand panel logs the key moments of the
+  active tab's Claude Code session: turn started, permission requests, turn
+  finished (with duration). Click an entry to scroll the terminal to that
+  point; entries whose output has scrolled out of the 5000-line history are
+  grayed out. Powered by the same hooks as the dashboard.
 - **Desktop-grade shortcuts** — a native menu drives ⌘T / ⌘W / ⌃Tab / ⌘1–9,
   so they work even when the terminal does not have keyboard focus. Closing a
   tab with a running process asks first.
@@ -97,23 +116,11 @@ Both builds are native; nothing needs Rosetta.
 Run `claude` in any tab like you would in a normal terminal — clitab picks up
 the session title from the escape sequences Claude Code already emits.
 
-For the attention flash, add a Notification hook to your Claude Code settings
-(`~/.claude/settings.json`) that rings the bell:
-
-```json
-{
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": ".*",
-        "hooks": [{ "type": "command", "command": "printf '\\a'" }]
-      }
-    ]
-  }
-}
-```
-
-Details and troubleshooting: [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md).
+The attention flash, the tab dashboard and the session timeline are powered by
+Claude Code hooks:
+add the configuration from [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) to your Claude
+Code settings (`~/.claude/settings.json`). That page has the details and
+troubleshooting.
 
 ## Shortcuts
 
@@ -125,9 +132,13 @@ the terminal does not have keyboard focus.
 | `⌘T` | New tab |
 | `⌘W` | Close tab (asks first if a process is still running) |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
+| `⌘J` | Jump to the next tab waiting for input |
 | `⌘1` … `⌘8` | Jump to tab 1–8 |
 | `⌘9` | Jump to the last tab |
 | `⌘C` / `⌘V` / `⌘A` | Copy / paste / select all |
+
+> Notifications appear only while clitab is in the background. If they never
+> show up, check System Settings → Notifications → clitab.
 
 In the tab list, arrow keys / Home / End move between tabs.
 

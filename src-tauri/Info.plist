@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMessage</key>
+      <string>openTab</string>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>New clitab Tab Here</string>
+      </dict>
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSTextContent</key>
+        <string>FilePath</string>
+      </dict>
+      <key>NSSendTypes</key>
+      <array>
+        <string>NSFilenamesPboardType</string>
+        <string>public.file-url</string>
+        <string>public.plain-text</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

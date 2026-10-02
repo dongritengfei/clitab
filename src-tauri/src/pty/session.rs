@@ -2,6 +2,7 @@ use super::lock;
 use super::registry::Registry;
 use super::shell_integration;
 use crate::osc::{self, OscEvent, OscParser};
+use crate::status::{self, StatusEvent};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::VecDeque;
@@ -142,6 +143,15 @@ impl PtySession {
         // foreground, and cleared when its turn ends / the shell prompt returns.
         let program_active = Arc::new(AtomicBool::new(false));
 
+        // The attention watcher needs the registry too (enter_waiting), and
+        // the reader thread takes ownership of the original below.
+        let watcher_registry = Arc::clone(&registry);
+
+        // Set when the tab flashed for the current turn — shared between the
+        // idle watcher and the hook protocol so an explicit `stop` event can
+        // flash immediately without the watcher repeating it 2s later.
+        let flashed = Arc::new(AtomicBool::new(false));
+
         // Reader thread: pump PTY output into the renderer + OSC parser.
         {
             let tab_id = tab_id.clone();
@@ -150,6 +160,7 @@ impl PtySession {
             let running = Arc::clone(&running);
             let last_activity = Arc::clone(&last_activity);
             let program_active = Arc::clone(&program_active);
+            let flashed = Arc::clone(&flashed);
             thread::spawn(move || {
                 Self::read_loop(
                     tab_id,
@@ -160,6 +171,7 @@ impl PtySession {
                     running,
                     last_activity,
                     program_active,
+                    flashed,
                 );
             });
         }
@@ -172,20 +184,22 @@ impl PtySession {
             let running = Arc::clone(&running);
             let last_activity = Arc::clone(&last_activity);
             let program_active = Arc::clone(&program_active);
+            let registry = watcher_registry;
+            let flashed = Arc::clone(&flashed);
             thread::spawn(move || {
-                let mut flashed = false;
                 while running.load(Ordering::Relaxed) {
                     thread::sleep(WATCHER_POLL);
                     if !program_active.load(Ordering::Relaxed) {
-                        flashed = false;
+                        flashed.store(false, Ordering::Relaxed);
                         continue;
                     }
                     let idle = lock(&last_activity).elapsed();
                     if idle < TURN_IDLE {
                         continue; // still streaming
                     }
-                    if !flashed {
-                        flashed = true;
+                    // swap: only the first caller of a turn emits the flash.
+                    if !flashed.swap(true, Ordering::Relaxed) {
+                        crate::attention::enter_waiting(&app, &registry, &tab_id);
                         let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                     }
                 }
@@ -229,6 +243,7 @@ impl PtySession {
         running: Arc<AtomicBool>,
         last_activity: Arc<Mutex<Instant>>,
         program_active: Arc<AtomicBool>,
+        flashed: Arc<AtomicBool>,
     ) {
         let mut buf = vec![0u8; READ_CHUNK];
         let mut parser = OscParser::new();
@@ -247,6 +262,7 @@ impl PtySession {
                             &registry,
                             &program_active,
                             &last_activity,
+                            &flashed,
                             event,
                         );
                     }
@@ -278,6 +294,7 @@ impl PtySession {
         registry: &Registry,
         program_active: &AtomicBool,
         last_activity: &Mutex<Instant>,
+        flashed: &AtomicBool,
         event: OscEvent,
     ) {
         match event {
@@ -306,6 +323,7 @@ impl PtySession {
                 );
             }
             OscEvent::Bell => {
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
             }
             OscEvent::PromptReady => {
@@ -313,9 +331,64 @@ impl PtySession {
                 program_active.store(false, Ordering::Relaxed);
                 registry.clear_program_title(tab_id);
                 *lock(last_activity) = Instant::now();
+                // After clear_program_title: the notification then carries the
+                // same title the tab bar shows (the cwd it reverted to).
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }
+            OscEvent::Clitab(json) => {
+                // Unknown kinds and malformed payloads decode to None and are
+                // dropped: a hook emitting something newer than this build
+                // must be a no-op, never an error.
+                if let Some(event) = status::decode(&json) {
+                    Self::handle_status(tab_id, app, registry, flashed, event);
+                }
+            }
+        }
+    }
+
+    /// Apply one hook-protocol event: registry transition, then broadcast the
+    /// tab's full protocol state so the renderer replaces (not merges) it.
+    fn handle_status(
+        tab_id: &str,
+        app: &AppHandle,
+        registry: &Registry,
+        flashed: &AtomicBool,
+        event: StatusEvent,
+    ) {
+        let now = now_ms();
+        match event {
+            StatusEvent::Prompt => registry.begin_turn(tab_id, now),
+            StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
+            StatusEvent::Stop => {
+                registry.end_turn(tab_id, now);
+                // An explicit turn-end beats the 2s idle heuristic: flash now
+                // and suppress the watcher's duplicate. Like every flash
+                // trigger, this enters the triage queue (set_waiting's
+                // transition guard keeps badge/notification exactly-once).
+                flashed.store(true, Ordering::Relaxed);
+                crate::attention::enter_waiting(app, registry, tab_id);
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                // Deliberately does NOT touch program_active or the title:
+                // Claude Code is still running between turns. (Title revert
+                // stays owned by the shell integration's `claude-done`.)
+            }
+            StatusEvent::Notify { msg } => {
+                registry.set_notice(tab_id, msg, now);
+                crate::attention::enter_waiting(app, registry, tab_id);
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            }
+        }
+        if let Some(tab) = registry.get(tab_id) {
+            let _ = app.emit(
+                "tab-status",
+                serde_json::json!({
+                    "tab_id": tab_id,
+                    "status": tab.status,
+                    "notice": tab.notice,
+                }),
+            );
         }
     }
 
@@ -372,6 +445,15 @@ impl Drop for PtySession {
         self.kill();
         self.integration.cleanup();
     }
+}
+
+/// Epoch milliseconds, the clock the whole protocol speaks: `Instant` would
+/// not survive the IPC boundary or a webview reload.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Forward raw PTY bytes. They travel base64-encoded because a Tauri event

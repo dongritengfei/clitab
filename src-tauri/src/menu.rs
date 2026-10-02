@@ -20,11 +20,12 @@ pub const CLOSE_TAB: &str = "close-tab";
 pub const NEXT_TAB: &str = "next-tab";
 pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
+pub const NEXT_WAITING: &str = "next-waiting";
 
 /// Menu ids we forward to the renderer. Everything else (quit, copy, paste,
 /// minimize, ...) is handled natively by predefined menu items.
 fn is_tab_action(id: &str) -> bool {
-    matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB)
+    matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB | NEXT_WAITING)
         || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
 }
 
@@ -50,6 +51,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let close_tab = item(app, CLOSE_TAB, "Close Tab", "CmdOrCtrl+W")?;
     let next_tab = item(app, NEXT_TAB, "Next Tab", "Control+Tab")?;
     let prev_tab = item(app, PREV_TAB, "Previous Tab", "Control+Shift+Tab")?;
+    let next_waiting = item(app, NEXT_WAITING, "Next Waiting Tab", "CmdOrCtrl+J")?;
 
     // ⌘1 … ⌘9 jump straight to a tab.
     let mut indexed: Vec<MenuItem<R>> = Vec::with_capacity(9);
@@ -68,6 +70,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&next_tab)
         .item(&prev_tab)
+        .item(&next_waiting)
         .separator();
     for tab in &indexed {
         tabs = tabs.item(tab);
@@ -128,6 +131,7 @@ mod tests {
         assert!(is_tab_action(CLOSE_TAB));
         assert!(is_tab_action(NEXT_TAB));
         assert!(is_tab_action(PREV_TAB));
+        assert!(is_tab_action(NEXT_WAITING));
         assert!(is_tab_action("select-tab-1"));
         assert!(is_tab_action("select-tab-9"));
     }

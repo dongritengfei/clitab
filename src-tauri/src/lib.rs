@@ -10,8 +10,10 @@ use pty::manager::{ManagerError, TabManager};
 use pty::registry::TabRecord;
 use serde::{Deserialize, Serialize};
 use status::{Notice, TabStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{Listener, Manager, State};
+use tauri::{AppHandle, Listener, Manager, RunEvent, State, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// Errors cross the IPC boundary as strings, so "the tab is gone" — which the
 /// renderer must tolerate silently — gets an explicit marker instead of being
@@ -156,12 +158,58 @@ fn ack_tab_notice(state: State<'_, AppState>, tab_id: String) -> Result<(), Stri
     Ok(())
 }
 
+/// Ask the user to confirm quitting, then exit if they do. Shared by both
+/// quit paths (the window close button and ⌘Q): quitting kills every tab,
+/// so unlike a single-tab close it always asks. `quit_confirmed` lets the
+/// `app.exit(0)` below re-enter `ExitRequested` without a second dialog.
+fn confirm_quit(app: &AppHandle, quit_confirmed: Arc<AtomicBool>) {
+    let handle = app.clone();
+    app.dialog()
+        .message("All open terminals will be closed. Quit clitab?")
+        .title("Quit clitab")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancel)
+        .show(move |quit| {
+            if quit {
+                quit_confirmed.store(true, Ordering::Relaxed);
+                handle.exit(0);
+            }
+        });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let quit_confirmed = Arc::new(AtomicBool::new(false));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .menu(menu::build)
-        .on_menu_event(|app, event| menu::forward(app, event.id().as_ref()))
+        .on_menu_event({
+            let quit_confirmed = quit_confirmed.clone();
+            move |app, event| {
+                if event.id().as_ref() == menu::QUIT {
+                    // The custom Quit item (see menu.rs for why it is not the
+                    // predefined one): confirm here, exit only on yes. The
+                    // `app.exit(0)` re-enters `ExitRequested` below, where
+                    // the flag lets it through without asking twice.
+                    confirm_quit(app, quit_confirmed.clone());
+                } else {
+                    menu::forward(app, event.id().as_ref());
+                }
+            }
+        })
+        .on_window_event({
+            let quit_confirmed = quit_confirmed.clone();
+            move |window, event| {
+                // Closing the window quits the app, so it gets the same
+                // confirmation as the Quit menu item (handled in
+                // `on_menu_event` above).
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    confirm_quit(window.app_handle(), quit_confirmed.clone());
+                }
+            }
+        })
         .setup(|app| {
             let tab_manager = Arc::new(TabManager::new(app.handle().clone()));
             app.manage(AppState {
@@ -225,8 +273,20 @@ pub fn run() {
             has_active_process,
             ack_tab_notice
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(move |app_handle, event| {
+            // Safety net for any exit request that still reaches the event
+            // loop (e.g. the last window being destroyed): hold it until the
+            // user confirms. A confirmed `app.exit(0)` re-enters here; the
+            // flag lets that one through.
+            if let RunEvent::ExitRequested { api, .. } = event {
+                if !quit_confirmed.load(Ordering::Relaxed) {
+                    api.prevent_exit();
+                    confirm_quit(app_handle, quit_confirmed.clone());
+                }
+            }
+        });
 }
 
 /// Typed mirror of the `tab-exit` payload, so the listener does not have to fish

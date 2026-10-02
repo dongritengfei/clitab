@@ -4,50 +4,54 @@
 
 **Goal:** Show a right-side panel listing Claude Code conversation events (user prompt, agent question, agent done, user choice) with text + timestamps; clicking an entry scrolls the terminal to the position where the event happened.
 
-**Architecture:** Claude Code hooks run a tiny POSIX-sh script that writes the hook's stdin JSON (truncated, base64-encoded) into the PTY stream as `OSC 9;clitab-agent;<b64>`. The Rust OSC parser decodes it *together with the sequence's absolute byte-stream offset*, stores the event per tab in the Registry, and emits an `agent-event` Tauri event. The renderer writes output chunks tagged with `seq`; when a write reaches an event's `seq` it registers an xterm marker at that exact buffer line. Clicking a panel row scrolls to the marker.
+**Architecture:** Claude Code hooks already speak the **OSC 7777 protocol** to their tab (the shipped dashboard: turn state, tool timer, notifications — see `status.rs` and `CLAUDE_HOOKS.md`). This plan extends the same wire with conversation text: `{"e":"prompt","text":…}` and `{"e":"notify","msg":…}` carry user-visible text, `{"e":"stop"}` marks turn end, and a new `{"e":"choice","text":…}` (PostToolUse, matcher `AskUserQuestion`) reports selections. Two things are added on the Rust side: the OSC parser reports each decoded event's **absolute byte-stream offset**, and `handle_status` maps decoded events into per-tab **`AgentEvent`** records — stored in the Registry, emitted as an `agent-event` Tauri event carrying `seq`. The renderer writes output chunks tagged with `seq`; when a write reaches an event's `seq` it registers an xterm marker at that exact buffer line. Clicking a panel row scrolls to the marker.
 
-**Tech Stack:** Tauri 2 / Rust (portable-pty; existing `uuid`, `base64`, `serde_json` crates — **no new crates**), React 18 + xterm.js (`registerMarker` / `scrollLines` are existing public API — **no new npm deps**).
+**Tech Stack:** Tauri 2 / Rust (portable-pty; existing `uuid`, `serde_json` crates — **no new crates**), React 18 + xterm.js (`registerMarker` / `scrollLines` are existing public API — **no new npm deps**).
 
-**Spec:** `docs/superpowers/specs/2026-10-01-agent-event-panel-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-01-agent-event-panel-design.md` (revision 2)
 
 **Execution note (user requirement):** implementation runs in a git worktree — create it via superpowers:using-git-worktrees before Task 1.
+
+**Revision 2 (2026-10-02):** rebased onto the shipped OSC 7777 dashboard work and the probe verdict of commit efd762d (hooks have no controlling terminal and their stdout is captured — only the ancestor-tty transport works). Dropped from revision 1: the OSC 9 `clitab-agent` channel, the base64 hook script, the salvage decoder, and all "legacy attention effects" (the shipped `handle_status` already owns flash/queue behavior; the `stop`-never-touches-the-title invariant stands). The installer now writes the same inline commands `CLAUDE_HOOKS.md` documents and upgrades existing manual installs in place.
 
 ## Global Constraints
 
 - No new Rust crates, no new npm dependencies.
-- `MAX_OSC_LEN` (4096) in `osc.rs` stays unchanged; the hook script caps stdin at 2800 bytes so the base64 payload (~3.8 KB) fits.
-- Event text truncated to 140 chars (char-safe, CJK); per-tab event list capped at 200, oldest evicted first.
-- Tauri event payload keys stay snake_case (`tab_id`), matching existing events. `AgentEvent` fields (`id`/`kind`/`text`/`time`/`seq`) are single words — identical in any casing convention.
-- The re-attach dedup invariant is untouchable: `pty-output` chunks are emitted **while holding the stream lock**, each carrying its absolute `seq`; only the renderer-side `OutputHandler` signature gains the `seq` it already had internally.
-- OSC handling in `read_loop` happens before the stream lock is taken (as today).
+- OSC 7777 is extended, never forked: wire payloads stay valid JSON; `text` is optional (old builds ignore unknown fields — the serde forward-compat already documented in `status.rs`). No new OSC codes.
+- `MAX_OSC_LEN` (4096) in `osc.rs` stays unchanged; hook commands slice text at the wire with jq (`.[0:140]`), and Rust truncates to `TEXT_LIMIT = 140` chars (char-safe, CJK) as the authoritative cap.
+- Hook commands must use the ancestor-tty transport (probe verdict efd762d): `t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')`, write `> /dev/$t` guarded by `[ -n "$t" ] && [ "$t" != '??' ]`, end with `; true`. `/dev/tty` and stdout do NOT reach the PTY — do not "simplify" them back in.
+- Every hook degrades silently without jq (bare payload or no payload), matching the shipped dashboard's degradation philosophy.
+- Per-tab event list capped at 200 (oldest evicted); duplicate guard: same kind + same text within 2000 ms is rejected (hooks fire once per settings level — the dashboard's duplicate-Stop guard proves this happens).
+- `stop`/panel handling must NOT touch `program_active` or the title: the shipped invariant in `session.rs` says title revert stays owned by the shell integration's `claude-done`.
+- The re-attach dedup invariant is untouchable: `pty-output` chunks are emitted **while holding the stream lock**, each carrying its absolute `seq`. `agent-event` is emitted from `handle_osc` **before** the stream lock is taken, i.e. before the `pty-output` chunk containing its OSC bytes — the renderer must therefore anchor from a synchronous ref, not React state.
+- Tauri event payload keys stay snake_case (`tab_id`); command responses are camelCase via serde. `AgentEvent` fields (`id`/`kind`/`text`/`time`/`seq`) are single words — identical in any casing convention; `kind` serializes kebab-case.
 - Checks: Rust = `cargo test --manifest-path src-tauri/Cargo.toml --lib`; frontend = `npm run typecheck` (no test runner exists; do not add one).
 - Every commit message ends with the attribution line:
   `Co-Authored-By: Claude Code <noreply@anthropic.com>`
-- Existing `claude-done` → `prompt-ready` / flash / title-revert code path stays as-is; decoded events additionally drive the same effects (spec: "Preserving existing attention/title behavior").
 
 ## Review Focus
 
-The five spec-implied failure modes no single task's tests fully exercise, most likely first. Each is pinned to the owning task below.
+The failure modes no single task's tests fully exercise, most likely first. Each is pinned to the owning task below.
 
-1. **A hook type whose output never reaches the PTY** (neither `/dev/tty` nor stdout) → that event kind silently missing while others work. Pinned by Task 1 (probe before any product code; if the probe fails, STOP and report — the design's core assumption is broken).
-2. **Truncated JSON cut mid multi-byte UTF-8 char** (the 2800-byte cap lands inside a CJK prompt) → decode must not panic, salvage still yields the event kind. Pinned by Task 3 test `truncated_mid_multibyte_is_salvaged`.
-3. **Forged / garbage `clitab-agent` OSC** from any program `cat`-ing binary noise → dropped without panic or state corruption. Pinned by Task 2 test `agent_event_requires_prefix` + Task 3 test `garbage_is_dropped`.
-4. **`~/.claude/settings.json` in an unexpected shape** (hooks not an object, an event entry not an array, foreign hooks present) → merge normalizes clitab's entries and preserves user data byte-for-byte otherwise; malformed JSON is refused, never overwritten. Pinned by Task 6 tests `merge_preserves_foreign_hooks`, `merge_replaces_stale_clitab_entries`, `merge_normalizes_broken_shapes`.
-5. **Jump target no longer reachable** (marker trimmed out of the 5000-line scrollback, or event seq older than the replay ring after a webview reload) → silent no-op, terminal keeps working. Pinned by Task 8's `isDisposed`/missing-marker guard + Task 11 manual acceptance item.
+1. **`PostToolUse` with matcher `AskUserQuestion` never fires, or `tool_response` has an unexpected shape** → the `user-choice` kind silently missing while others work. Pinned by Task 1 (probe before any product code; if the hook never fires, STOP and report — `user-choice` is dropped from v1 and Tasks 3/6/9/10 shed it).
+2. **Duplicate hook fires** (same hook registered at user + project settings level) → doubled panel rows that also diverge from the restored-after-reload list. Pinned by Task 4's dedup test and Task 5's emit-only-when-accepted rule.
+3. **Existing manual OSC 7777 installs must be upgraded, not duplicated** (the current `CLAUDE_HOOKS.md` commands are in real users' settings.json — including this repo's author). Pinned by Task 6 test `merge_replaces_existing_manual_osc_entries`, whose fixture is the exact shipped command strings.
+4. **Forged / garbage / oversized OSC 7777 payloads** from any program `cat`-ing binary noise → dropped without panic (existing `status::decode` tolerance + parser cap); long prompt text → truncated at 140 chars, never mid-codepoint. Pinned by Task 3 tests `text_truncated_to_limit_chars` + existing `status.rs` malformed-input tests.
+5. **Jump target no longer reachable** (marker trimmed out of the 5000-line scrollback, event seq older than the 256 KB replay ring after a webview reload, alt-screen replay dropped) → silent no-op, terminal keeps working. Pinned by Task 8's `isDisposed`/missing-marker guard + Task 11 manual acceptance items.
 
 ---
 
-### Task 1: Probe — verify the hook → PTY path and payload shapes
+### Task 1: Probe — verify the AskUserQuestion PostToolUse payload shape
 
-Throwaway verification. **No product code.** The whole design rests on "a Claude Code hook process can write bytes that land in the PTY output stream"; verify it (and learn the real JSON shapes) before building anything.
+Throwaway verification. **No product code.** The transport question is already verdict'd (commit efd762d; the shipped dashboard hooks prove OSC 7777 reaches the PTY via the ancestor tty in production). What remains unknown: whether `PostToolUse` with matcher `AskUserQuestion` fires at all, and where the user's selection lives in its stdin JSON. Task 6's `choice` jq expression is written against this shape.
 
 **Files:**
 - Create (throwaway, outside the repo): `/tmp/clitab-probe/.claude/settings.json`
-- Output artifacts: `/tmp/clitab-probe/session.txt`, `/tmp/clitab-probe/*.json`
+- Output artifacts: `/tmp/clitab-probe/*.json`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: verified facts — (a) which write path (`/dev/tty` and/or stdout) reaches the PTY per hook type; (b) exact stdin JSON shapes for `UserPromptSubmit`, `Notification`, `Stop`, `PostToolUse`+`AskUserQuestion` (especially where the user's selection lives in `tool_response`). Task 3's decoder is written against these shapes.
+- Produces: verified facts — (a) `PostToolUse`+`AskUserQuestion` fires (or the stop-the-line verdict); (b) the exact `tool_response` structure and a working jq expression extracting the user's selection; (c) confirmation that `UserPromptSubmit` stdin carries the prompt in `.prompt` as a plain string.
 
 - [ ] **Step 1: Write the probe hook config**
 
@@ -57,46 +61,47 @@ cat > /tmp/clitab-probe/.claude/settings.json <<'EOF'
 {
   "hooks": {
     "UserPromptSubmit": [{ "hooks": [{ "type": "command",
-      "command": "cat > /tmp/clitab-probe/prompt.json; printf '\\033]9;clitab-probe;prompt\\033\\\\' > /dev/tty" }] }],
-    "Notification": [{ "matcher": ".*", "hooks": [{ "type": "command",
-      "command": "cat > /tmp/clitab-probe/notification.json; printf '\\033]9;clitab-probe;notification\\033\\\\' > /dev/tty" }] }],
-    "Stop": [{ "hooks": [{ "type": "command",
-      "command": "cat > /tmp/clitab-probe/stop.json; printf '\\033]9;clitab-probe;stop\\033\\\\' > /dev/tty" }] }],
+      "command": "cat > /tmp/clitab-probe/prompt.json" }] }],
     "PostToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command",
-      "command": "cat > /tmp/clitab-probe/choice.json; printf '\\033]9;clitab-probe;choice\\033\\\\' > /dev/tty" }] }]
+      "command": "cat > /tmp/clitab-probe/choice.json" }] }]
   }
 }
 EOF
 ```
 
-Each hook dumps its stdin JSON to a file (that is what we want to learn) and writes a distinguishable OSC marker to `/dev/tty`.
+Each hook dumps its stdin JSON to a file. No tty writes needed — we are probing payload shapes, not transport. (A project-level `.claude/settings.json` merges with the user's global hooks; if your global `~/.claude/settings.json` has OSC 7777 hooks, they fire too — harmless for this probe.)
 
-- [ ] **Step 2: Run Claude Code under `script` so the PTY stream is recorded**
-
-```bash
-cd /tmp/clitab-probe && script -q /tmp/clitab-probe/session.txt claude
-```
-
-Inside the session: (1) send any short prompt and let the turn finish (covers UserPromptSubmit + Stop + likely Notification); (2) send `请用 AskUserQuestion 工具问我一个单选题` and answer the choice (covers PostToolUse); (3) exit Claude, then `exit` the script session.
-
-- [ ] **Step 3: Check the markers reached the PTY stream**
+- [ ] **Step 2: Run Claude Code in the probe directory**
 
 ```bash
-grep -c 'clitab-probe;' /tmp/clitab-probe/session.txt
-grep -o 'clitab-probe;[a-z]*' /tmp/clitab-probe/session.txt | sort | uniq -c
+cd /tmp/clitab-probe && claude
 ```
 
-Expected: count ≥ 1, and ideally all four kinds (`prompt`, `notification`, `stop`, `choice`) present. If `/dev/tty` markers are missing, retry with the redirect removed (bare `printf ...`, i.e. stdout) and re-run — record which path works. If neither path delivers for a hook type, note which; if NONE deliver, **STOP and report** (design risk materialized).
+Inside the session: (1) send any short prompt and let the turn finish; (2) send `请用 AskUserQuestion 工具问我一个单选题` and answer the choice; (3) exit Claude.
 
-- [ ] **Step 4: Inspect the payload shapes**
+- [ ] **Step 3: Inspect the payload shapes**
 
 ```bash
-for f in /tmp/clitab-probe/*.json; do echo "== $f"; head -c 600 "$f"; echo; done
+for f in /tmp/clitab-probe/*.json; do echo "== $f"; head -c 800 "$f"; echo; done
 ```
 
-Record: the exact key holding the prompt text (`prompt`), the notification text (`message`), and the structure of `tool_input` / `tool_response` for `AskUserQuestion` (where the user's selected option label lives). Paste these findings into the task report — Task 3's `choice_text` and salvage extractor are adjusted to match reality.
+Record: the key holding the prompt text (expected: `.prompt`, a plain string), and the structure of `tool_input` / `tool_response` for `AskUserQuestion` (where the selected option label(s) live).
 
-- [ ] **Step 5: Clean up and report**
+- [ ] **Step 4: Pin the choice jq expression**
+
+Test the candidate expression against the captured payload:
+
+```bash
+jq -c '{e:"choice",text:((.tool_response.answers // .tool_response // "")|tostring|.[0:140])}' < /tmp/clitab-probe/choice.json
+```
+
+If `text` is not a readable summary of the user's selection, adjust the expression (e.g. index into the real `tool_response` shape) and re-test until it is. **Paste the final expression into the task report** — Task 6 embeds it verbatim.
+
+- [ ] **Step 5: Stop-the-line check**
+
+If `choice.json` was never created, the `PostToolUse`/`AskUserQuestion` hook does not fire: **STOP and report**. The fallback scope is dropping the `user-choice` kind from v1 — Tasks 3/6/9/10 then omit the `Choice` variant, the `PostToolUse` registration, the `You chose` label, and the docs row respectively.
+
+- [ ] **Step 6: Clean up and report**
 
 ```bash
 rm -rf /tmp/clitab-probe
@@ -106,7 +111,7 @@ No commit (nothing in the repo changed). Report findings before starting Task 2.
 
 ---
 
-### Task 2: `osc.rs` — `AgentEvent` variant + absolute stream offsets
+### Task 2: `osc.rs` — absolute stream offsets
 
 **Files:**
 - Modify: `src-tauri/src/osc.rs`
@@ -115,7 +120,7 @@ No commit (nothing in the repo changed). Report findings before starting Task 2.
 
 **Interfaces:**
 - Consumes: nothing (leaf module).
-- Produces: `OscEvent::AgentEvent(String)` (the base64 payload after `clitab-agent;`), and `OscParser::parse(&mut self, data: &[u8]) -> Vec<(OscEvent, u64)>` where the `u64` is the absolute stream position of the sequence's leading `ESC`. Tasks 3/5 rely on both.
+- Produces: `OscParser::parse(&mut self, data: &[u8]) -> Vec<(OscEvent, u64)>` where the `u64` is the absolute stream position of the sequence's leading `ESC` (for a standalone BEL, the BEL's own position). **No enum changes** — OSC 7777 payloads keep arriving as `OscEvent::Clitab(String)`. Tasks 3/5 rely on the offset.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -123,74 +128,68 @@ Add to `mod tests` in `osc.rs`:
 
 ```rust
     #[test]
-    fn agent_event_payload_and_offset() {
-        let mut parser = OscParser::new();
-        let parsed = parser.parse(b"hello\x1b]9;clitab-agent;QUJD\x1b\\tail");
-        assert_eq!(parsed, vec![(OscEvent::AgentEvent("QUJD".into()), 5)]);
-    }
-
-    #[test]
-    fn agent_event_offset_survives_split_across_reads() {
-        let mut parser = OscParser::new();
-        assert!(parser.parse(b"abcd\x1b]9;clitab-age").is_empty());
-        let parsed = parser.parse(b"nt;QUJD\x07");
-        assert_eq!(parsed, vec![(OscEvent::AgentEvent("QUJD".into()), 4)]);
-    }
-
-    #[test]
-    fn agent_event_requires_prefix() {
-        let mut parser = OscParser::new();
-        // OSC 9 that is neither claude-done nor clitab-agent is ignored,
-        // and must not corrupt the next sequence.
-        assert!(parser.parse(b"\x1b]9;something-else\x07").is_empty());
-        let parsed = parser.parse(b"\x1b]9;clitab-agent;QQ\x07");
-        assert_eq!(parsed, vec![(OscEvent::AgentEvent("QQ".into()), 0)]);
-    }
-
-    #[test]
     fn offsets_count_every_fed_byte() {
         let mut parser = OscParser::new();
-        assert!(parser.parse(b"12345678").is_empty());
+        assert!(ev(&mut parser, b"12345678").is_empty());
         // Second feed: the BEL sits at absolute position 8.
         let parsed = parser.parse(b"\x07");
         assert_eq!(parsed, vec![(OscEvent::Bell, 8)]);
     }
+
+    #[test]
+    fn osc_offset_is_the_leading_esc() {
+        let mut parser = OscParser::new();
+        let parsed = parser.parse(b"ab\x1b]7777;{\"e\":\"stop\"}\x1b\\tail");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, 2);
+        assert!(matches!(parsed[0].0, OscEvent::Clitab(_)));
+    }
+
+    #[test]
+    fn osc_offset_survives_split_across_reads() {
+        let mut parser = OscParser::new();
+        assert!(parser.parse(b"abcd\x1b]7777;{\"e\":").is_empty());
+        let parsed = parser.parse(b"\"prompt\"}\x07");
+        assert_eq!(
+            parsed,
+            vec![(OscEvent::Clitab("{\"e\":\"prompt\"}".into()), 4)]
+        );
+    }
+
+    #[test]
+    fn nested_osc_offset_points_at_inner_esc() {
+        let mut parser = OscParser::new();
+        // ESC ] a b c ESC ] 0 ; T BEL — the garbage outer sequence restarts at
+        // the second ESC (position 5); that is the inner sequence's start.
+        let parsed = parser.parse(b"\x1b]abc\x1b]0;T\x07");
+        assert_eq!(parsed, vec![(OscEvent::TitleChanged("T".into()), 5)]);
+    }
 ```
+
+(`ev` is the helper Step 4 introduces for the pre-existing tests; add it first or write these tests expecting it — either order fails correctly at Step 2.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib osc`
-Expected: FAIL — `parse` returns `Vec<OscEvent>` (tuple assertions don't typecheck) and `AgentEvent` doesn't exist. Existing tests also fail to compile once the signature changes — that's Step 4's job.
+Expected: FAIL — `parse` returns `Vec<OscEvent>` (tuple assertions don't typecheck) and `ev` doesn't exist.
 
-- [ ] **Step 3: Implement the parser changes**
+- [ ] **Step 3: Implement the offset bookkeeping**
 
-In `osc.rs`:
-
-1. New enum variant:
+In `osc.rs` — three new fields on the existing struct (the `payload_len` cap machinery stays exactly as it is):
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OscEvent {
-    TitleChanged(String),
-    CwdChanged(String),
-    Bell,
-    PromptReady,
-    /// OSC 9 `clitab-agent;<base64>`: an encoded agent conversation event,
-    /// written into the PTY stream by the Claude Code hook script.
-    AgentEvent(String),
-}
-```
-
-2. New parser fields (position bookkeeping):
-
-```rust
+#[derive(Debug, Default)]
 pub struct OscParser {
     state: State,
     buffer: Vec<u8>,
     params: Vec<Vec<u8>>,
+    /// Bytes accumulated into `params` after the code parameter, including
+    /// the `;` separators between them — i.e. the length the rejoined
+    /// payload will have. (existing field, existing doc comment — unchanged)
+    payload_len: usize,
     /// Total bytes ever fed to `parse()`. One parser instance per session,
-    /// fed from stream position 0, so this equals the absolute seq — the
-    /// same numbering `StreamState.position` uses.
+    /// fed every byte from stream position 0, so this equals the absolute
+    /// seq — the same numbering `StreamState.position` uses.
     fed: u64,
     /// Absolute position of the ESC that began the OSC being accumulated.
     osc_start: u64,
@@ -201,9 +200,12 @@ pub struct OscParser {
 }
 ```
 
-3. `parse()` counts positions and tags events. The state machine is unchanged except: every byte's absolute position is `self.fed` before increment; `Ground`'s `0x1b` arm and `InOsc`'s `0x1b` arm record `self.esc_pos = pos`; `AfterEsc`'s `b']'` arm and `InOscAfterEsc`'s `b']'` arm call `self.begin_osc(self.esc_pos)`; `Bell` is tagged with its own `pos`:
+`parse()` gains position bookkeeping. The state machine logic is unchanged except where noted; in particular the `InOsc` accumulator arm keeps the existing two-part cap check (`buffer.len() >= MAX_OSC_LEN || payload_len + buffer.len() > MAX_OSC_LEN`) and the `0x1b` arm keeps calling `flush_param()` (not `push_param`):
 
 ```rust
+    /// Feed a chunk of PTY output, returning every OSC event it completed,
+    /// each tagged with the absolute stream position of its leading ESC
+    /// (a standalone BEL: the BEL's own position).
     pub fn parse(&mut self, data: &[u8]) -> Vec<(OscEvent, u64)> {
         let mut events = Vec::new();
 
@@ -223,6 +225,7 @@ pub struct OscParser {
                     if byte == b']' {
                         self.begin_osc(self.esc_pos);
                     } else {
+                        // CSI / DCS / anything else: we only care about OSC.
                         self.state = State::Ground;
                     }
                 }
@@ -230,12 +233,17 @@ pub struct OscParser {
                     0x07 => events.extend(self.finish_osc()),
                     b';' => self.push_param(),
                     0x1b => {
+                        // Either the start of an `ESC \` (ST) terminator, or a
+                        // nested OSC from truncated / binary output.
                         self.esc_pos = pos;
-                        self.push_param();
+                        self.flush_param();
                         self.state = State::InOscAfterEsc;
                     }
                     _ => {
-                        if self.buffer.len() >= MAX_OSC_LEN {
+                        if self.buffer.len() >= MAX_OSC_LEN
+                            || self.payload_len + self.buffer.len() > MAX_OSC_LEN
+                        {
+                            // Runaway sequence: drop it and resynchronise.
                             self.abort_osc();
                         } else {
                             self.buffer.push(byte);
@@ -244,10 +252,15 @@ pub struct OscParser {
                 },
                 State::InOscAfterEsc => {
                     if byte == b'\\' {
+                        // ST terminator.
                         events.extend(self.finish_osc());
                     } else if byte == b']' {
+                        // A new OSC started before the previous one was
+                        // terminated: the partial sequence is garbage, so throw
+                        // away everything accumulated so far and start clean.
                         self.begin_osc(self.esc_pos);
                     } else {
+                        // Not a terminator after all: keep the payload going.
                         self.buffer.push(0x1b);
                         self.buffer.push(byte);
                         self.state = State::InOsc;
@@ -260,12 +273,13 @@ pub struct OscParser {
     }
 ```
 
-4. `begin_osc` / `finish_osc` carry the start position:
+`begin_osc` takes the start position; `finish_osc` tags with it:
 
 ```rust
     fn begin_osc(&mut self, start: u64) {
         self.buffer.clear();
         self.params.clear();
+        self.payload_len = 0;
         self.osc_start = start;
         self.state = State::InOsc;
     }
@@ -273,7 +287,7 @@ pub struct OscParser {
     /// Close the current OSC sequence and interpret it, tagged with the
     /// absolute position of its leading ESC.
     fn finish_osc(&mut self) -> Vec<(OscEvent, u64)> {
-        self.push_param();
+        self.flush_param();
         let event = Self::interpret(&self.params);
         let start = self.osc_start;
         self.reset();
@@ -281,23 +295,11 @@ pub struct OscParser {
     }
 ```
 
-5. `interpret` gains the OSC 9 branch (replace the existing `"9"` arm):
-
-```rust
-            "9" => {
-                if value == "claude-done" {
-                    Some(OscEvent::PromptReady)
-                } else {
-                    value
-                        .strip_prefix("clitab-agent;")
-                        .map(|payload| OscEvent::AgentEvent(payload.to_string()))
-                }
-            }
-```
+`reset()` also zeroes `osc_start` (cosmetic; `begin_osc` always sets it before use). `push_param`, `flush_param`, `abort_osc`, `interpret` are unchanged.
 
 - [ ] **Step 4: Update the existing tests mechanically**
 
-Every existing test asserts on `Vec<OscEvent>`; add a helper at the top of `mod tests` and route the old assertions through it (assertions themselves unchanged):
+Every pre-existing test asserts on `Vec<OscEvent>`; add a helper at the top of `mod tests` and route the old assertions through it (assertions themselves unchanged):
 
 ```rust
     /// Unwrap the offsets: legacy tests only care which events were decoded.
@@ -306,7 +308,7 @@ Every existing test asserts on `Vec<OscEvent>`; add a helper at the top of `mod 
     }
 ```
 
-Replace `parser.parse(X)` with `ev(&mut parser, X)` in every pre-existing test (also `assert!(parser.parse(X).is_empty())` → `assert!(ev(&mut parser, X).is_empty())`). The `runaway_osc_is_capped` test also touches `parser.buffer` — unchanged.
+Replace `parser.parse(X)` with `ev(&mut parser, X)` in every pre-existing test (also `assert!(parser.parse(X).is_empty())` → `assert!(ev(&mut parser, X).is_empty())`). The `runaway_osc_is_capped` / `semicolon_run_osc_is_capped` tests also touch `parser.buffer` / `parser.params` — unchanged.
 
 - [ ] **Step 5: Fix the `session.rs` call site (compile only)**
 
@@ -320,12 +322,13 @@ In `read_loop`:
                             &registry,
                             &program_active,
                             &last_activity,
+                            &flashed,
                             event,
                         );
                     }
 ```
 
-`handle_osc` gains an `OscEvent::AgentEvent(_) => {}` no-op arm for now (Task 5 fills it).
+`handle_osc` itself is untouched in this task (Task 5 threads the offset through).
 
 - [ ] **Step 6: Run the full Rust suite**
 
@@ -336,31 +339,158 @@ Expected: PASS (all osc tests, new and updated).
 
 ```bash
 git add src-tauri/src/osc.rs src-tauri/src/pty/session.rs
-git commit -m "osc: decode clitab-agent payloads and report absolute stream offsets
+git commit -m "osc: report absolute stream offsets with decoded events
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 3: `agent_events.rs` — payload decoding (pure, TDD)
+### Task 3: `status.rs` text fields + new `agent_events.rs` mapping
 
 **Files:**
+- Modify: `src-tauri/src/status.rs`
 - Create: `src-tauri/src/agent_events.rs`
-- Modify: `src-tauri/src/lib.rs` (add `mod agent_events;` next to the existing `mod osc;`)
-- Test: inline `mod tests` in `agent_events.rs`
+- Modify: `src-tauri/src/lib.rs` (add `mod agent_events;`)
+- Modify: `src-tauri/src/pty/session.rs` (match-arm compile fixes only)
+- Test: inline `mod tests` in both modules
 
 **Interfaces:**
-- Consumes: nothing (pure functions over the base64 string from `OscEvent::AgentEvent`).
-- Produces (Tasks 4/5 rely on these exact names):
-  - `pub enum AgentEventKind { UserPrompt, AgentQuestion, AgentDone, UserChoice }` — serde-serialized kebab-case (`"user-prompt"` etc.), derives `Debug, Clone, Copy, PartialEq, Eq, Serialize`.
-  - `pub struct AgentEvent { pub id: String, pub kind: AgentEventKind, pub text: String, pub time: u64, pub seq: u64 }` — derives `Debug, Clone, PartialEq, Serialize`.
-  - `pub fn decode_agent_event(payload_b64: &str) -> Option<(AgentEventKind, String)>`
-  - `pub const TEXT_LIMIT: usize = 140`
+- Consumes: nothing new (pure decode/mapping).
+- Produces (Tasks 5/6 rely on these exact names):
+  - `StatusEvent::Prompt { text: Option<String> }` (variant reshaped) and `StatusEvent::Choice { text: Option<String> }` (new), decoded from `{"e":"prompt","text":…}` / `{"e":"choice","text":…}`.
+  - `agent_events::AgentEventKind { UserPrompt, AgentQuestion, AgentDone, UserChoice }` — serde kebab-case (`"user-prompt"` etc.), derives `Debug, Clone, Copy, PartialEq, Eq, Serialize`.
+  - `agent_events::AgentEvent { pub id: String, pub kind: AgentEventKind, pub text: String, pub time: u64, pub seq: u64 }` — derives `Debug, Clone, PartialEq, Serialize`.
+  - `agent_events::panel_event(&StatusEvent) -> Option<(AgentEventKind, String)>`
+  - `agent_events::TEXT_LIMIT: usize = 140`
 
-**Note:** the `choice_text` extraction below is written against the shape observed in Task 1. If the probe showed a different `tool_response` structure for `AskUserQuestion`, adjust `choice_text` AND its test to the real shape before implementing — that is the whole point of probing first.
+- [ ] **Step 1: Update + extend the `status.rs` tests (failing)**
 
-- [ ] **Step 1: Write the failing tests**
+In `mod tests` of `status.rs`:
+
+Mechanical updates to existing tests — `decodes_each_event`:
+
+```rust
+        assert_eq!(decode(r#"{"e":"prompt"}"#), Some(StatusEvent::Prompt { text: None }));
+```
+
+(the `tool` / `stop` / `notify` assertions in that test are unchanged).
+
+New tests:
+
+```rust
+    #[test]
+    fn prompt_carries_optional_text() {
+        assert_eq!(
+            decode(r#"{"e":"prompt","text":"fix the build"}"#),
+            Some(StatusEvent::Prompt { text: Some("fix the build".into()) })
+        );
+        // An empty text is treated like a missing one (same rule as tool names).
+        assert_eq!(
+            decode(r#"{"e":"prompt","text":""}"#),
+            Some(StatusEvent::Prompt { text: None })
+        );
+    }
+
+    #[test]
+    fn choice_decodes() {
+        assert_eq!(
+            decode(r#"{"e":"choice","text":"Option B"}"#),
+            Some(StatusEvent::Choice { text: Some("Option B".into()) })
+        );
+        assert_eq!(decode(r#"{"e":"choice"}"#), Some(StatusEvent::Choice { text: None }));
+        assert_eq!(decode(r#"{"e":"choice","text":""}"#), Some(StatusEvent::Choice { text: None }));
+    }
+
+    /// The hooks slice text with jq, but a manual payload may carry anything:
+    /// semicolons and JSON escapes must survive the parser rejoin + decode.
+    #[test]
+    fn text_with_semicolons_and_escapes_survives() {
+        assert_eq!(
+            decode(r#"{"e":"prompt","text":"a;b\n\"c\""}"#),
+            Some(StatusEvent::Prompt { text: Some("a;b\n\"c\"".into()) })
+        );
+    }
+```
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib status`
+Expected: FAIL (compile error — variants don't match).
+
+- [ ] **Step 2: Implement the `status.rs` changes**
+
+Variant reshaping + new variant (update the doc comments to match):
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusEvent {
+    /// UserPromptSubmit: an assistant turn began. `text` is the user's prompt
+    /// (sliced at the wire by jq); missing when the hook ran without jq.
+    Prompt { text: Option<String> },
+    /// PreToolUse: a tool is about to run.
+    Tool { name: String },
+    /// Stop: the turn ended. Duration is computed by the receiver, not sent.
+    Stop,
+    /// Notification: the session wants attention. `msg` is optional because
+    /// the hook degrades to a bare notify when jq is unavailable.
+    Notify { msg: Option<String> },
+    /// PostToolUse for AskUserQuestion: the user submitted a choice.
+    /// Panel-only — drives no dashboard transition.
+    Choice { text: Option<String> },
+}
+```
+
+`Wire` gains the field:
+
+```rust
+#[derive(Debug, Deserialize)]
+struct Wire {
+    e: String,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+```
+
+`decode` — factor the empty-string rule into a helper and use it for all three optional strings:
+
+```rust
+/// Empty strings carry no information; treat them like missing ones.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+pub fn decode(json: &str) -> Option<StatusEvent> {
+    let wire: Wire = serde_json::from_str(json).ok()?;
+    match wire.e.as_str() {
+        "prompt" => Some(StatusEvent::Prompt { text: non_empty(wire.text) }),
+        // An empty tool name would render as a blank dashboard cell; treat it
+        // like a missing one.
+        "tool" => Some(StatusEvent::Tool { name: non_empty(wire.tool)? }),
+        "stop" => Some(StatusEvent::Stop),
+        "notify" => Some(StatusEvent::Notify { msg: non_empty(wire.msg) }),
+        "choice" => Some(StatusEvent::Choice { text: non_empty(wire.text) }),
+        _ => None,
+    }
+}
+```
+
+Also extend the module doc comment's event list with `choice`.
+
+- [ ] **Step 3: Keep `session.rs` compiling (mechanical)**
+
+In `handle_status`, the match arm becomes `StatusEvent::Prompt { .. } => registry.begin_turn(tab_id, now),` and a new arm is added (Task 5 replaces the no-op body's context; for now):
+
+```rust
+            // Panel-only event; Task 5 wires the panel row. No dashboard
+            // transition, and the `tab-status` re-emit below is a harmless
+            // full-state replacement of unchanged state.
+            StatusEvent::Choice { .. } => {}
+```
+
+- [ ] **Step 4: Write the failing `agent_events.rs` tests**
 
 Create `src-tauri/src/agent_events.rs` with the test module first:
 
@@ -368,133 +498,114 @@ Create `src-tauri/src/agent_events.rs` with the test module first:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-    fn payload(json: &str) -> String {
-        BASE64.encode(json)
-    }
+    use crate::status::StatusEvent;
 
     #[test]
-    fn user_prompt_full_json() {
-        let p = payload(r#"{"session_id":"s","cwd":"/tmp","hook_event_name":"UserPromptSubmit","prompt":"fix the build"}"#);
+    fn prompt_maps_to_user_prompt() {
         assert_eq!(
-            decode_agent_event(&p),
+            panel_event(&StatusEvent::Prompt { text: Some("fix the build".into()) }),
             Some((AgentEventKind::UserPrompt, "fix the build".into()))
         );
-    }
-
-    #[test]
-    fn notification_full_json() {
-        let p = payload(r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#);
+        // Without jq there is no text; the row still exists.
         assert_eq!(
-            decode_agent_event(&p),
-            Some((AgentEventKind::AgentQuestion, "Claude needs your permission to use Bash".into()))
+            panel_event(&StatusEvent::Prompt { text: None }),
+            Some((AgentEventKind::UserPrompt, String::new()))
         );
     }
 
     #[test]
-    fn stop_has_empty_text() {
-        let p = payload(r#"{"hook_event_name":"Stop"}"#);
-        assert_eq!(decode_agent_event(&p), Some((AgentEventKind::AgentDone, String::new())));
+    fn notify_maps_to_agent_question() {
+        assert_eq!(
+            panel_event(&StatusEvent::Notify { msg: Some("needs permission".into()) }),
+            Some((AgentEventKind::AgentQuestion, "needs permission".into()))
+        );
     }
 
     #[test]
-    fn ask_user_question_choice() {
-        // Shape per Task 1 probe; adjust if the real payload differs.
-        let p = payload(r#"{"hook_event_name":"PostToolUse","tool_name":"AskUserQuestion","tool_response":{"answers":{"Which approach?":"Option B"}}}"#);
+    fn stop_maps_to_agent_done_without_text() {
         assert_eq!(
-            decode_agent_event(&p),
+            panel_event(&StatusEvent::Stop),
+            Some((AgentEventKind::AgentDone, String::new()))
+        );
+    }
+
+    #[test]
+    fn choice_maps_to_user_choice() {
+        assert_eq!(
+            panel_event(&StatusEvent::Choice { text: Some("Option B".into()) }),
             Some((AgentEventKind::UserChoice, "Option B".into()))
         );
     }
 
     #[test]
-    fn posttooluse_other_tool_ignored() {
-        let p = payload(r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{}}"#);
-        assert_eq!(decode_agent_event(&p), None);
-    }
-
-    #[test]
-    fn unknown_hook_event_ignored() {
-        let p = payload(r#"{"hook_event_name":"PreToolUse"}"#);
-        assert_eq!(decode_agent_event(&p), None);
-    }
-
-    #[test]
-    fn truncated_json_salvages_prompt() {
-        // The hook script caps stdin at 2800 bytes: the JSON can arrive cut
-        // mid-value with no closing braces.
-        let p = payload(r#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"refactor the parser and update all call sites"#);
-        assert_eq!(
-            decode_agent_event(&p),
-            Some((AgentEventKind::UserPrompt, "refactor the parser and update all call sites".into()))
-        );
-    }
-
-    #[test]
-    fn truncated_json_with_escapes_is_unescaped() {
-        let p = payload(r#"{"hook_event_name":"UserPromptSubmit","prompt":"line one\nline two \"quoted\""#);
-        assert_eq!(
-            decode_agent_event(&p),
-            Some((AgentEventKind::UserPrompt, "line one\nline two \"quoted\"".into()))
-        );
-    }
-
-    #[test]
-    fn truncated_mid_multibyte_is_salvaged() {
-        // Cut the raw bytes in the middle of a CJK char: from_utf8_lossy must
-        // absorb it and the event kind must still decode.
-        let json = r#"{"hook_event_name":"UserPromptSubmit","prompt":"中文输入"#;
-        let bytes = json.as_bytes();
-        let cut = &bytes[..bytes.len() - 1]; // splits the last UTF-8 char
-        let p = BASE64.encode(cut);
-        let (kind, text) = decode_agent_event(&p).expect("salvaged");
-        assert_eq!(kind, AgentEventKind::UserPrompt);
-        assert!(text.starts_with("中文"), "got {text:?}");
-    }
-
-    #[test]
-    fn garbage_is_dropped() {
-        assert_eq!(decode_agent_event("!!!not-base64!!!"), None);
-        assert_eq!(decode_agent_event(&BASE64.encode([0x00u8, 0xff, 0xfe, 0x01])), None);
-        assert_eq!(decode_agent_event(""), None);
+    fn tool_produces_no_panel_row() {
+        assert_eq!(panel_event(&StatusEvent::Tool { name: "Bash".into() }), None);
     }
 
     #[test]
     fn text_truncated_to_limit_chars() {
-        let long: String = "字".repeat(300);
-        let p = payload(&format!(r#"{{"hook_event_name":"UserPromptSubmit","prompt":"{long}"}}"#));
-        let (_, text) = decode_agent_event(&p).unwrap();
+        let long = "字".repeat(300);
+        let (_, text) = panel_event(&StatusEvent::Prompt { text: Some(long) }).unwrap();
         assert_eq!(text.chars().count(), TEXT_LIMIT);
         assert!(text.chars().all(|c| c == '字'));
+    }
+
+    #[test]
+    fn whitespace_flattens_to_single_spaces() {
+        let (_, text) = panel_event(&StatusEvent::Prompt {
+            text: Some("  line one\n\tline  two  ".into()),
+        })
+        .unwrap();
+        assert_eq!(text, "line one line two");
+    }
+
+    #[test]
+    fn control_chars_become_spaces() {
+        let (_, text) =
+            panel_event(&StatusEvent::Prompt { text: Some("a\u{1}b\u{1b}c".into()) }).unwrap();
+        assert_eq!(text, "a b c");
+    }
+
+    /// Pins the IPC contract for `src/types.ts`: kebab-case kind, single-word
+    /// fields identical in any casing convention.
+    #[test]
+    fn agent_event_serializes_for_ipc() {
+        let event = AgentEvent {
+            id: "e1".into(),
+            kind: AgentEventKind::UserPrompt,
+            text: "hi".into(),
+            time: 1700000000000,
+            seq: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({"id": "e1", "kind": "user-prompt", "text": "hi", "time": 1700000000000u64, "seq": 42})
+        );
     }
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
-
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib agent_events`
-Expected: FAIL — module empty / items missing.
+Expected: FAIL — items missing.
 
-- [ ] **Step 3: Implement the module**
+- [ ] **Step 5: Implement `agent_events.rs`**
 
-Above the test module in `agent_events.rs`:
+Above the test module:
 
 ```rust
-//! Decoding of `clitab-agent` OSC payloads.
+//! Conversation events for the agent panel.
 //!
-//! The Claude Code hook script (installed by `install_claude_hooks`, see
-//! `claude_hooks.rs`) forwards each hook's stdin JSON — truncated to 2800
-//! bytes and base64-encoded — through the PTY stream as an OSC 9 sequence.
-//! Decoding is deliberately two-tiered: a strict JSON parse for intact
-//! payloads, then a string-search salvage for payloads the truncation cut
-//! open. Anything unrecognisable is dropped: a `cat` of binary noise must
-//! never fabricate (or crash on) a conversation event.
+//! The OSC 7777 hook protocol (`crate::status`) already reports the turn
+//! lifecycle; this module maps those decoded events to panel rows — what
+//! happened, summary text, and (filled in by the caller) when and at which
+//! position in the PTY byte stream, which is what anchors click-to-jump.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use crate::status::StatusEvent;
 use serde::Serialize;
 
-/// Maximum characters of summary text kept per event.
+/// Maximum characters of summary text kept per event. The hooks' jq slices
+/// text to the same limit at the wire; this is the authoritative cap (a
+/// manual payload can carry more, up to the parser's MAX_OSC_LEN).
 pub const TEXT_LIMIT: usize = 140;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -511,7 +622,7 @@ pub enum AgentEventKind {
 pub struct AgentEvent {
     pub id: String,
     pub kind: AgentEventKind,
-    /// Summary text, at most `TEXT_LIMIT` chars.
+    /// Summary text: whitespace-flattened, at most `TEXT_LIMIT` chars.
     pub text: String,
     /// Unix milliseconds: when Rust received the OSC.
     pub time: u64,
@@ -519,167 +630,83 @@ pub struct AgentEvent {
     pub seq: u64,
 }
 
-/// Decode the base64 body of a `clitab-agent` OSC into a kind and summary
-/// text, or `None` when nothing trustworthy can be extracted.
-pub fn decode_agent_event(payload_b64: &str) -> Option<(AgentEventKind, String)> {
-    if payload_b64.is_empty() {
-        return None;
-    }
-    let bytes = BASE64.decode(payload_b64.trim()).ok()?;
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if let Some(decoded) = decode_strict(&value) {
-            return Some(decoded);
-        }
-    }
-    decode_salvage(&bytes)
-}
-
-fn decode_strict(value: &serde_json::Value) -> Option<(AgentEventKind, String)> {
-    match value.get("hook_event_name").and_then(|v| v.as_str())? {
-        "UserPromptSubmit" => Some((AgentEventKind::UserPrompt, text_of(value, "prompt"))),
-        "Notification" => Some((AgentEventKind::AgentQuestion, text_of(value, "message"))),
-        "Stop" => Some((AgentEventKind::AgentDone, String::new())),
-        "PostToolUse" => {
-            if value.get("tool_name").and_then(|v| v.as_str()) != Some("AskUserQuestion") {
-                return None;
-            }
-            Some((AgentEventKind::UserChoice, choice_text(value)))
-        }
-        _ => None,
-    }
-}
-
-fn text_of(value: &serde_json::Value, key: &str) -> String {
-    truncate_chars(value.get(key).and_then(|v| v.as_str()).unwrap_or(""), TEXT_LIMIT)
-}
-
-/// The user's selection from an `AskUserQuestion` PostToolUse payload. The
-/// `tool_response` shape varies across Claude Code versions (Task 1 probe
-/// pinned the current one): prefer the answers' values, fall back to the raw
-/// response JSON so the row is never empty.
-fn choice_text(value: &serde_json::Value) -> String {
-    let response = value.get("tool_response");
-    if let Some(answers) = response
-        .and_then(|r| r.get("answers"))
-        .and_then(|a| a.as_object())
-    {
-        let joined = answers
-            .values()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if !joined.is_empty() {
-            return truncate_chars(&joined, TEXT_LIMIT);
-        }
-    }
-    match response {
-        Some(r) => truncate_chars(&r.to_string(), TEXT_LIMIT),
-        None => String::new(),
-    }
-}
-
-/// Best-effort extraction from JSON the 2800-byte cap cut open.
-fn decode_salvage(bytes: &[u8]) -> Option<(AgentEventKind, String)> {
-    let raw = String::from_utf8_lossy(bytes);
-    let kind = match json_string_field(&raw, "hook_event_name")?.as_str() {
-        "UserPromptSubmit" => AgentEventKind::UserPrompt,
-        "Notification" => AgentEventKind::AgentQuestion,
-        "Stop" => AgentEventKind::AgentDone,
-        "PostToolUse" => AgentEventKind::UserChoice,
-        _ => return None,
+/// The panel row for a decoded protocol event, or `None` when it is not
+/// conversation-visible (tool events drive the dashboard only).
+pub fn panel_event(event: &StatusEvent) -> Option<(AgentEventKind, String)> {
+    let (kind, text) = match event {
+        StatusEvent::Prompt { text } => (AgentEventKind::UserPrompt, text.as_deref().unwrap_or("")),
+        StatusEvent::Notify { msg } => (AgentEventKind::AgentQuestion, msg.as_deref().unwrap_or("")),
+        StatusEvent::Stop => (AgentEventKind::AgentDone, ""),
+        StatusEvent::Choice { text } => (AgentEventKind::UserChoice, text.as_deref().unwrap_or("")),
+        StatusEvent::Tool { .. } => return None,
     };
-    let key = match kind {
-        AgentEventKind::UserPrompt => "prompt",
-        AgentEventKind::AgentQuestion => "message",
-        _ => "",
-    };
-    let text = if key.is_empty() {
-        String::new()
+    Some((kind, normalize_text(text)))
+}
+
+/// Panel rows are single-line: control characters become spaces, whitespace
+/// runs collapse, edges trim, and the result is truncated to `TEXT_LIMIT`
+/// chars (char-based, so CJK text is never cut mid-codepoint).
+fn normalize_text(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= TEXT_LIMIT {
+        flat
     } else {
-        truncate_chars(&json_string_field(&raw, key).unwrap_or_default(), TEXT_LIMIT)
-    };
-    Some((kind, text))
-}
-
-/// Find `"key":"value"` in possibly-broken JSON. Handles `\"`, `\\`, `\n`,
-/// `\t`; an unterminated value (the truncation case) yields what was read.
-fn json_string_field(raw: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = raw.find(&needle)? + needle.len();
-    let mut out = String::new();
-    let mut chars = raw[start..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => return Some(out),
-            },
-            _ => out.push(c),
-        }
-        if out.chars().count() >= TEXT_LIMIT {
-            return Some(out);
-        }
-    }
-    Some(out)
-}
-
-fn truncate_chars(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        s.chars().take(limit).collect()
+        flat.chars().take(TEXT_LIMIT).collect()
     }
 }
 ```
 
-Also add `mod agent_events;` to `lib.rs` (alphabetically before `mod menu;`).
+- [ ] **Step 6: Register the module**
 
-**Known salvage caveat (accepted):** `json_string_field` matches the first occurrence of `"prompt":"` anywhere in the payload — if a Notification message itself contains that literal substring, salvage could pick the wrong span. Strict parsing handles all intact payloads correctly; salvage only runs on truncated ones, where a slightly-wrong summary beats a dropped event.
+In `lib.rs`, add `mod agent_events;` — alphabetically first, before `mod attention;`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 7: Run the full Rust suite**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib agent_events`
-Expected: PASS (all 11 tests).
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib && cargo check --manifest-path src-tauri/Cargo.toml`
+Expected: PASS (status + agent_events tests, no warnings from changed code).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src-tauri/src/agent_events.rs src-tauri/src/lib.rs
-git commit -m "agent_events: decode hook OSC payloads with strict + salvage tiers
+git add src-tauri/src/status.rs src-tauri/src/agent_events.rs src-tauri/src/lib.rs src-tauri/src/pty/session.rs
+git commit -m "status: carry prompt/choice text; agent_events: map protocol events to panel rows
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 4: `Registry` — per-tab in-memory event store
+### Task 4: `Registry` — per-tab in-memory event store with duplicate guard
 
 **Files:**
 - Modify: `src-tauri/src/pty/registry.rs`
 - Test: inline `mod tests` in `registry.rs`
 
 **Interfaces:**
-- Consumes: `crate::agent_events::AgentEvent` (Task 3).
+- Consumes: `crate::agent_events::{AgentEvent, AgentEventKind}` (Task 3).
 - Produces (Tasks 5/6 rely on these):
-  - `Registry::push_agent_event(&self, tab_id: &str, event: AgentEvent)`
+  - `Registry::push_agent_event(&self, tab_id: &str, event: AgentEvent) -> bool` — true when stored; false for unknown tabs and rejected duplicates.
   - `Registry::agent_events(&self, tab_id: &str) -> Vec<AgentEvent>`
   - `Registry::remove` additionally clears the tab's events.
-  - Cap: `const AGENT_EVENT_LIMIT: usize = 200` (module-private).
+  - Module-private: `const AGENT_EVENT_LIMIT: usize = 200`, `const AGENT_DUP_WINDOW_MS: u64 = 2000`.
 
 - [ ] **Step 1: Write the failing tests**
 
 Add to `mod tests` in `registry.rs`:
 
 ```rust
-    fn event(id: &str, seq: u64) -> crate::agent_events::AgentEvent {
-        crate::agent_events::AgentEvent {
+    use crate::agent_events::{AgentEvent, AgentEventKind};
+
+    fn agent_event(id: &str, kind: AgentEventKind, time: u64, seq: u64) -> AgentEvent {
+        AgentEvent {
             id: id.to_string(),
-            kind: crate::agent_events::AgentEventKind::UserPrompt,
+            kind,
             text: id.to_string(),
-            time: 0,
+            time,
             seq,
         }
     }
@@ -688,8 +715,8 @@ Add to `mod tests` in `registry.rs`:
     fn agent_events_round_trip_in_order() {
         let registry = Registry::new();
         registry.insert("t1".into(), "/tmp".into());
-        registry.push_agent_event("t1", event("a", 1));
-        registry.push_agent_event("t1", event("b", 2));
+        assert!(registry.push_agent_event("t1", agent_event("a", AgentEventKind::UserPrompt, 1, 1)));
+        assert!(registry.push_agent_event("t1", agent_event("b", AgentEventKind::AgentDone, 2, 2)));
         let ids: Vec<_> = registry.agent_events("t1").iter().map(|e| e.id.clone()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert!(registry.agent_events("nope").is_empty());
@@ -700,7 +727,11 @@ Add to `mod tests` in `registry.rs`:
         let registry = Registry::new();
         registry.insert("t1".into(), "/tmp".into());
         for i in 0..205 {
-            registry.push_agent_event("t1", event(&format!("e{i}"), i));
+            // Distinct times well outside the dedup window; distinct texts.
+            registry.push_agent_event(
+                "t1",
+                agent_event(&format!("e{i}"), AgentEventKind::UserPrompt, (i * 10_000) as u64, i),
+            );
         }
         let events = registry.agent_events("t1");
         assert_eq!(events.len(), 200);
@@ -708,15 +739,51 @@ Add to `mod tests` in `registry.rs`:
         assert_eq!(events.last().unwrap().id, "e204");
     }
 
+    /// Hooks fire once per settings level: the same event can arrive twice
+    /// within moments. The second copy must not double-row the panel.
+    #[test]
+    fn duplicate_within_window_is_rejected() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        assert!(registry.push_agent_event("t1", agent_event("a", AgentEventKind::AgentDone, 1000, 10)));
+        // Same kind + same text, 500 ms later, different seq/id.
+        let dup = AgentEvent { id: "b".into(), kind: AgentEventKind::AgentDone, text: "a".into(), time: 1500, seq: 90 };
+        assert!(!registry.push_agent_event("t1", dup));
+        assert_eq!(registry.agent_events("t1").len(), 1);
+    }
+
+    #[test]
+    fn duplicate_outside_window_or_different_content_is_accepted() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        registry.push_agent_event("t1", agent_event("a", AgentEventKind::AgentDone, 1000, 10));
+        // Same kind+text but 3 s later: a genuine second turn end.
+        let later = AgentEvent { id: "b".into(), kind: AgentEventKind::AgentDone, text: "a".into(), time: 3001, seq: 90 };
+        assert!(registry.push_agent_event("t1", later));
+        // Inside the window but different text: a genuine new prompt.
+        let different = AgentEvent { id: "c".into(), kind: AgentEventKind::UserPrompt, text: "new".into(), time: 3100, seq: 120 };
+        assert!(registry.push_agent_event("t1", different));
+        assert_eq!(registry.agent_events("t1").len(), 3);
+    }
+
+    #[test]
+    fn unknown_tab_agent_events_are_noops() {
+        let registry = Registry::new();
+        assert!(!registry.push_agent_event("nope", agent_event("a", AgentEventKind::UserPrompt, 1, 1)));
+        assert!(registry.agent_events("nope").is_empty());
+    }
+
     #[test]
     fn removing_a_tab_clears_its_events() {
         let registry = Registry::new();
         registry.insert("t1".into(), "/tmp".into());
-        registry.push_agent_event("t1", event("a", 1));
+        registry.push_agent_event("t1", agent_event("a", AgentEventKind::UserPrompt, 1, 1));
         registry.remove("t1");
         assert!(registry.agent_events("t1").is_empty());
     }
 ```
+
+Note the `agent_events_cap_evicts_oldest` times: consecutive pushes 10 s apart with distinct texts also exercise that the dedup guard never misfires on a healthy stream.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -725,15 +792,22 @@ Expected: FAIL — `push_agent_event` / `agent_events` don't exist.
 
 - [ ] **Step 3: Implement**
 
-In `registry.rs`:
+In `registry.rs` — imports and constants:
 
 ```rust
-use crate::agent_events::AgentEvent;
+use crate::agent_events::{AgentEvent, AgentEventKind};
 use std::collections::{HashMap, VecDeque};
 
-/// Per-tab cap on retained agent events; oldest are evicted first.
+/// Per-tab cap on retained conversation events; oldest are evicted first.
 const AGENT_EVENT_LIMIT: usize = 200;
+/// Same kind + same text within this window is a duplicate hook fire (hooks
+/// merge across settings levels), not a second conversation event.
+const AGENT_DUP_WINDOW_MS: u64 = 2000;
+```
 
+Struct gains the second lock (lock order: `tabs` then `agent_events` — the same order `remove` establishes; no path takes them the other way):
+
+```rust
 #[derive(Debug, Default)]
 pub struct Registry {
     tabs: Mutex<Vec<TabRecord>>,
@@ -746,15 +820,29 @@ pub struct Registry {
 New methods on `impl Registry`:
 
 ```rust
-    /// Store one decoded conversation event for `tab_id`, evicting the oldest
-    /// past the cap.
-    pub fn push_agent_event(&self, tab_id: &str, event: AgentEvent) {
+    /// Store one decoded conversation event for `tab_id`. Returns false (and
+    /// stores nothing) for unknown tabs — a push racing a close must not
+    /// orphan an entry — and for duplicate hook fires: same kind and text as
+    /// the newest event, within `AGENT_DUP_WINDOW_MS`.
+    pub fn push_agent_event(&self, tab_id: &str, event: AgentEvent) -> bool {
+        if !lock(&self.tabs).iter().any(|t| t.id == tab_id) {
+            return false;
+        }
         let mut map = lock(&self.agent_events);
         let events = map.entry(tab_id.to_string()).or_default();
+        if let Some(last) = events.back() {
+            if last.kind == event.kind
+                && last.text == event.text
+                && event.time.saturating_sub(last.time) <= AGENT_DUP_WINDOW_MS
+            {
+                return false;
+            }
+        }
         events.push_back(event);
         while events.len() > AGENT_EVENT_LIMIT {
             events.pop_front();
         }
+        true
     }
 
     pub fn agent_events(&self, tab_id: &str) -> Vec<AgentEvent> {
@@ -765,13 +853,20 @@ New methods on `impl Registry`:
     }
 ```
 
-And in the existing `remove`, after `tabs.retain(...)` (still fine to do under the same function, separate lock):
+And in the existing `remove`, after `tabs.retain(...)` — release the `tabs` lock first (scope), then clean up, keeping the documented lock order:
 
 ```rust
+    pub fn remove(&self, id: &str) -> bool {
+        let removed = {
+            let mut tabs = lock(&self.tabs);
+            let before = tabs.len();
+            tabs.retain(|t| t.id != id);
+            tabs.len() != before
+        };
         lock(&self.agent_events).remove(id);
+        removed
+    }
 ```
-
-(`remove` computes `before`/returns based on `tabs`; add the events cleanup before the return.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -782,24 +877,24 @@ Expected: PASS.
 
 ```bash
 git add src-tauri/src/pty/registry.rs
-git commit -m "registry: store per-tab agent conversation events (cap 200)
+git commit -m "registry: per-tab agent event store (cap 200, duplicate-hook guard)
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 5: `session.rs` — wire decoded events into store, IPC, and legacy attention behavior
+### Task 5: `session.rs` — wire offsets, panel events, and the `agent-event` IPC
 
 **Files:**
-- Modify: `src-tauri/src/pty/session.rs` (`read_loop` call site + `handle_osc`)
-- Test: no new unit tests (this is AppHandle-bound wiring; its parts are tested in Tasks 2–4). The full suite must stay green.
+- Modify: `src-tauri/src/pty/session.rs`
+- Test: no new unit tests (AppHandle-bound wiring; its parts are tested in Tasks 2–4). The full suite must stay green.
 
 **Interfaces:**
-- Consumes: `OscEvent::AgentEvent` + offset (Task 2), `decode_agent_event` / `AgentEvent` / `AgentEventKind` (Task 3), `Registry::push_agent_event` (Task 4), `uuid` crate (already a dependency).
-- Produces: the Tauri event **`agent-event`** with payload `{ "tab_id": String, "event": AgentEvent }` — Task 7 listens to exactly this shape. Also emits `tab-flash` (kinds `agent-question`, `agent-done`) and `prompt-ready` (kind `agent-done`), so panel and legacy attention behavior arrive together.
+- Consumes: parser offsets (Task 2), `StatusEvent::Prompt{text}`/`Choice` (Task 3), `agent_events::{panel_event, AgentEvent}` (Task 3), `Registry::push_agent_event` (Task 4), `uuid` (already a dependency).
+- Produces: the Tauri event **`agent-event`** with payload `{ "tab_id": String, "event": AgentEvent }` — Task 7 listens to exactly this shape. Emitted only when the registry accepted the event (duplicates must not double-row the renderer's live list, which would diverge from the restored-after-reload list).
 
-- [ ] **Step 1: Pass the offset through `read_loop`**
+- [ ] **Step 1: Thread the offset through `read_loop` and `handle_osc`**
 
 Replace the Task-2 interim loop:
 
@@ -811,69 +906,116 @@ Replace the Task-2 interim loop:
                             &registry,
                             &program_active,
                             &last_activity,
+                            &flashed,
                             event,
                             offset,
                         );
                     }
 ```
 
-- [ ] **Step 2: Extend `handle_osc`**
-
-Signature gains `offset: u64` (add `#[allow(clippy::too_many_arguments)]` — the function already has 5 params; the codebase uses this attribute on `read_loop`). Add imports at the top of `session.rs`:
+`handle_osc` gains `offset: u64` as its last parameter (it already carries `#[allow(clippy::too_many_arguments)]`-worthy arity via `read_loop`'s pattern; add the attribute to `handle_osc` if clippy complains — the codebase tolerates it on `read_loop`). Its `OscEvent::Clitab(json)` arm passes the offset on:
 
 ```rust
-use crate::agent_events::{self, AgentEvent, AgentEventKind};
-```
-
-New arm (replacing the Task-2 no-op):
-
-```rust
-            OscEvent::AgentEvent(payload) => {
-                // Untrusted input: anything that fails to decode is dropped.
-                let Some((kind, text)) = agent_events::decode_agent_event(&payload) else {
-                    return;
-                };
-                let event = AgentEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    kind,
-                    text,
-                    time: now_ms(),
-                    seq: offset,
-                };
-                registry.push_agent_event(tab_id, event.clone());
-                let _ = app.emit(
-                    "agent-event",
-                    serde_json::json!({ "tab_id": tab_id, "event": event }),
-                );
-                if kind == AgentEventKind::AgentDone {
-                    // Same effects as the legacy `claude-done` OSC: the turn
-                    // ended, so drop the program title and re-arm the watcher.
-                    program_active.store(false, Ordering::Relaxed);
-                    registry.clear_program_title(tab_id);
-                    *lock(last_activity) = Instant::now();
-                    let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
-                }
-                if matches!(kind, AgentEventKind::AgentQuestion | AgentEventKind::AgentDone) {
-                    let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            OscEvent::Clitab(json) => {
+                // Unknown kinds and malformed payloads decode to None and are
+                // dropped: a hook emitting something newer than this build
+                // must be a no-op, never an error.
+                if let Some(event) = status::decode(&json) {
+                    Self::handle_status(tab_id, app, registry, flashed, event, offset);
                 }
             }
 ```
 
-Helper (module level, near `emit_output`):
+Every other `handle_osc` arm is unchanged (the `offset` parameter is simply unused there).
+
+- [ ] **Step 2: Extend `handle_status`**
+
+New import at the top of `session.rs`:
 
 ```rust
-/// Unix milliseconds; 0 if the clock is somehow before the epoch.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::agent_events::{self, AgentEvent};
 ```
 
-Add `use std::time::SystemTime;` only if you reference it unqualified — the helper above is fully qualified, so no import change beyond `agent_events`.
+Restructured function — the existing transitions and effects stay byte-for-byte identical; the panel block and the `Choice` skip are the only additions. `panel_event` borrows the event before the by-value match consumes it:
 
-**Invariant check:** this arm runs inside `handle_osc`, i.e. *before* the stream lock is taken — same as every other OSC event today. Do not move any emit into or after the stream-lock section.
+```rust
+    /// Apply one hook-protocol event: registry transition, panel row, then
+    /// broadcast the tab's full protocol state so the renderer replaces (not
+    /// merges) it. `offset` is the absolute stream position of the OSC that
+    /// carried the event — the panel row's jump anchor.
+    fn handle_status(
+        tab_id: &str,
+        app: &AppHandle,
+        registry: &Registry,
+        flashed: &AtomicBool,
+        event: StatusEvent,
+        offset: u64,
+    ) {
+        let now = now_ms();
+        // Borrow before the match consumes the event.
+        let panel = agent_events::panel_event(&event);
+        // Choice is panel-only: no dashboard transition, no state re-emit.
+        let panel_only = matches!(event, StatusEvent::Choice { .. });
+
+        match event {
+            StatusEvent::Prompt { .. } => registry.begin_turn(tab_id, now),
+            StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
+            StatusEvent::Stop => {
+                registry.end_turn(tab_id, now);
+                // (existing body unchanged — flash, triage queue, and the
+                // invariant comment about not touching program_active/title)
+                flashed.store(true, Ordering::Relaxed);
+                crate::attention::enter_waiting(app, registry, tab_id);
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            }
+            StatusEvent::Notify { msg } => {
+                registry.set_notice(tab_id, msg, now);
+                crate::attention::enter_waiting(app, registry, tab_id);
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            }
+            StatusEvent::Choice { .. } => {}
+        }
+
+        // Panel row, anchored at the OSC's stream position. Emitted only when
+        // the store accepted it: a duplicate hook fire (hooks merge across
+        // settings levels) must not double-row the renderer's live list.
+        if let Some((kind, text)) = panel {
+            let agent_event = AgentEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind,
+                text,
+                time: now,
+                seq: offset,
+            };
+            if registry.push_agent_event(tab_id, agent_event.clone()) {
+                let _ = app.emit(
+                    "agent-event",
+                    serde_json::json!({ "tab_id": tab_id, "event": agent_event }),
+                );
+            }
+        }
+
+        if !panel_only {
+            if let Some(tab) = registry.get(tab_id) {
+                let _ = app.emit(
+                    "tab-status",
+                    serde_json::json!({
+                        "tab_id": tab_id,
+                        "status": tab.status,
+                        "notice": tab.notice,
+                    }),
+                );
+            }
+        }
+    }
+```
+
+Preserve the existing doc comments inside the `Stop` arm verbatim (the "explicit turn-end beats the 2s idle heuristic" and "Deliberately does NOT touch program_active or the title" comments).
+
+**Invariant checks:**
+- Everything above runs inside `handle_osc`, i.e. *before* the stream lock is taken — same as every other OSC event today. Do not move any emit into or after the stream-lock section.
+- No new `program_active` / title effects anywhere. `stop` still never touches the title (shipped invariant; `claude-done` owns the revert).
+- `now_ms()` already exists in `session.rs` — reuse it, do not add a second helper.
 
 - [ ] **Step 3: Run the full Rust suite + build**
 
@@ -884,57 +1026,35 @@ Expected: PASS / no warnings from the changed code.
 
 ```bash
 git add src-tauri/src/pty/session.rs
-git commit -m "session: emit agent-event for decoded hook OSCs, reuse prompt-ready effects
+git commit -m "session: anchor decoded hook events into the panel store, emit agent-event
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 6: One-click hook install — script, merge logic, Tauri commands
+### Task 6: One-click hook install — merge logic, commands, IPC
 
 **Files:**
-- Create: `src-tauri/hooks/clitab-hook.sh` (embedded into the binary at compile time)
 - Create: `src-tauri/src/claude_hooks.rs`
 - Modify: `src-tauri/src/lib.rs` (`mod claude_hooks;`, three commands, handler list)
 - Modify: `src-tauri/src/pty/manager.rs` (`list_agent_events` passthrough)
 - Test: inline `mod tests` in `claude_hooks.rs`
 
 **Interfaces:**
-- Consumes: `Registry::agent_events` (Task 4), `crate::agent_events::AgentEvent` (Task 3).
+- Consumes: `Registry::agent_events` (Task 4), `crate::agent_events::AgentEvent` (Task 3), Task 1's pinned choice jq expression.
 - Produces (Task 7 invokes these by name):
   - Tauri command `list_agent_events(tab_id: String) -> Result<Vec<AgentEvent>, String>` — `TAB_GONE`-prefixed error for a vanished tab.
   - Tauri command `claude_hooks_status() -> bool`.
   - Tauri command `install_claude_hooks() -> Result<(), String>`.
-  - Pure fn `pub fn merge_hooks(settings: serde_json::Value, script_path: &str) -> serde_json::Value`.
-  - `pub const SCRIPT_MARKER: &str = "clitab-hook.sh"` — ownership detection.
+  - Pure fn `pub fn merge_hooks(settings: serde_json::Value) -> serde_json::Value`.
+  - `pub const OSC_MARKER: &str = "]7777;"` — ownership detection: a hook group is clitab-owned when any of its commands contains the marker. This recognises both previous one-click installs and the manual inline setup from `CLAUDE_HOOKS.md` (OSC 7777 is clitab's private code; no foreign tool emits it).
 
-- [ ] **Step 1: Create the hook script**
+**Design note:** no hook script file, no app-data-dir dependency. The installer writes the same inline commands `CLAUDE_HOOKS.md` documents (Task 10 syncs the doc to match byte-for-byte), so `settings.json` stays self-contained and an existing manual install is upgraded in place.
 
-`src-tauri/hooks/clitab-hook.sh` (Task 1's probe decides whether `/dev/tty` or the stdout fallback is the primary path — the script below tries tty first, falls back to stdout; if the probe showed only one path works, keep both anyway, the fallback is one `||`):
+- [ ] **Step 1: Write the failing merge tests**
 
-```sh
-#!/bin/sh
-# clitab Claude Code hook: forwards this hook's stdin JSON to clitab as an
-# OSC 9 payload riding the PTY output stream, where clitab's parser turns it
-# into a conversation-event panel entry.
-#
-# Installed by clitab (install_claude_hooks). Must never block or break
-# Claude Code: every failure path is silent and exits 0.
-payload=$(head -c 2800)
-[ -n "$payload" ] || exit 0
-b64=$(printf '%s' "$payload" | base64 | tr -d '\n')
-[ -n "$b64" ] || exit 0
-osc=$(printf '\033]9;clitab-agent;%s\033\\' "$b64")
-printf '%s' "$osc" > /dev/tty 2>/dev/null || printf '%s' "$osc"
-exit 0
-```
-
-`chmod +x` is NOT needed in-repo (permissions don't survive `include_str!`); the installer sets 0755 on the written copy.
-
-- [ ] **Step 2: Write the failing merge tests**
-
-Create `src-tauri/src/claude_hooks.rs` with tests first:
+Create `src-tauri/src/claude_hooks.rs` with the test module first. The `merge_replaces_existing_manual_osc_entries` fixture uses the **exact command strings from the current `CLAUDE_HOOKS.md`** — that is the upgrade path real users hit:
 
 ```rust
 #[cfg(test)]
@@ -942,124 +1062,195 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The manual UserPromptSubmit command as shipped in CLAUDE_HOOKS.md
+    /// (pre-panel: no text field).
+    const MANUAL_PROMPT: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n "$t" ] && [ "$t" != '??' ] && printf '\033]7777;{"e":"prompt"}\033\\' > /dev/$t 2>/dev/null; true"#;
+    /// The manual Notification command as shipped in CLAUDE_HOOKS.md.
+    const MANUAL_NOTIFY: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:"notify",msg:.message}' 2>/dev/null || printf '{"e":"notify"}'); [ -n "$t" ] && [ "$t" != '??' ] && printf '\033]7777;%s\033\\' "$j" > /dev/$t 2>/dev/null; true"#;
+
+    fn manual_settings() -> serde_json::Value {
+        json!({
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [
+                    { "type": "command", "command": MANUAL_PROMPT }
+                ]}],
+                "PreToolUse": [{ "matcher": "", "hooks": [
+                    { "type": "command", "command": "j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); printf 'x'" }
+                ]}],
+                "Notification": [{ "matcher": "", "hooks": [
+                    { "type": "command", "command": MANUAL_NOTIFY }
+                ]}]
+            },
+            "theme": "dark"
+        })
+    }
+
     #[test]
-    fn merge_adds_all_four_hooks_to_empty_settings() {
-        let merged = merge_hooks(json({}), "/path/to/clitab-hook.sh");
+    fn merge_adds_all_five_hooks_to_empty_settings() {
+        let merged = merge_hooks(json({}));
         let hooks = merged.get("hooks").unwrap();
-        for event in ["UserPromptSubmit", "Notification", "Stop", "PostToolUse"] {
+        for (event, matcher) in [
+            ("UserPromptSubmit", None),
+            ("PreToolUse", Some("")),
+            ("Notification", Some("")),
+            ("Stop", None),
+            ("PostToolUse", Some("AskUserQuestion")),
+        ] {
             let groups = hooks.get(event).and_then(|g| g.as_array()).unwrap();
             assert_eq!(groups.len(), 1, "{event}");
+            assert_eq!(groups[0].get("matcher").and_then(|m| m.as_str()), matcher, "{event}");
             let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
-            assert_eq!(cmd, "/path/to/clitab-hook.sh");
+            assert!(cmd.contains(OSC_MARKER), "{event} command must speak OSC 7777");
+            assert!(cmd.ends_with("; true"), "{event} command must never fail the hook");
         }
-        assert_eq!(hooks["Notification"][0]["matcher"], json(".*"));
-        assert_eq!(hooks["PostToolUse"][0]["matcher"], json("AskUserQuestion"));
-        assert!(hooks["UserPromptSubmit"][0].get("matcher").is_none());
-        assert!(hooks["Stop"][0].get("matcher").is_none());
+        // The panel-bearing payloads are present.
+        assert!(hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str().unwrap().contains(r#"e:"prompt",text:"#));
+        assert!(hooks["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str().unwrap().contains(r#"e:"choice""#));
     }
 
     #[test]
     fn merge_preserves_foreign_hooks() {
-        let settings = json({
+        let settings = json!({
             "hooks": {
-                "Notification": [{ "matcher": ".*", "hooks": [
-                    { "type": "command", "command": "printf '\\a'" }
-                ]}],
-                "PreToolUse": [{ "hooks": [
-                    { "type": "command", "command": "my-own-tool" }
+                "Notification": [{ "matcher": "", "hooks": [
+                    { "type": "command", "command": "my-own-notifier" }
                 ]}]
             },
             "theme": "dark"
         });
-        let merged = merge_hooks(settings.clone(), "/p/clitab-hook.sh");
+        let merged = merge_hooks(settings);
         // The user's own Notification hook is untouched, ours is appended.
         let groups = merged["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0]["hooks"][0]["command"], json("printf '\\a'"));
-        assert_eq!(groups[1]["hooks"][0]["command"], json("/p/clitab-hook.sh"));
-        // Unrelated keys and hook events survive verbatim.
-        assert_eq!(merged["theme"], json("dark"));
-        assert_eq!(merged["hooks"]["PreToolUse"], settings["hooks"]["PreToolUse"]);
+        assert_eq!(groups[0]["hooks"][0]["command"], json!("my-own-notifier"));
+        assert!(groups[1]["hooks"][0]["command"].as_str().unwrap().contains(OSC_MARKER));
+        // Unrelated keys survive verbatim.
+        assert_eq!(merged["theme"], json!("dark"));
+    }
+
+    /// The upgrade path: a user who set up the dashboard manually per
+    /// CLAUDE_HOOKS.md must end up with exactly the installer's commands —
+    /// no duplicates, no orphaned pre-panel variants.
+    #[test]
+    fn merge_replaces_existing_manual_osc_entries() {
+        let merged = merge_hooks(manual_settings());
+        for event in ["UserPromptSubmit", "PreToolUse", "Notification", "Stop", "PostToolUse"] {
+            let groups = merged["hooks"][event].as_array().unwrap();
+            let owned: Vec<_> = groups.iter().filter(|g| group_owns_clitab(g)).collect();
+            assert_eq!(owned.len(), 1, "{event}: exactly one clitab group");
+        }
+        // The stale prompt command (no text field) is gone, replaced by the
+        // installer's current one.
+        let prompt = merged["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert_ne!(prompt[0]["hooks"][0]["command"], json!(MANUAL_PROMPT));
+        // The fixture's PreToolUse stub mentions jq but carries no OSC
+        // marker: ownership keys on the marker, so it counts as foreign —
+        // preserved, with ours appended.
+        let tool = merged["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(tool.len(), 2, "foreign PreToolUse survives, ours appended");
+        assert!(!group_owns_clitab(&tool[0]));
     }
 
     #[test]
-    fn merge_replaces_stale_clitab_entries() {
-        let settings = json({
-            "hooks": {
-                "Notification": [{ "matcher": ".*", "hooks": [
-                    { "type": "command", "command": "/old/path/clitab-hook.sh" }
-                ]}],
-                "Stop": [{ "hooks": [
-                    { "type": "command", "command": "/old/path/clitab-hook.sh" }
-                ]}]
-            }
-        });
-        let merged = merge_hooks(settings, "/new/path/clitab-hook.sh");
-        let cmd = |event: &str| merged["hooks"][event][0]["hooks"][0]["command"].clone();
-        assert_eq!(cmd("Notification"), json("/new/path/clitab-hook.sh"));
-        assert_eq!(cmd("Stop"), json("/new/path/clitab-hook.sh"));
-        // Exactly one clitab group per event: no duplicates after reinstall.
-        for event in ["UserPromptSubmit", "Notification", "Stop", "PostToolUse"] {
-            let n = merged["hooks"][event].as_array().unwrap().iter()
-                .filter(|g| group_owns_clitab(g)).count();
-            assert_eq!(n, 1, "{event}");
-        }
+    fn merge_is_idempotent() {
+        let once = merge_hooks(json({}));
+        let twice = merge_hooks(once.clone());
+        assert_eq!(once, twice);
     }
 
     #[test]
     fn merge_normalizes_broken_shapes() {
         // `hooks` not an object, an event entry not an array, a group without
         // a hooks array: none of these may panic or block the install.
-        let settings = json({ "hooks": "garbage" });
-        let merged = merge_hooks(settings, "/p/clitab-hook.sh");
-        assert_eq!(merged["hooks"]["Stop"][0]["hooks"][0]["command"], json("/p/clitab-hook.sh"));
+        let merged = merge_hooks(json!({ "hooks": "garbage" }));
+        assert!(merged["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str().unwrap().contains(OSC_MARKER));
 
-        let settings = json({ "hooks": { "Stop": "garbage", "Notification": [ { "matcher": "x" } ] } });
-        let merged = merge_hooks(settings, "/p/clitab-hook.sh");
-        let stop = merged["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1);
+        let merged = merge_hooks(json!({
+            "hooks": { "Stop": "garbage", "Notification": [ { "matcher": "x" } ] }
+        }));
+        assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 1);
         // The foreign group without a hooks array is preserved (not ours).
         let notif = merged["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(notif.len(), 2);
-        assert_eq!(notif[0]["matcher"], json("x"));
+        assert_eq!(notif[0]["matcher"], json!("x"));
+    }
+
+    #[test]
+    fn hooks_installed_detects_the_marker() {
+        assert!(hooks_installed_in(&manual_settings()));
+        assert!(!hooks_installed_in(&json!({})));
+        assert!(!hooks_installed_in(&json!({ "hooks": { "Stop": [] } })));
+    }
+
+    /// Testable core of `hooks_installed` (which adds file IO).
+    fn hooks_installed_in(settings: &serde_json::Value) -> bool {
+        settings
+            .get("hooks")
+            .map(|hooks| hooks.to_string().contains(OSC_MARKER))
+            .unwrap_or(false)
     }
 }
 ```
 
-- [ ] **Step 3: Run tests to verify they fail**
+**Fixture caveat:** the `manual_settings()` PreToolUse stub deliberately does NOT contain `]7777;` (it is a foreign command that merely mentions jq) — this pins that ownership detection keys on the OSC marker, not on jq or tty usage. If Step 3's implementation disagrees with any comment embedded in a test, fix the **implementation** to match the test's intent, not the reverse.
+
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib claude_hooks`
-Expected: FAIL — `merge_hooks` / `group_owns_clitab` missing.
+Expected: FAIL — `merge_hooks` / `group_owns_clitab` / `OSC_MARKER` missing.
 
-- [ ] **Step 4: Implement `claude_hooks.rs`**
+- [ ] **Step 3: Implement `claude_hooks.rs`**
 
 Above the test module:
 
 ```rust
-//! One-click installation of the Claude Code hooks that feed the agent event
-//! panel. The hook script is embedded in the binary and written to the app
-//! data dir; `~/.claude/settings.json` is merged — never clobbered: foreign
-//! hooks survive, clitab-owned entries (recognised by the script filename in
-//! their command) are replaced on reinstall, and a malformed settings file
-//! is refused untouched.
+//! One-click installation of the Claude Code hooks that feed the tab
+//! dashboard and the agent event panel. The registrations are the exact
+//! inline commands `CLAUDE_HOOKS.md` documents (kept in sync by hand — the
+//! doc's manual-setup JSON must match these strings); `~/.claude/settings.json`
+//! is merged, never clobbered: foreign hooks survive, clitab-owned entries
+//! (recognised by the OSC 7777 marker in their command) are replaced on
+//! reinstall — which is also how an existing manual setup gets upgraded —
+//! and a malformed settings file is refused untouched.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// Filament that identifies a hook entry as ours: the script's name appears
-/// in its `command`. Path-independent so a moved app data dir still matches.
-pub const SCRIPT_MARKER: &str = "clitab-hook.sh";
+/// Ownership marker: OSC 7777 is clitab's private code, so any hook command
+/// writing it is a clitab hook (ours or the documented manual equivalent).
+pub const OSC_MARKER: &str = "]7777;";
 
-/// The hook script, embedded at compile time (see hooks/clitab-hook.sh).
-pub const HOOK_SCRIPT: &str = include_str!("../hooks/clitab-hook.sh");
+// Every command below uses the ancestor-tty transport (probe verdict, commit
+// efd762d): hooks have no controlling terminal and their stdout is captured
+// by Claude Code, so the only reliable path is the parent's tty device.
+// Every command ends in `; true`: a failing hook must never block Claude Code.
 
-/// The four hook events clitab registers, with their matcher (None = omit).
-fn registrations() -> [(&'static str, Option<&'static str>); 4] {
+const PROMPT_CMD: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:"prompt",text:(.prompt//""|tostring|.[0:140])}' 2>/dev/null || printf '{"e":"prompt"}'); [ -n "$t" ] && [ "$t" != '??' ] && printf '\033]7777;%s\033\\' "$j" > /dev/$t 2>/dev/null; true"#;
+
+const TOOL_CMD: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:"tool",tool:.tool_name}' 2>/dev/null); [ -n "$t" ] && [ "$t" != '??' ] && [ -n "$j" ] && printf '\033]7777;%s\033\\' "$j" > /dev/$t 2>/dev/null; true"#;
+
+const STOP_CMD: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n "$t" ] && [ "$t" != '??' ] && printf '\033]7777;{"e":"stop"}\033\\' > /dev/$t 2>/dev/null; true"#;
+
+const NOTIFY_CMD: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:"notify",msg:.message}' 2>/dev/null || printf '{"e":"notify"}'); [ -n "$t" ] && [ "$t" != '??' ] && printf '\033]7777;%s\033\\' "$j" > /dev/$t 2>/dev/null; true"#;
+
+/// Task 1's probe pinned this jq expression against a real AskUserQuestion
+/// `tool_response`; if the probe report adjusted it, this constant carries
+/// the adjusted form.
+const CHOICE_CMD: &str = r#"t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:"choice",text:((.tool_response.answers // .tool_response // "")|tostring|.[0:140])}' 2>/dev/null); [ -n "$t" ] && [ "$t" != '??' ] && [ -n "$j" ] && printf '\033]7777;%s\033\\' "$j" > /dev/$t 2>/dev/null; true"#;
+
+/// The five hook events clitab registers: (event, matcher, command).
+/// `None` matcher means the group omits the key entirely.
+fn registrations() -> [(&'static str, Option<&'static str>, &'static str); 5] {
     [
-        ("UserPromptSubmit", None),
-        ("Notification", Some(".*")),
-        ("Stop", None),
-        ("PostToolUse", Some("AskUserQuestion")),
+        ("UserPromptSubmit", None, PROMPT_CMD),
+        ("PreToolUse", Some(""), TOOL_CMD),
+        ("Notification", Some(""), NOTIFY_CMD),
+        ("Stop", None, STOP_CMD),
+        ("PostToolUse", Some("AskUserQuestion"), CHOICE_CMD),
     ]
 }
 
@@ -1069,7 +1260,8 @@ pub fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-/// True when settings.json already contains clitab-owned hook entries.
+/// True when settings.json already contains clitab-owned hook entries
+/// (manual or installed).
 pub fn hooks_installed(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
@@ -1077,7 +1269,7 @@ pub fn hooks_installed(path: &Path) -> bool {
         .map(|settings| {
             settings
                 .get("hooks")
-                .map(|hooks| hooks.to_string().contains(SCRIPT_MARKER))
+                .map(|hooks| hooks.to_string().contains(OSC_MARKER))
                 .unwrap_or(false)
         })
         .unwrap_or(false)
@@ -1092,63 +1284,53 @@ pub fn group_owns_clitab(group: &Value) -> bool {
             list.iter().any(|hook| {
                 hook.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains(SCRIPT_MARKER))
+                    .map(|c| c.contains(OSC_MARKER))
                     .unwrap_or(false)
             })
         })
         .unwrap_or(false)
 }
 
-/// Add (or replace) clitab's four hook registrations in a settings document.
+/// Add (or replace) clitab's five hook registrations in a settings document.
 /// Normalizes broken shapes instead of panicking; foreign data is preserved.
-pub fn merge_hooks(mut settings: Value, script_path: &str) -> Value {
+pub fn merge_hooks(mut settings: Value) -> Value {
     if !settings.is_object() {
-        settings = json({});
+        settings = json!({});
     }
     let root = settings.as_object_mut().expect("checked above");
-    let hooks = root.entry("hooks").or_insert_with(|| json({}));
+    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json({});
+        *hooks = json!({});
     }
-    for (event, matcher) in registrations() {
+    for (event, matcher, command) in registrations() {
         let entry = hooks
             .as_object_mut()
             .expect("checked above")
             .entry(event)
-            .or_insert_with(|| json([]));
+            .or_insert_with(|| json!([]));
         if !entry.is_array() {
-            *entry = json([]);
+            *entry = json!([]);
         }
         let groups = entry.as_array_mut().expect("checked above");
+        // Replaces stale clitab entries (any prior one-click install or the
+        // documented manual commands); foreign groups stay.
         groups.retain(|group| !group_owns_clitab(group));
         let mut group = serde_json::Map::new();
         if let Some(m) = matcher {
-            group.insert("matcher".into(), json(m));
+            group.insert("matcher".into(), json!(m));
         }
         group.insert(
             "hooks".into(),
-            json([{ "type": "command", "command": script_path }]),
+            json!([{ "type": "command", "command": command }]),
         );
         groups.push(Value::Object(group));
     }
     settings
 }
 
-/// Write the hook script and merge the registrations into settings.json.
-/// `app_data` is the Tauri app data dir. Errors leave the settings file
-/// untouched; the first successful install writes a `settings.json.bak`.
-pub fn install(app_data: &Path) -> Result<(), String> {
-    let hooks_dir = app_data.join("hooks");
-    std::fs::create_dir_all(&hooks_dir).map_err(|e| format!("could not create hooks dir: {e}"))?;
-    let script_path = hooks_dir.join(SCRIPT_MARKER);
-    std::fs::write(&script_path, HOOK_SCRIPT).map_err(|e| format!("could not write hook script: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("could not mark hook script executable: {e}"))?;
-    }
-
+/// Merge the registrations into ~/.claude/settings.json. Errors leave the
+/// file untouched; the first successful install writes a `settings.json.bak`.
+pub fn install() -> Result<(), String> {
     let settings_path = settings_path();
     let existing = match std::fs::read_to_string(&settings_path) {
         Ok(text) => Some(text),
@@ -1158,7 +1340,7 @@ pub fn install(app_data: &Path) -> Result<(), String> {
     let current: Value = match &existing {
         Some(text) => serde_json::from_str(text)
             .map_err(|_| "settings.json is not valid JSON; refusing to touch it".to_string())?,
-        None => json({}),
+        None => json!({}),
     };
 
     if let Some(text) = &existing {
@@ -1169,7 +1351,7 @@ pub fn install(app_data: &Path) -> Result<(), String> {
         }
     }
 
-    let merged = merge_hooks(current, &script_path.to_string_lossy());
+    let merged = merge_hooks(current);
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create ~/.claude: {e}"))?;
@@ -1180,14 +1362,14 @@ pub fn install(app_data: &Path) -> Result<(), String> {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib claude_hooks`
-Expected: PASS (4 tests).
+Expected: PASS (6 tests).
 
-- [ ] **Step 6: Add the `TabManager` passthrough**
+- [ ] **Step 5: Add the `TabManager` passthrough**
 
-In `src-tauri/src/pty/manager.rs` (imports: `use crate::agent_events::AgentEvent;`):
+In `src-tauri/src/pty/manager.rs` (import: `use crate::agent_events::AgentEvent;`):
 
 ```rust
     /// The tab's stored conversation events (panel restore after a reload).
@@ -1200,9 +1382,11 @@ In `src-tauri/src/pty/manager.rs` (imports: `use crate::agent_events::AgentEvent
     }
 ```
 
-- [ ] **Step 7: Add the three commands in `lib.rs`**
+(Adjust `self.registry` to however `TabManager` names its registry field — check the struct; the `ack_notice` passthrough added for the dashboard is the pattern to copy.)
 
-Imports: `use crate::agent_events::AgentEvent;` and (inside `install_claude_hooks`) `tauri::Manager` is already imported for `.path()`.
+- [ ] **Step 6: Add the three commands in `lib.rs`**
+
+Import: `use crate::agent_events::AgentEvent;`.
 
 ```rust
 /// Stored conversation events of a tab, for panel restore after a webview
@@ -1212,38 +1396,39 @@ fn list_agent_events(
     state: State<'_, AppState>,
     tab_id: String,
 ) -> Result<Vec<AgentEvent>, String> {
-    state.tab_manager.list_agent_events(&tab_id).map_err(ipc_error)
+    state
+        .tab_manager
+        .list_agent_events(&tab_id)
+        .map_err(ipc_error)
 }
 
+/// Whether ~/.claude/settings.json carries clitab's hook registrations
+/// (manual or installed). Drives the panel's "Install hooks" empty state.
 #[tauri::command]
 fn claude_hooks_status() -> bool {
     claude_hooks::hooks_installed(&claude_hooks::settings_path())
 }
 
-/// Write the embedded hook script into the app data dir and merge the four
-/// hook registrations into ~/.claude/settings.json (idempotent).
+/// Merge the five OSC 7777 hook registrations into ~/.claude/settings.json
+/// (idempotent; upgrades manual installs; backs the file up once).
 #[tauri::command]
-fn install_claude_hooks(app: tauri::AppHandle) -> Result<(), String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("could not resolve app data dir: {e}"))?;
-    claude_hooks::install(&app_data)
+fn install_claude_hooks() -> Result<(), String> {
+    claude_hooks::install()
 }
 ```
 
-Add `mod claude_hooks;` at the top, and `list_agent_events, claude_hooks_status, install_claude_hooks` to the `generate_handler!` list.
+Add `mod claude_hooks;` at the top (alphabetically after `mod attention;`), and `list_agent_events, claude_hooks_status, install_claude_hooks` to the `generate_handler!` list.
 
-- [ ] **Step 8: Run full suite + typecheck of the whole backend**
+- [ ] **Step 7: Run full suite + build**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib && cargo check --manifest-path src-tauri/Cargo.toml`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src-tauri/hooks/clitab-hook.sh src-tauri/src/claude_hooks.rs src-tauri/src/lib.rs src-tauri/src/pty/manager.rs
-git commit -m "hooks: one-click Claude Code hook install + list_agent_events command
+git add src-tauri/src/claude_hooks.rs src-tauri/src/lib.rs src-tauri/src/pty/manager.rs
+git commit -m "hooks: one-click OSC 7777 install + list_agent_events command
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
@@ -1261,22 +1446,24 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: Tauri event `agent-event` `{tab_id, event}` and commands `list_agent_events` / `claude_hooks_status` / `install_claude_hooks` (Tasks 5/6).
 - Produces (Tasks 8/9 rely on these):
-  - `types.ts`: `AgentEventKind`, `AgentEvent`, `AgentEventPayload`, and `OutputHandler`-visible seq (below).
+  - `types.ts`: `AgentEventKind`, `AgentEvent`, `AgentEventPayload`.
   - `TabManagerState` additions: `agentEvents: Record<string, AgentEvent[]>` (state, for rendering), `eventsForTab: (tabId: string) => AgentEvent[]` (reads a **synchronously-updated ref** — see rationale below), `hooksInstalled: boolean`, `installHooks: () => Promise<void>`.
-  - `OutputHandler` becomes `(chunk: Uint8Array, seq: number, isReplay?: boolean) => void`.
+  - `OutputHandler` becomes `(chunk: Uint8Array, seq: number, isReplay?: boolean) => void`. The internal `StreamSink` already carries `seq` — this task only surfaces it.
 
-**Why both state and a ref:** the `agent-event` Tauri event is emitted *before* the `pty-output` chunk containing the OSC bytes. If anchoring read events from React state, the chunk could be written before the state update re-renders — the anchor would be missed. `eventsForTab` therefore reads a plain `Map` ref that the listener mutates synchronously; the state mirror exists only to re-render the panel. This is the same "callbacks live in a ref" pattern `useTabManager` already uses for output handlers.
+**Why both state and a ref:** the `agent-event` Tauri event is emitted *before* the `pty-output` chunk containing the OSC bytes (backend invariant, Task 5). If anchoring read events from React state, the chunk could be written before the state update re-renders — the anchor would be missed. `eventsForTab` therefore reads a plain `Map` ref that the listener mutates synchronously; the state mirror exists only to re-render the panel. This is the same "callbacks live in a ref" pattern `useTabManager` already uses for output handlers.
 
 - [ ] **Step 1: Extend `src/types.ts`**
 
 ```ts
 export type AgentEventKind = 'user-prompt' | 'agent-question' | 'agent-done' | 'user-choice';
 
-/** One Claude Code conversation event, anchored to the PTY stream via `seq`. */
+/** One Claude Code conversation event, anchored to the PTY stream via `seq`.
+ *  Mirrors `AgentEvent` in `src-tauri/src/agent_events.rs`. */
 export interface AgentEvent {
   id: string;
   kind: AgentEventKind;
-  /** Summary text, at most 140 chars; may be empty (e.g. agent-done). */
+  /** Summary text, at most 140 chars, whitespace-flattened; may be empty
+   *  (e.g. agent-done, or a hook that ran without jq). */
   text: string;
   /** Unix milliseconds. */
   time: number;
@@ -1292,7 +1479,7 @@ export interface AgentEventPayload {
 
 - [ ] **Step 2: Rework `useTabManager.ts`**
 
-2a. Handler types and import:
+2a. Imports and handler type:
 
 ```ts
 import {
@@ -1308,15 +1495,16 @@ import {
 type OutputHandler = (chunk: Uint8Array, seq: number, isReplay?: boolean) => void;
 ```
 
+(`StreamSink` is unchanged — it already carries `seq`.)
+
 2b. New state + ref next to the existing `handlers` ref:
 
 ```ts
   const [agentEvents, setAgentEvents] = useState<Record<string, AgentEvent[]>>({});
   const [hooksInstalled, setHooksInstalled] = useState(false);
-  // Synchronous mirror for terminal anchoring (see the ref rationale in the
-  // plan / component comment): React state updates are batched, but the
-  // output chunk carrying an event's OSC bytes can arrive in the same tick
-  // as the event itself.
+  // Synchronous mirror for terminal anchoring: the `agent-event` arrives
+  // before the pty-output chunk containing its OSC bytes, and React state
+  // updates are batched — anchoring that read state could miss the chunk.
   const agentEventsRef = useRef(new Map<string, AgentEvent[]>());
 
   const pushAgentEvent = useCallback((tabId: string, event: AgentEvent) => {
@@ -1345,7 +1533,7 @@ type OutputHandler = (chunk: Uint8Array, seq: number, isReplay?: boolean) => voi
     });
 ```
 
-2d. `attachTab` — thread seq through every path (dedup logic unchanged):
+2d. `attachTab` — surface seq on every path (dedup logic unchanged):
 
 ```ts
       const subscription: StreamSink = (chunk, seq) => {
@@ -1354,7 +1542,7 @@ type OutputHandler = (chunk: Uint8Array, seq: number, isReplay?: boolean) => voi
       };
 ```
 
-replay call (ring starts at `replayEnd - bytes.length`):
+replay call (the ring ends at `replayEnd`, so it starts at `replayEnd - bytes.length`):
 
 ```ts
         const bytes = base64ToBytes(response.data);
@@ -1375,9 +1563,7 @@ queued flush:
       }
 ```
 
-2e. Startup — restore events **before** setting tabs, so a mounting Terminal sees them while its replay is written (otherwise replay anchoring would race the restore):
-
-Replace the `invoke<TabResponse[]>('list_tabs').then((loaded) => { ... })` body with:
+2e. Startup — restore events **before** setting tabs, so a mounting Terminal sees them while its replay is written (otherwise replay anchoring would race the restore). Replace the `invoke<TabResponse[]>('list_tabs').then((loaded) => { ... })` body with:
 
 ```ts
     invoke<TabResponse[]>('list_tabs')
@@ -1449,11 +1635,11 @@ Add `pushAgentEvent` to the effect's dependency list (it is stable — `useCallb
   }, []);
 ```
 
-2h. Extend `TabManagerState` and the returned object with: `agentEvents`, `eventsForTab`, `hooksInstalled`, `installHooks`.
+2h. Extend `TabManagerState` (the interface) and the returned object with: `agentEvents`, `eventsForTab`, `hooksInstalled`, `installHooks`.
 
 - [ ] **Step 3: Adapt `Terminal.tsx` to the new handler signature (no behavior change)**
 
-In the mount effect's attach call, the callback becomes `(chunk, _seq, isReplay)` — the underscore keeps `noUnusedParameters`-style checks quiet; Task 8 puts `_seq` to work. Replay branch passes through unchanged otherwise:
+The `TerminalProps.attach` type and the mount effect's attach callback become `(chunk, _seq, isReplay)` — the underscore keeps unused-parameter checks quiet; Task 8 puts `_seq` to work. The replay branch body is unchanged:
 
 ```ts
     void callbacks.current
@@ -1538,7 +1724,7 @@ Component-level (next to `termRef`):
   const markersRef = useRef(new Map<string, IMarker>());
 ```
 
-Add `eventsForTab` / `jumpRequest` to the `callbacks` ref object (same pattern as the existing four callbacks), with defaults in destructuring:
+Add `eventsForTab` to the `callbacks` ref object (same pattern as the existing four callbacks), with defaults in destructuring:
 
 ```tsx
 export const Terminal: React.FC<TerminalProps> = ({
@@ -1594,7 +1780,7 @@ Replace the Task-7 attach block with:
     };
 
     // Replay whatever the PTY produced before we were listening, then stream.
-    // (classifyReplay comment above stays as-is.)
+    // (The classifyReplay comment above stays as-is.)
     void callbacks.current
       .attach(tabId, (chunk, seq, isReplay) => {
         if (disposed) return;
@@ -2007,15 +2193,16 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ---
 
-### Task 10: Documentation — READMEs + CLAUDE_HOOKS.md
+### Task 10: Documentation — READMEs + CLAUDE_HOOKS.md + CLAUDE.md
 
 **Files:**
 - Modify: `README.md`, `README.zh-CN.md` (kept in sync with each other — repo rule)
-- Rewrite: `CLAUDE_HOOKS.md`
-- Verify: prose only; both READMEs say the same things.
+- Modify: `CLAUDE_HOOKS.md` (update in place — it already documents OSC 7777 and the ancestor-tty transport)
+- Modify: `CLAUDE.md` (architecture bullets)
+- Verify: prose only; both READMEs say the same things; the manual-setup JSON in `CLAUDE_HOOKS.md` matches `claude_hooks.rs`'s command constants byte-for-byte.
 
 **Interfaces:**
-- Consumes: final behavior from Tasks 1–9.
+- Consumes: final behavior from Tasks 1–9; the five command constants in `claude_hooks.rs`.
 - Produces: user-facing docs; no code depends on it.
 
 - [ ] **Step 1: README.md — add a section**
@@ -2031,13 +2218,13 @@ submissions — each with a timestamp. Clicking an entry scrolls the terminal
 back to where that event happened.
 
 The panel needs a one-time Claude Code hook setup: click **Install hooks** in
-the panel. clitab writes a small hook script into its app-data directory and
-merges four hook registrations into `~/.claude/settings.json` — your own hooks
-are preserved, a `settings.json.bak` backup is created on first install, and
-reinstalling is safe (clitab replaces only its own entries). Events are kept
-in memory per tab (most recent 200) and are not persisted to disk; jumps work
-as long as the position is still in the terminal's scrollback. See
-[CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) for details and manual setup.
+the panel. clitab merges five hook registrations into `~/.claude/settings.json`
+(the same inline commands [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) documents) — your
+own hooks are preserved, an existing manual dashboard setup is upgraded in
+place, a `settings.json.bak` backup is created on first install, and
+reinstalling is safe. Events are kept in memory per tab (most recent 200) and
+are not persisted to disk; jumps work as long as the position is still in the
+terminal's scrollback.
 ```
 
 - [ ] **Step 2: README.zh-CN.md — the mirrored section**
@@ -2050,105 +2237,48 @@ Same placement as Step 1:
 当某个标签页运行 Claude Code 时，右侧面板会实时列出对话事件——你的发言、Claude 的提问、
 回合完成、选择提交——每条带时间戳。点击条目可将终端滚动回事件发生的位置。
 
-面板需要一次性安装 Claude Code hooks：点击面板中的 **Install hooks**。clitab 会把一个
-小 hook 脚本写入应用数据目录，并把四条 hook 注册合并进 `~/.claude/settings.json`——
-你自己的 hooks 会原样保留，首次安装会创建 `settings.json.bak` 备份，重复安装是安全的
-（clitab 只替换自己的条目）。事件按标签页保存在内存中（最近 200 条），不落盘；只要对应
-位置还在终端回滚缓冲区里，跳转就有效。详见 [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md)。
+面板需要一次性安装 Claude Code hooks：点击面板中的 **Install hooks**。clitab 会把五条
+hook 注册合并进 `~/.claude/settings.json`（与 [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) 文档中
+的内联命令完全一致）——你自己的 hooks 会原样保留，已有的手动 dashboard 配置会被就地
+升级，首次安装会创建 `settings.json.bak` 备份，重复安装是安全的。事件按标签页保存在
+内存中（最近 200 条），不落盘；只要对应位置还在终端回滚缓冲区里，跳转就有效。
 ```
 
-- [ ] **Step 3: Rewrite `CLAUDE_HOOKS.md`**
+- [ ] **Step 3: Update `CLAUDE_HOOKS.md` in place**
 
-Replace the whole file with:
+Keep its structure (intro / Setup / How it works / Legacy notes / Troubleshooting) and make these changes:
 
-````markdown
-# Claude Code Integration
+1. **Intro**: add one sentence — the same hooks also feed the agent event panel (conversation timeline with click-to-jump).
+2. **New section after the intro: "One-click install (recommended)"** — open the panel in any tab and click **Install hooks**; clitab merges the five registrations below into `~/.claude/settings.json`, preserving foreign hooks, replacing any clitab-owned entries (recognised by the `]7777;` marker — including a previous manual setup), and writing a `settings.json.bak` on first install. Restart running Claude Code sessions to pick up changes.
+3. **Setup section (manual)**: retitle to "Manual setup (alternative)" and replace the JSON block with the five commands **exactly as they appear in `claude_hooks.rs`** — the two changed/new ones are:
+   - `UserPromptSubmit` now builds `{"e":"prompt","text":…}` (jq slices `.prompt` to 140 chars, with the bare-payload fallback when jq is missing);
+   - new `PostToolUse` entry, matcher `AskUserQuestion`, building `{"e":"choice","text":…}` (Task 1's pinned jq expression).
+   `PreToolUse`, `Stop`, `Notification` are unchanged.
+4. **How it works**: keep the transport bullets (ancestor tty, `/dev/$t`, `; true`); extend the events bullet list with `text` on prompt and the new `choice` payload; add one bullet: because payloads ride the PTY byte stream, clitab knows each event's exact stream position — that is what makes the panel's click-to-jump land on the right terminal line.
+5. **Legacy notes**: keep; add that installs predating the panel (prompt without `text`, no `PostToolUse`) keep working — the panel simply shows text-less prompt rows until the one-click install upgrades them.
+6. **Troubleshooting**: keep items 1–3; add: "Panel shows rows but jumps do nothing — the target line was trimmed out of the scrollback (5000 lines) or the event predates the replay ring after a reload; this is expected."
 
-clitab's agent event panel (and the attention flash) are driven by Claude Code
-hooks that write escape sequences into the terminal stream, where clitab's PTY
-parser picks them up.
+- [ ] **Step 4: Update `CLAUDE.md`**
 
-## One-click install (recommended)
+Surgical additions only (match the existing bullet style):
 
-Open the agent event panel in any tab and click **Install hooks**. clitab:
+- Backend bullets: `agent_events.rs` (maps decoded OSC 7777 events to panel rows; `TEXT_LIMIT` 140, whitespace-flattened) and `claude_hooks.rs` (one-click install; ownership marker `]7777;`; merge never clobbers foreign hooks).
+- `status.rs` bullet: mention the `text` field on prompt and the `choice` kind.
+- `pty/registry.rs` bullet: mention the per-tab agent-event store (cap 200, 2 s duplicate guard).
+- `lib.rs` command list: add `list_agent_events`, `claude_hooks_status`, `install_claude_hooks`.
+- Events list (Data flow / invariants): add `agent-event`; note the invariant that it is emitted before the `pty-output` chunk containing its OSC (renderer anchors via a synchronous ref).
+- Frontend bullets: `AgentEventPanel.tsx` and the marker-anchoring line in `Terminal.tsx`.
+- Deliberate-choices section: `stop` never touches the title (extend the existing invariant sentence with the panel/`choice` fact: `choice` is panel-only, no dashboard transition).
 
-1. writes its hook script to
-   `~/Library/Application Support/com.clitab.app/hooks/clitab-hook.sh`;
-2. merges four registrations into `~/.claude/settings.json`:
+- [ ] **Step 5: Verify the sync**
 
-   | Hook event | Matcher | Panel event |
-   |---|---|---|
-   | `UserPromptSubmit` | — | your prompt |
-   | `Notification` | `.*` | Claude asks / waits |
-   | `Stop` | — | turn completed |
-   | `PostToolUse` | `AskUserQuestion` | your choice |
+Re-read both README sections side by side: same facts, same order, same link. Diff the manual-setup JSON commands in `CLAUDE_HOOKS.md` against the five constants in `claude_hooks.rs` — they must be identical (that equality is what makes the manual setup upgradeable by the installer).
 
-Your own hook entries are preserved. The first install writes a
-`settings.json.bak` backup next to the original. Reinstalling replaces only
-clitab-owned entries (recognized by the `clitab-hook.sh` filename in their
-command), so it is safe after an app update. Restart any running Claude Code
-sessions to pick up the new settings.
-
-## How it works
-
-- The hook script reads the hook's stdin JSON (truncated to 2800 bytes),
-  base64-encodes it, and writes `OSC 9;clitab-agent;<base64>` to the terminal.
-- Because the sequence rides the PTY byte stream, clitab knows the event's
-  exact stream position — that is what makes click-to-jump land on the right
-  terminal line.
-- `Notification` events additionally flash the tab; `Stop` events additionally
-  revert the tab title to the working directory (same effects the legacy
-  `claude-done` sequence had).
-- Everything is best-effort and silent on failure: a hook must never block or
-  break Claude Code.
-
-## Manual setup (alternative)
-
-Point the four hook events at the script yourself, e.g. in
-`~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      { "hooks": [{ "type": "command",
-        "command": "$HOME/Library/Application Support/com.clitab.app/hooks/clitab-hook.sh" }] }
-    ]
-  }
-}
-```
-
-(Repeat for `UserPromptSubmit`, `Notification` with matcher `.*`, and
-`PostToolUse` with matcher `AskUserQuestion`.)
-
-## Legacy: flash-only setup
-
-Older docs suggested a bare BEL hook for the attention flash alone:
-
-```json
-{
-  "hooks": {
-    "Notification": [
-      { "matcher": ".*",
-        "hooks": [{ "type": "command", "command": "printf '\\a'" }] }
-    ]
-  }
-}
-```
-
-This still works (clitab flashes on BEL), but it produces no panel events.
-Use the one-click install instead; it supersedes this setup.
-````
-
-- [ ] **Step 4: Verify the sync**
-
-Re-read both README sections side by side: same facts, same order, same link. Confirm `CLAUDE_HOOKS.md` has no leftover claim that conflicts with the spec (e.g. the old "Stop may not support command hooks" note is gone — Task 1's probe proved otherwise; if the probe showed Stop does NOT fire, restore that caveat and drop Stop from the table in all three files).
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add README.md README.zh-CN.md CLAUDE_HOOKS.md
-git commit -m "docs: agent event panel + one-click hook install (READMEs, CLAUDE_HOOKS)
+git add README.md README.zh-CN.md CLAUDE_HOOKS.md CLAUDE.md
+git commit -m "docs: agent event panel + one-click hook install (READMEs, CLAUDE_HOOKS, CLAUDE.md)
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
@@ -2179,7 +2309,7 @@ Expected: all green.
 npm run tauri dev
 ```
 
-In the app: open a tab, confirm the `☰` toggle appears at the terminal's top-right; open the panel; click **Install hooks**; confirm `~/.claude/settings.json` now contains the four entries and `settings.json.bak` exists (first install only). Re-click install (via toggle) and confirm no duplicate groups.
+Precondition for a meaningful test: start from a **manual** dashboard setup — put the current `CLAUDE_HOOKS.md` commands into a scratch `~/.claude/settings.json` (back up the real one first). In the app: open a tab, confirm the `☰` toggle appears at the terminal's top-right; open the panel — with only the manual (pre-panel) hooks, `hooksInstalled` is already true (the marker matches), so the empty state says "No events yet." Click **Install hooks** anyway and verify: the `UserPromptSubmit` command gained the `text` field, `PostToolUse` appeared, no duplicate groups, `settings.json.bak` was written (first install only), foreign hooks untouched. Re-click install: still no duplicates.
 
 - [ ] **Step 3: Live conversation acceptance**
 
@@ -2187,31 +2317,33 @@ In the tab, run `claude` in a scratch directory. Check each behavior:
 
 - Panel auto-opens when Claude Code takes the title.
 - Send a prompt → a **You** row appears with your prompt text and a sane time.
-- Let a turn finish → a **Claude done** row appears; tab title reverts to the cwd (prompt-ready behavior); the tab flashes if not focused.
-- Trigger a permission prompt or idle notification → a **Claude asks** row appears; tab flashes when unfocused.
+- Let a turn finish → a **Claude done** row appears; the tab flashes if not focused; the existing dashboard still shows the turn duration. The title does NOT revert on Stop (it reverts on `claude-done` when you exit or the shell integration fires — shipped invariant).
+- Trigger a permission prompt or idle notification → a **Claude asks** row appears with the message text; tab flashes when unfocused.
 - Ask Claude to use AskUserQuestion (`请用 AskUserQuestion 工具问我一个单选题`) and answer → a **You chose** row appears naming your selection.
+- Send a prompt longer than 140 chars → the row's text is truncated, no crash, dashboard unaffected.
 - Scroll away, then click an early row → the terminal jumps back to roughly where that event happened (within a few lines: the anchor is the OSC's position, and ink repaints around it).
 - Send ~50 more messages, scroll to top: rows whose lines were trimmed (scrollback is 5000) do nothing on click — no crash, terminal keeps working.
 
-- [ ] **Step 4: Reload and multi-tab acceptance**
+- [ ] **Step 4: Duplicate-hook acceptance**
+
+Add one of the five registrations (e.g. `Stop`) to a scratch project's `.claude/settings.json` as well, run `claude` there, and finish a turn: exactly **one** new "Claude done" row (the registry's 2 s guard rejects the second fire), and the dashboard duration is still correct. Remove the project-level hook afterwards.
+
+- [ ] **Step 5: Reload and multi-tab acceptance**
 
 - With a conversation in the panel, reload the webview (dev: cmd-R in the webview / restart frontend): panel rows are restored; clicking a row whose position is still inside the 256 KB replay ring jumps correctly; older rows no-op silently.
 - Open a second tab without Claude Code: no panel (toggle still available; its panel shows the empty state). Switch between tabs: each panel shows its own tab's events; the `☰`/auto-open rule follows the active tab.
 - Close the Claude tab: its events are gone from state (reopen a tab, no stale rows).
 
-- [ ] **Step 5: Legacy coexistence check**
-
-In a terminal *outside* clitab, add the legacy `printf '\a'` Notification hook alongside clitab's entries (or reuse an existing legacy config): confirm BEL still flashes the tab and nothing double-fires badly (a duplicate flash is acceptable per spec; a duplicate panel row is not — the legacy hook writes no `clitab-agent` OSC, so no row must appear from it). Remove the legacy entry afterwards.
-
 - [ ] **Step 6: Record results and finish**
 
-Note pass/fail per checklist item in the task report. Any failure: fix in a focused commit (`fix: ...` + attribution line) referencing the behavior, re-run the affected step. When green, the branch is ready — follow superpowers:finishing-a-development-branch for merge/PR.
+Note pass/fail per checklist item in the task report. Any failure: fix in a focused commit (`fix: ...` + attribution line) referencing the behavior, re-run the affected step. Restore the user's real `~/.claude/settings.json` from the Step-2 backup. When green, the branch is ready — follow superpowers:finishing-a-development-branch for merge/PR.
 
 ---
 
-## Self-Review Notes (author)
+## Self-Review Notes (author, revision 2)
 
-- **Spec coverage:** every spec section maps to a task — data flow (2–5, 7–8), event model (3), hook script + install (6), attention-behavior preservation (5), panel UI + auto-open (9), reload restore (7 step 2e), scrollback-trim no-op (8 step 3), docs (10), acceptance (11). No gaps found.
-- **Placeholder scan:** all code steps carry full code; the only deliberately deferred values are Task 1's probe findings, which Task 3 and Task 6 Step 1 explicitly instruct to fold in.
-- **Type consistency:** `AgentEvent`/`AgentEventKind` names and fields identical across Tasks 3/4/5/7; `OutputHandler` seq signature consistent across 7/8; `jumpRequest {tabId, eventId, nonce}` consistent across 8/9; command names `list_agent_events`/`claude_hooks_status`/`install_claude_hooks` consistent across 6/7.
-- **Review Focus pins:** item 1 → Task 1 Step 3 (stop-the-line); item 2 → Task 3 `truncated_mid_multibyte_is_salvaged`; item 3 → Task 2 `agent_event_requires_prefix` + Task 3 `garbage_is_dropped`; item 4 → Task 6 `merge_*` tests; item 5 → Task 8 Step 3 guard + Task 11 Steps 3–4.
+- **Rebase check:** every code step was re-derived from the current sources (osc.rs with `payload_len`/`flush_param`, status.rs with `Wire`/`non_empty`-style filtering, registry.rs with turn-state fields, session.rs `handle_status` with its flash/triage effects and title invariant, useTabManager with `StreamSink`, App/Terminal as shipped). No step references removed revision-1 machinery (OSC 9 channel, base64 script, salvage decoder, legacy-effect re-emission).
+- **Spec coverage:** every revision-2 spec section maps to a task — wire protocol (1, 6), offsets (2), decode + mapping (3), store + dedup (4), session wiring (5), one-click install (6), renderer plumbing + restore (7), anchoring + jump (8), panel + auto-open (9), docs incl. CLAUDE.md (10), acceptance (11). No gaps found.
+- **Placeholder scan:** all code steps carry full code. The single deliberately deferred value is Task 1's pinned choice jq expression, which Task 6's `CHOICE_CMD` comment explicitly instructs to fold in.
+- **Type consistency:** `StatusEvent::Prompt{text}`/`Choice{text}` identical across Tasks 3/5; `panel_event -> Option<(AgentEventKind, String)>` across 3/5; `push_agent_event -> bool` across 4/5; `AgentEvent` fields `id/kind/text/time/seq` across 3/4/5/6/7; `agent-event` payload `{tab_id, event}` across 5/7; command names `list_agent_events`/`claude_hooks_status`/`install_claude_hooks` across 6/7; `OutputHandler (chunk, seq, isReplay?)` across 7/8; `eventsForTab` + `jumpRequest {tabId, eventId, nonce}` across 7/8/9; `OSC_MARKER "]7777;"` across 6/10.
+- **Review Focus pins:** item 1 → Task 1 Step 5 (stop-the-line); item 2 → Task 4 `duplicate_within_window_is_rejected` + Task 5 emit-only-when-accepted; item 3 → Task 6 `merge_replaces_existing_manual_osc_entries` (fixture = shipped commands) + Task 11 Step 2; item 4 → Task 3 `text_truncated_to_limit_chars` / `control_chars_become_spaces` + existing status/osc tolerance tests; item 5 → Task 8 Step 3 guard + Task 11 Steps 3/5.

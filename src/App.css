@@ -421,9 +421,16 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+/* Clamped to two lines: a submitted prompt or notification can be long, and
+   the timeline is a summary — the full text lives in the row's hover title. */
 .timeline-label {
   min-width: 0;
   overflow-wrap: anywhere;
+  white-space: pre-line;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 /* The event's terminal line left the scrollback: visible as history, but

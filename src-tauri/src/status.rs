@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// A decoded protocol event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusEvent {
-    /// UserPromptSubmit: an assistant turn began.
-    Prompt,
+    /// UserPromptSubmit: an assistant turn began. `msg` is the user's
+    /// submitted text, optional because the hook degrades to a bare prompt
+    /// when jq is unavailable.
+    Prompt { msg: Option<String> },
     /// PreToolUse: a tool is about to run.
     Tool { name: String },
     /// Stop: the turn ended. Duration is computed by the receiver, not sent.
@@ -39,7 +41,11 @@ struct Wire {
 pub fn decode(json: &str) -> Option<StatusEvent> {
     let wire: Wire = serde_json::from_str(json).ok()?;
     match wire.e.as_str() {
-        "prompt" => Some(StatusEvent::Prompt),
+        // An empty prompt text would render as a blank timeline row; treat it
+        // like a missing one.
+        "prompt" => Some(StatusEvent::Prompt {
+            msg: wire.msg.filter(|msg| !msg.is_empty()),
+        }),
         // An empty tool name would render as a blank dashboard cell; treat it
         // like a missing one.
         "tool" => Some(StatusEvent::Tool {
@@ -58,8 +64,9 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum TabStatus {
-    /// Turn in flight, no tool reported yet.
-    Thinking { since: u64 },
+    /// Turn in flight, no tool reported yet. `msg` is the prompt text that
+    /// started the turn, when the hook could supply it.
+    Thinking { since: u64, msg: Option<String> },
     Tool { name: String, since: u64 },
     /// Turn finished; `duration` is None when the start was never observed
     /// (partially installed hooks).
@@ -81,7 +88,7 @@ mod tests {
 
     #[test]
     fn decodes_each_event() {
-        assert_eq!(decode(r#"{"e":"prompt"}"#), Some(StatusEvent::Prompt));
+        assert_eq!(decode(r#"{"e":"prompt"}"#), Some(StatusEvent::Prompt { msg: None }));
         assert_eq!(
             decode(r#"{"e":"tool","tool":"Bash"}"#),
             Some(StatusEvent::Tool { name: "Bash".into() })
@@ -101,6 +108,20 @@ mod tests {
         assert_eq!(
             decode(r#"{"e":"notify","msg":null}"#),
             Some(StatusEvent::Notify { msg: None })
+        );
+    }
+
+    /// The prompt hook carries the user's submitted text; it degrades to no
+    /// msg when jq is missing, and an empty msg is treated as a missing one.
+    #[test]
+    fn prompt_carries_submitted_text() {
+        assert_eq!(
+            decode(r#"{"e":"prompt","msg":"fix the bug"}"#),
+            Some(StatusEvent::Prompt { msg: Some("fix the bug".into()) })
+        );
+        assert_eq!(
+            decode(r#"{"e":"prompt","msg":""}"#),
+            Some(StatusEvent::Prompt { msg: None })
         );
     }
 
@@ -126,6 +147,9 @@ mod tests {
 
     #[test]
     fn tab_status_serializes_camel_case() {
+        let json =
+            serde_json::to_value(TabStatus::Thinking { since: 5, msg: Some("hi".into()) }).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "thinking", "since": 5, "msg": "hi"}));
         let json = serde_json::to_value(TabStatus::Tool { name: "Bash".into(), since: 42 }).unwrap();
         assert_eq!(json, serde_json::json!({"kind": "tool", "name": "Bash", "since": 42}));
         let json = serde_json::to_value(TabStatus::Done { duration: None, at: 7 }).unwrap();

@@ -11,7 +11,8 @@ export interface TimelineEvent {
   kind: TimelineEventKind;
   /** Epoch ms taken from the backend payload — authoritative, never Date.now(). */
   at: number;
-  /** notice only: message text; may be absent when the hook lacks jq. */
+  /** notice / turn-start: message text (the notification, or the user's
+   *  submitted prompt); may be absent when the hook lacks jq. */
   msg?: string | null;
   /** turn-end only: turn duration in ms; null when the start was never seen. */
   duration?: number | null;
@@ -54,7 +55,7 @@ export class TimelineTracker {
       events.push({ id: this.nextId++, kind: 'notice', at: notice.at, msg: notice.msg });
     }
     if (status?.kind === 'thinking' && this.prev.status?.kind !== 'thinking') {
-      events.push({ id: this.nextId++, kind: 'turn-start', at: status.since });
+      events.push({ id: this.nextId++, kind: 'turn-start', at: status.since, msg: status.msg });
     } else if (status?.kind === 'done' && this.prev.status?.kind !== 'done') {
       events.push({ id: this.nextId++, kind: 'turn-end', at: status.at, duration: status.duration });
     }

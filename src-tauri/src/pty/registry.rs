@@ -132,10 +132,10 @@ impl Registry {
 
     /// UserPromptSubmit: a turn began. Any stale notice is by definition
     /// answered — the user just typed.
-    pub fn begin_turn(&self, id: &str, now_ms: u64) {
+    pub fn begin_turn(&self, id: &str, now_ms: u64, msg: Option<String>) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.status = Some(TabStatus::Thinking { since: now_ms });
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg });
             tab.turn_start = Some(now_ms);
             tab.notice = None;
         }
@@ -317,9 +317,12 @@ mod tests {
     #[test]
     fn turn_lifecycle_thinking_tool_done() {
         let r = status_fixture();
-        r.begin_turn("t1", 1000);
+        r.begin_turn("t1", 1000, Some("fix the bug".into()));
         let tab = r.get("t1").unwrap();
-        assert_eq!(tab.status, Some(TabStatus::Thinking { since: 1000 }));
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()) })
+        );
         assert_eq!(tab.turn_start, Some(1000));
 
         r.set_tool("t1", "Bash", 1500);
@@ -368,7 +371,7 @@ mod tests {
     #[test]
     fn duplicate_stop_keeps_first_duration() {
         let r = status_fixture();
-        r.begin_turn("t1", 1000);
+        r.begin_turn("t1", 1000, None);
         r.end_turn("t1", 4200);
         r.end_turn("t1", 4300);
         assert_eq!(
@@ -403,7 +406,7 @@ mod tests {
     fn turn_events_clear_the_notice() {
         let r = status_fixture();
         for apply in [
-            |r: &Registry| r.begin_turn("t1", 300),
+            |r: &Registry| r.begin_turn("t1", 300, None),
             |r: &Registry| r.set_tool("t1", "Bash", 300),
             |r: &Registry| r.end_turn("t1", 300),
         ] {
@@ -416,7 +419,7 @@ mod tests {
     #[test]
     fn unknown_tab_status_ops_are_noops() {
         let r = status_fixture();
-        r.begin_turn("nope", 1);
+        r.begin_turn("nope", 1, None);
         r.set_tool("nope", "Bash", 1);
         r.end_turn("nope", 1);
         r.set_notice("nope", None, 1);

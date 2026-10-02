@@ -4,7 +4,7 @@
  * `TabStatus` in `src-tauri/src/status.rs`.
  */
 export type TabStatus =
-  | { kind: 'thinking'; since: number }
+  | { kind: 'thinking'; since: number; msg: string | null }
   | { kind: 'tool'; name: string; since: number }
   | { kind: 'done'; duration: number | null; at: number };
 

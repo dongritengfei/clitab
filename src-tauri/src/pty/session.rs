@@ -359,7 +359,7 @@ impl PtySession {
     ) {
         let now = now_ms();
         match event {
-            StatusEvent::Prompt => registry.begin_turn(tab_id, now),
+            StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg),
             StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
             StatusEvent::Stop => {
                 registry.end_turn(tab_id, now);

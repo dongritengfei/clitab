@@ -17,11 +17,19 @@ import {
   type TabWaitingPayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
+import { getTerm } from '../lib/termRegistry';
+import { MAX_TIMELINE_EVENTS, TimelineTracker, type TimelineEvent } from '../lib/timeline';
+import type { IDecoration, IMarker } from '@xterm/xterm';
 
 /** `isReplay` marks the attach-time ring replay, as opposed to live output. */
 type OutputHandler = (chunk: Uint8Array, isReplay?: boolean) => void;
 /** Internal sink: a live chunk plus its absolute position in the byte stream. */
 type StreamSink = (chunk: Uint8Array, seq: number) => void;
+
+/** How long the jumped-to terminal line stays highlighted. */
+const HIGHLIGHT_MS = 1200;
+/** Same color as xterm's selectionBackground (Catppuccin surface2, translucent). */
+const HIGHLIGHT_COLOR = '#585b7066';
 
 function toTab(response: TabResponse): Tab {
   return { ...response, flashing: false };
@@ -43,12 +51,28 @@ export interface TabManagerState {
   detachTab: (tabId: string) => void;
   writeInput: (tabId: string, data: Uint8Array) => Promise<void>;
   resizePty: (tabId: string, rows: number, cols: number) => Promise<void>;
+  /** Per-tab timeline of key hook-protocol events (renderer-only history). */
+  timelines: Record<string, TimelineEvent[]>;
+  /** Keys `${tabId}:${eventId}` whose terminal line left the scrollback. */
+  staleEvents: ReadonlySet<string>;
+  /** Scroll the tab's terminal to a timeline event and highlight the line. */
+  navigateToEvent: (tabId: string, eventId: number) => void;
 }
 
 export function useTabManager(): TabManagerState {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [timelines, setTimelines] = useState<Record<string, TimelineEvent[]>>({});
+  const [staleEvents, setStaleEvents] = useState<ReadonlySet<string>>(() => new Set());
+
+  // Timeline transition detection is per-tab stateful. Markers bind an event
+  // to its terminal line; they are mutable xterm objects, so they live in a
+  // ref (tabId → eventId → marker), never in state.
+  const trackers = useRef(new Map<string, TimelineTracker>());
+  const markers = useRef(new Map<string, Map<number, IMarker>>());
+  // The one highlight decoration currently on screen, plus its expiry timer.
+  const highlight = useRef<{ decoration: IDecoration; timer: number } | null>(null);
 
   // Output handlers live in a ref: putting them in state would re-subscribe the
   // PTY listener on every tab mount, and the gap between unsubscribing the old
@@ -74,6 +98,22 @@ export function useTabManager(): TabManagerState {
 
   const abandonTab = useCallback((tabId: string) => {
     handlers.current.delete(tabId);
+    trackers.current.delete(tabId);
+    // The tab's markers die with its terminal instance; dropping the map
+    // first also disarms their onDispose guards (see the tab-status
+    // listener), so a closing tab never re-adds stale keys.
+    markers.current.delete(tabId);
+    setTimelines((prev) => {
+      const { [tabId]: _dropped, ...rest } = prev;
+      return rest;
+    });
+    setStaleEvents((prev) => {
+      let next: Set<string> | null = null;
+      for (const key of prev) {
+        if (key.startsWith(`${tabId}:`)) (next ??= new Set(prev)).delete(key);
+      }
+      return next ?? prev;
+    });
     const remaining = tabsRef.current.filter((tab) => tab.id !== tabId);
     const closedIndex = tabsRef.current.findIndex((tab) => tab.id === tabId);
     setTabs(remaining);
@@ -266,6 +306,40 @@ export function useTabManager(): TabManagerState {
     }
   }, []);
 
+  const navigateToEvent = useCallback((tabId: string, eventId: number) => {
+    const term = getTerm(tabId);
+    const marker = markers.current.get(tabId)?.get(eventId);
+    // A trimmed line has no valid position anymore: no-op (the UI grays the
+    // event out via staleEvents, but double-guard here).
+    if (!term || !marker || marker.isDisposed) return;
+
+    term.scrollToLine(marker.line);
+
+    // Replace a still-showing highlight from a previous jump, so rapid clicks
+    // never leave ghost decorations or timers behind.
+    if (highlight.current) {
+      window.clearTimeout(highlight.current.timer);
+      highlight.current.decoration.dispose();
+      highlight.current = null;
+    }
+    const decoration = term.registerDecoration({
+      marker,
+      width: term.cols,
+      height: 1,
+      backgroundColor: HIGHLIGHT_COLOR,
+    });
+    if (!decoration) return;
+    highlight.current = {
+      decoration,
+      timer: window.setTimeout(() => {
+        decoration.dispose();
+        if (highlight.current?.decoration === decoration) highlight.current = null;
+      }, HIGHLIGHT_MS),
+    };
+    // Focus deliberately stays in the timeline panel: consecutive jumps
+    // should not each cost a click back into the panel.
+  }, []);
+
   const dismissError = useCallback(() => setError(null), []);
 
   // The event listeners below are registered once for the lifetime of the app,
@@ -350,6 +424,52 @@ export function useTabManager(): TabManagerState {
               : tab
           )
         );
+
+        // Timeline: derive events from the state transition, then bind each
+        // new event to the terminal line it arrived at.
+        const tabId = payload.tab_id;
+        let tracker = trackers.current.get(tabId);
+        if (!tracker) {
+          tracker = new TimelineTracker();
+          trackers.current.set(tabId, tracker);
+        }
+        const newEvents = tracker.push({ status: payload.status, notice: payload.notice });
+        if (newEvents.length === 0) return;
+
+        const existing = markers.current.get(tabId);
+        const markerMap = existing ?? new Map<number, IMarker>();
+        if (!existing) markers.current.set(tabId, markerMap);
+
+        const term = getTerm(tabId);
+        for (const ev of newEvents) {
+          // No terminal mounted yet (mid-attach): record the event anyway —
+          // it renders non-navigable instead of being lost.
+          const marker = term?.registerMarker(0);
+          if (!marker) continue;
+          markerMap.set(ev.id, marker);
+          const key = `${tabId}:${ev.id}`;
+          marker.onDispose(() => {
+            // Skip when the dispose was cleanup we initiated ourselves (tab
+            // closed, event dropped by the cap): the map entry is already
+            // gone in those cases, and the event is no longer rendered.
+            if (!markers.current.get(tabId)?.has(ev.id)) return;
+            setStaleEvents((prev) => new Set(prev).add(key));
+          });
+        }
+
+        setTimelines((prev) => {
+          const merged = [...(prev[tabId] ?? []), ...newEvents];
+          if (merged.length <= MAX_TIMELINE_EVENTS) return { ...prev, [tabId]: merged };
+          // Cap reached: drop the oldest events and release their markers.
+          // Delete from the map *before* dispose so the onDispose guard above
+          // sees them as cleaned-up, not as trimmed lines.
+          for (const ev of merged.slice(0, merged.length - MAX_TIMELINE_EVENTS)) {
+            const marker = markerMap.get(ev.id);
+            markerMap.delete(ev.id);
+            marker?.dispose();
+          }
+          return { ...prev, [tabId]: merged.slice(-MAX_TIMELINE_EVENTS) };
+        });
       }),
       listen<TabFlashPayload>('tab-flash', ({ payload }) => {
         // Flashing the tab the user is already looking at is pure noise.
@@ -451,6 +571,9 @@ export function useTabManager(): TabManagerState {
     detachTab,
     writeInput,
     resizePty,
+    timelines,
+    staleEvents,
+    navigateToEvent,
   };
 }
 

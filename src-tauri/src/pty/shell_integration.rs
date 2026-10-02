@@ -164,10 +164,21 @@ unset __clitab_rc
     }
 }
 
+/// Resolve the user's real ZDOTDIR from the app's environment. When the app
+/// was launched from an already-integrated shell (e.g. `npm run tauri dev` run
+/// inside a tab), the inherited ZDOTDIR points at that tab's wrapper dir and
+/// CLITAB_ZDOTDIR carries the real one — trusting ZDOTDIR there would chain
+/// the new wrapper to the old one, which then sources itself until zsh aborts
+/// with "job table full or recursion limit exceeded".
+fn real_zdotdir(get: impl Fn(&str) -> Option<String>) -> String {
+    get("CLITAB_ZDOTDIR")
+        .or_else(|| get("ZDOTDIR"))
+        .or_else(|| get("HOME"))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 fn zsh(tab_id: &str, shell_path: &str) -> Prepared {
-    let real_zdotdir = std::env::var("ZDOTDIR")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| "/".to_string());
+    let real_zdotdir = real_zdotdir(|k| std::env::var(k).ok());
 
     let Some(dir) = wrapper_dir(tab_id) else {
         return Prepared::plain(shell_path);
@@ -263,9 +274,7 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "ZDOTDIR" && Path::new(v) == dir));
-        let expected_real = std::env::var("ZDOTDIR")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| "/".to_string());
+        let expected_real = real_zdotdir(|k| std::env::var(k).ok());
         assert!(prepared
             .env
             .iter()
@@ -277,6 +286,33 @@ mod tests {
 
         prepared.cleanup();
         assert!(!dir.exists());
+    }
+
+    /// The reported bug: launching the app from inside an already-integrated
+    /// tab (e.g. `npm run tauri dev` run in a tab) inherits ZDOTDIR=<that
+    /// tab's wrapper dir>. Trusting it points the new tab's CLITAB_ZDOTDIR at
+    /// the old wrapper, whose line 2 then sources itself forever — zsh aborts
+    /// with "job table full or recursion limit exceeded" and the user's real
+    /// ~/.zshrc never loads. CLITAB_ZDOTDIR carries the real dir through any
+    /// nesting depth and must win.
+    #[test]
+    fn nested_launch_resolves_through_clitab_zdotdir() {
+        let env = |k: &str| match k {
+            "CLITAB_ZDOTDIR" => Some("/Users/dev".to_string()),
+            "ZDOTDIR" => Some("/tmp/clitab-old-tab".to_string()),
+            "HOME" => Some("/Users/dev".to_string()),
+            _ => None,
+        };
+        assert_eq!(real_zdotdir(env), "/Users/dev");
+    }
+
+    #[test]
+    fn plain_launch_prefers_zdotdir_then_home() {
+        let zdotdir_only = |k: &str| (k == "ZDOTDIR").then(|| "/cfg/zsh".to_string());
+        assert_eq!(real_zdotdir(zdotdir_only), "/cfg/zsh");
+        let home_only = |k: &str| (k == "HOME").then(|| "/Users/dev".to_string());
+        assert_eq!(real_zdotdir(home_only), "/Users/dev");
+        assert_eq!(real_zdotdir(|_| None), "/");
     }
 
     /// A Finder-launched clitab inherits launchd's minimal PATH. The shell

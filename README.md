@@ -55,7 +55,8 @@ parallel agents stays glanceable from whichever tab you are in.
 - **Session timeline** — the right-hand panel logs the key moments of the
   active tab's Claude Code session: turn started (showing the prompt you
   submitted, clamped to two lines with the full text on hover), permission
-  requests, turn finished (with duration). Click an entry to scroll the
+  requests, your answers to Claude's multiple-choice questions, turn finished
+  (with duration). Click an entry to scroll the
   terminal to that point; entries whose output has scrolled out of the
   5000-line history are grayed out. Powered by the same hooks as the dashboard.
 - **Desktop-grade shortcuts** — a native menu drives ⌘T / ⌘W / ⌃Tab / ⌘1–9,

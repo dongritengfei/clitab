@@ -14,6 +14,12 @@ export interface TabNotice {
   at: number;
 }
 
+/** The user's answer to an in-terminal question. Mirrors `Answer` in Rust. */
+export interface TabAnswer {
+  msg: string;
+  at: number;
+}
+
 export interface Tab {
   id: string;
   title: string;
@@ -84,6 +90,7 @@ export interface TabStatusPayload {
   tab_id: string;
   status: TabStatus | null;
   notice: TabNotice | null;
+  answer: TabAnswer | null;
 }
 
 export interface TabExitPayload {

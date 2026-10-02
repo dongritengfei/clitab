@@ -23,6 +23,9 @@ pub enum StatusEvent {
     /// Notification: the session wants attention. `msg` is optional because
     /// the hook degrades to a bare notify when jq is unavailable.
     Notify { msg: Option<String> },
+    /// PostToolUse of an in-terminal question (AskUserQuestion): the user's
+    /// choice, as the tool's result text.
+    Answer { msg: String },
 }
 
 /// Wire shape. Unknown fields are ignored by serde, which is the forward
@@ -53,6 +56,9 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
         }),
         "stop" => Some(StatusEvent::Stop),
         "notify" => Some(StatusEvent::Notify { msg: wire.msg }),
+        "answer" => Some(StatusEvent::Answer {
+            msg: wire.msg.filter(|msg| !msg.is_empty())?,
+        }),
         _ => None,
     }
 }
@@ -79,6 +85,17 @@ pub enum TabStatus {
 #[serde(rename_all = "camelCase")]
 pub struct Notice {
     pub msg: Option<String>,
+    pub at: u64,
+}
+
+/// The user's answer to an in-terminal question (AskUserQuestion). Unlike
+/// `Notice` this is a point-in-time record, not pending state: it stays in
+/// the payload so a reloaded webview re-renders the row, and the renderer
+/// dedups it by `at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Answer {
+    pub msg: String,
     pub at: u64,
 }
 
@@ -125,6 +142,19 @@ mod tests {
         );
     }
 
+    /// The answer hook carries the user's choice from an in-terminal
+    /// question; without msg there is nothing to show, so the event is
+    /// ignored rather than rendered as an empty row.
+    #[test]
+    fn answer_carries_the_users_choice() {
+        assert_eq!(
+            decode(r#"{"e":"answer","msg":"\"Q\"=\"A\""}"#),
+            Some(StatusEvent::Answer { msg: r#""Q"="A""#.into() })
+        );
+        assert_eq!(decode(r#"{"e":"answer"}"#), None);
+        assert_eq!(decode(r#"{"e":"answer","msg":""}"#), None);
+    }
+
     /// Forward compatibility: v2 fields (tokens, cost) must not break v1.
     #[test]
     fn unknown_extra_fields_are_ignored() {
@@ -156,5 +186,7 @@ mod tests {
         assert_eq!(json, serde_json::json!({"kind": "done", "duration": null, "at": 7}));
         let json = serde_json::to_value(Notice { msg: Some("hi".into()), at: 7 }).unwrap();
         assert_eq!(json, serde_json::json!({"msg": "hi", "at": 7}));
+        let json = serde_json::to_value(Answer { msg: "A".into(), at: 9 }).unwrap();
+        assert_eq!(json, serde_json::json!({"msg": "A", "at": 9}));
     }
 }

@@ -407,6 +407,10 @@ button:focus-visible {
   background: #f9e2af;
 }
 
+.kind-answer .timeline-dot {
+  background: #f5c2e7;
+}
+
 .kind-turn-end .timeline-dot {
   background: #a6e3a1;
 }

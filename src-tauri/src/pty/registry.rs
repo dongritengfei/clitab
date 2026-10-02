@@ -7,7 +7,7 @@
 //! and means `list_tabs` survives a webview reload with the right titles.
 
 use super::lock;
-use crate::status::{Notice, TabStatus};
+use crate::status::{Answer, Notice, TabStatus};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -27,6 +27,9 @@ pub struct TabRecord {
     pub status: Option<TabStatus>,
     /// A Notification-hook message awaiting the user; orthogonal to `status`.
     pub notice: Option<Notice>,
+    /// The user's latest answer to an in-terminal question; a point-in-time
+    /// record (see `status::Answer`), never cleared.
+    pub answer: Option<Answer>,
     /// Epoch ms of the current turn's start, consumed by `end_turn`.
     pub turn_start: Option<u64>,
 }
@@ -51,6 +54,7 @@ impl Registry {
             waiting: false,
             status: None,
             notice: None,
+            answer: None,
             turn_start: None,
         };
         lock(&self.tabs).push(record.clone());
@@ -187,6 +191,14 @@ impl Registry {
         }
     }
 
+    /// Record the user's answer to an in-terminal question.
+    pub fn set_answer(&self, id: &str, msg: String, now_ms: u64) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.answer = Some(Answer { msg, at: now_ms });
+        }
+    }
+
     /// The user switched to the tab and saw the notice.
     pub fn clear_notice(&self, id: &str) {
         let mut tabs = lock(&self.tabs);
@@ -306,7 +318,7 @@ mod tests {
         );
     }
 
-    use crate::status::{Notice, TabStatus};
+    use crate::status::{Answer, Notice, TabStatus};
 
     fn status_fixture() -> Registry {
         let registry = Registry::new();
@@ -414,6 +426,21 @@ mod tests {
             apply(&r);
             assert_eq!(r.get("t1").unwrap().notice, None);
         }
+    }
+
+    #[test]
+    fn set_answer_records_the_users_choice() {
+        let r = status_fixture();
+        r.set_answer("t1", "Option B".into(), 1200);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.answer, Some(Answer { msg: "Option B".into(), at: 1200 }));
+        // A recorded answer is history, not pending state: a new turn must
+        // not wipe it (the renderer dedups answers by `at`).
+        r.begin_turn("t1", 1300, None);
+        assert_eq!(
+            r.get("t1").unwrap().answer,
+            Some(Answer { msg: "Option B".into(), at: 1200 })
+        );
     }
 
     #[test]

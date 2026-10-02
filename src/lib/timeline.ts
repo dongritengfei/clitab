@@ -1,8 +1,9 @@
-import type { TabNotice, TabStatus } from '../types';
+import type { TabAnswer, TabNotice, TabStatus } from '../types';
 
 /** The key events the timeline tracks. Tool calls are deliberately excluded:
- *  a single turn can fire dozens, and the timeline is a summary. */
-export type TimelineEventKind = 'turn-start' | 'notice' | 'turn-end';
+ *  a single turn can fire dozens, and the timeline is a summary. `answer` is
+ *  the exception — the user's choice in an AskUserQuestion dialog. */
+export type TimelineEventKind = 'turn-start' | 'notice' | 'answer' | 'turn-end';
 
 /** One key event in a tab's session history. */
 export interface TimelineEvent {
@@ -11,8 +12,9 @@ export interface TimelineEvent {
   kind: TimelineEventKind;
   /** Epoch ms taken from the backend payload — authoritative, never Date.now(). */
   at: number;
-  /** notice / turn-start: message text (the notification, or the user's
-   *  submitted prompt); may be absent when the hook lacks jq. */
+  /** notice / turn-start / answer: message text (the notification, the
+   *  user's submitted prompt, or the chosen answer); may be absent when the
+   *  hook lacks jq. */
   msg?: string | null;
   /** turn-end only: turn duration in ms; null when the start was never seen. */
   duration?: number | null;
@@ -22,6 +24,7 @@ export interface TimelineEvent {
 export interface StatusSnapshot {
   status: TabStatus | null;
   notice: TabNotice | null;
+  answer: TabAnswer | null;
 }
 
 /** Per-tab event cap; the oldest events are dropped beyond this. */
@@ -33,6 +36,7 @@ export const MAX_TIMELINE_EVENTS = 500;
  *
  * - status becomes `thinking`            → turn-start (at = status.since)
  * - notice appears or its `at` changes   → notice     (at = notice.at)
+ * - answer appears or its `at` changes   → answer     (at = answer.at)
  * - status becomes `done`                → turn-end   (at = status.at)
  *
  * Tool-only changes never produce events. The notice rule keys on `at`, not on
@@ -43,16 +47,19 @@ export const MAX_TIMELINE_EVENTS = 500;
  * turn-end without a turn-start is recorded as-is).
  */
 export class TimelineTracker {
-  private prev: StatusSnapshot = { status: null, notice: null };
+  private prev: StatusSnapshot = { status: null, notice: null, answer: null };
   private nextId = 1;
 
   /** Feed one payload's snapshot; returns the newly detected events (oldest first). */
   push(snapshot: StatusSnapshot): TimelineEvent[] {
     const events: TimelineEvent[] = [];
-    const { status, notice } = snapshot;
+    const { status, notice, answer } = snapshot;
 
     if (notice && notice.at !== this.prev.notice?.at) {
       events.push({ id: this.nextId++, kind: 'notice', at: notice.at, msg: notice.msg });
+    }
+    if (answer && answer.at !== this.prev.answer?.at) {
+      events.push({ id: this.nextId++, kind: 'answer', at: answer.at, msg: answer.msg });
     }
     if (status?.kind === 'thinking' && this.prev.status?.kind !== 'thinking') {
       events.push({ id: this.nextId++, kind: 'turn-start', at: status.since, msg: status.msg });

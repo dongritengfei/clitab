@@ -30,6 +30,9 @@ function labelOf(ev: TimelineEvent): string {
     case 'notice':
       // The hook degrades to no message when jq is missing.
       return ev.msg ?? 'Needs attention';
+    case 'answer':
+      // The tool result text of the question dialog.
+      return ev.msg ?? 'Answered';
     case 'turn-end':
       return ev.duration != null
         ? `Turn finished · ${formatDuration(ev.duration)}`

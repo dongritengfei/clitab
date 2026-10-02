@@ -379,6 +379,9 @@ impl PtySession {
                 crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
             }
+            // An answer means the user is already at the keyboard: no flash,
+            // no waiting-queue entry — just a timeline record.
+            StatusEvent::Answer { msg } => registry.set_answer(tab_id, msg, now),
         }
         if let Some(tab) = registry.get(tab_id) {
             let _ = app.emit(
@@ -387,6 +390,7 @@ impl PtySession {
                     "tab_id": tab_id,
                     "status": tab.status,
                     "notice": tab.notice,
+                    "answer": tab.answer,
                 }),
             );
         }

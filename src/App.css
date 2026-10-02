@@ -354,8 +354,8 @@ button:focus-visible {
 /* Timeline Panel — right-hand session history for the active tab. Mirrors the
    tab list's chrome (same width family, header style, scrollbar). */
 .timeline-panel {
-  width: 230px;
-  min-width: 230px;
+  width: 280px;
+  min-width: 280px;
   background: #181825;
   border-left: 1px solid #313244;
   display: flex;
@@ -377,11 +377,10 @@ button:focus-visible {
   padding: 8px 0;
 }
 
+/* Inline flow: dot, time and label share the first line; the label's wrapped
+   lines start at the panel's left edge, giving the message maximum width. */
 .timeline-event {
-  display: grid;
-  grid-template-columns: 8px auto 1fr;
-  column-gap: 8px;
-  align-items: baseline;
+  display: block;
   width: 100%;
   padding: 6px 12px;
   background: none;
@@ -399,10 +398,12 @@ button:focus-visible {
 }
 
 .timeline-dot {
+  display: inline-block;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  align-self: center;
+  margin-right: 8px;
+  vertical-align: middle;
 }
 
 .kind-turn-start .timeline-dot {
@@ -426,21 +427,17 @@ button:focus-visible {
 }
 
 .timeline-time {
+  margin-right: 6px;
   font-size: 11px;
   color: #6c7086;
   font-variant-numeric: tabular-nums;
 }
 
-/* Clamped to two lines: a submitted prompt or notification can be long, and
-   the timeline is a summary — the full text lives in the row's hover title. */
+/* Shown in full: the label wraps freely and continuation lines start at the
+   event's left edge (plain inline flow, no indent). */
 .timeline-label {
-  min-width: 0;
   overflow-wrap: anywhere;
   white-space: pre-line;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 
 /* The event's terminal line left the scrollback: visible as history, but

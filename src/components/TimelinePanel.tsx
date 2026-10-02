@@ -95,8 +95,8 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
               >
                 <span className="timeline-dot" aria-hidden="true" />
                 <span className="timeline-time">{formatTime(ev.at)}</span>
-                {/* The label is clamped to two lines; hovering the full text
-                    reveals whatever overflowed. The button's own title keeps
+                {/* The label shows the message in full; the title still
+                    exposes the raw hook text. The button's own title keeps
                     the navigation hint on the dot/time. */}
                 <span className="timeline-label" title={ev.msg ?? undefined}>
                   {labelOf(ev)}

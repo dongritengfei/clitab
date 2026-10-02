@@ -442,10 +442,14 @@ export function useTabManager(): TabManagerState {
 
         const term = getTerm(tabId);
         for (const ev of newEvents) {
-          // No terminal mounted yet (mid-attach): record the event anyway —
-          // it renders non-navigable instead of being lost.
+          // No terminal mounted yet (mid-attach): record the event anyway,
+          // but gray it out — there is no terminal line to jump to, so it
+          // must not present itself as navigable.
           const marker = term?.registerMarker(0);
-          if (!marker) continue;
+          if (!marker) {
+            setStaleEvents((prev) => new Set(prev).add(`${tabId}:${ev.id}`));
+            continue;
+          }
           markerMap.set(ev.id, marker);
           const key = `${tabId}:${ev.id}`;
           marker.onDispose(() => {

@@ -256,6 +256,19 @@ export const Terminal: React.FC<TerminalProps> = ({
         }
         return false;
       }
+      /* With a CJK input source active, WebKit reports Cmd presses as
+         keyCode-229 "Process" keydowns — the IME marked the key handled, even
+         when nothing is composing (xterm.js #5887 documents exactly this).
+         xterm's composition path treats *every* 229 keydown as user input and,
+         via scrollOnUserInput, snaps a scrolled-up viewport to the bottom — so
+         ⌘C while reading history threw away the scroll position. A Cmd combo
+         never sends data to the terminal, so dropping it before xterm's
+         handler is safe: real composition keys (229 without Cmd) still take
+         the normal path, and native copy/paste runs through the Edit menu
+         (menu.rs), not through this handler. */
+      if (event.type === 'keydown' && event.metaKey && event.keyCode === 229) {
+        return false;
+      }
       return true;
     });
 

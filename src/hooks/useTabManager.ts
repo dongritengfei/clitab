@@ -51,6 +51,11 @@ export interface TabManagerState {
   detachTab: (tabId: string) => void;
   writeInput: (tabId: string, data: Uint8Array) => Promise<void>;
   resizePty: (tabId: string, rows: number, cols: number) => Promise<void>;
+  /** ⌘F find bar for the active terminal: 0 = closed; each increment (from
+   * the `find` menu shortcut) is a fresh open/refocus request. Renderer-only,
+   * like the timeline. */
+  searchNonce: number;
+  closeSearch: () => void;
   /** Per-tab timeline of key hook-protocol events (renderer-only history). */
   timelines: Record<string, TimelineEvent[]>;
   /** Keys `${tabId}:${eventId}` whose terminal line left the scrollback. */
@@ -63,6 +68,7 @@ export function useTabManager(): TabManagerState {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [searchNonce, setSearchNonce] = useState(0);
   const [timelines, setTimelines] = useState<Record<string, TimelineEvent[]>>({});
   const [staleEvents, setStaleEvents] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -227,6 +233,11 @@ export function useTabManager(): TabManagerState {
     }
   }, [switchTab]);
 
+  // ⌘F: every press is a fresh search — incrementing the nonce opens the bar
+  // and, when it is already open, tells SearchBar to reset and refocus.
+  const openSearch = useCallback(() => setSearchNonce((n) => n + 1), []);
+  const closeSearch = useCallback(() => setSearchNonce(0), []);
+
   const attachTab = useCallback(
     async (tabId: string, handler: OutputHandler) => {
       // Anything arriving while we catch up is queued, so the replay is always
@@ -344,7 +355,15 @@ export function useTabManager(): TabManagerState {
 
   // The event listeners below are registered once for the lifetime of the app,
   // so they call through a ref that always points at the freshest closures.
-  const actions = { createTab, closeActiveTab, selectTabByIndex, cycleTab, switchTab, jumpToNextWaiting };
+  const actions = {
+    createTab,
+    closeActiveTab,
+    selectTabByIndex,
+    cycleTab,
+    switchTab,
+    jumpToNextWaiting,
+    openSearch,
+  };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
 
@@ -539,6 +558,11 @@ export function useTabManager(): TabManagerState {
           case 'next-waiting':
             actions.jumpToNextWaiting();
             break;
+          case 'find':
+            // The bar searches the active terminal; with no tab open there is
+            // nothing to search and no caret to hand focus back to.
+            if (activeTabRef.current) actions.openSearch();
+            break;
         }
       }),
       // A tab the backend created itself: the delayed startup tab, or the
@@ -579,6 +603,8 @@ export function useTabManager(): TabManagerState {
     detachTab,
     writeInput,
     resizePty,
+    searchNonce,
+    closeSearch,
     timelines,
     staleEvents,
     navigateToEvent,

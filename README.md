@@ -59,6 +59,9 @@ parallel agents stays glanceable from whichever tab you are in.
   (with duration). Click an entry to scroll the
   terminal to that point; entries whose output has scrolled out of the
   5000-line history are grayed out. Powered by the same hooks as the dashboard.
+- **Terminal search** — ⌘F finds text in the active tab's screen and
+  scrollback: matches highlight as you type, Enter / Shift+Enter cycle
+  through them, Esc returns the caret to the shell.
 - **Desktop-grade shortcuts** — a native menu drives ⌘T / ⌘W / ⌃Tab / ⌘1–9,
   so they work even when the terminal does not have keyboard focus. Closing a
   tab with a running process asks first.
@@ -137,6 +140,7 @@ the terminal does not have keyboard focus.
 | `⌘J` | Jump to the next tab waiting for input |
 | `⌘1` … `⌘8` | Jump to tab 1–8 |
 | `⌘9` | Jump to the last tab |
+| `⌘F` | Search the active terminal (Enter / ⇧Enter cycle matches, Esc closes) |
 | `⌘C` / `⌘V` / `⌘A` | Copy / paste / select all |
 
 > Notifications appear only while clitab is in the background. If they never

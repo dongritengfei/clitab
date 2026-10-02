@@ -1,4 +1,5 @@
 import { useCallback } from 'react';
+import { SearchBar } from './components/SearchBar';
 import { TabList } from './components/TabList';
 import { Terminal } from './components/Terminal';
 import { TimelinePanel } from './components/TimelinePanel';
@@ -22,6 +23,8 @@ function App() {
     detachTab,
     writeInput,
     resizePty,
+    searchNonce,
+    closeSearch,
     timelines,
     staleEvents,
     navigateToEvent,
@@ -62,6 +65,9 @@ function App() {
               ×
             </button>
           </div>
+        )}
+        {searchNonce > 0 && activeTabId && (
+          <SearchBar tabId={activeTabId} nonce={searchNonce} onClose={closeSearch} />
         )}
         {tabs.length === 0 ? (
           <div className="empty-state">

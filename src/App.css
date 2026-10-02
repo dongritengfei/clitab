@@ -290,6 +290,65 @@ button:focus-visible {
   padding: 0 4px;
 }
 
+/* Search Bar — ⌘F find overlay for the active terminal, floating over its
+   top-right corner (VS Code / iTerm2 style). Above the error banner so a
+   search session survives an error toast. */
+.search-bar {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.search-input {
+  width: 200px;
+  padding: 4px 6px;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: #cdd6f4;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+
+.search-input:focus {
+  border-color: #89b4fa;
+}
+
+.search-input::placeholder {
+  color: #6c7086;
+}
+
+.search-bar button {
+  background: none;
+  border: none;
+  color: #a6adc8;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.search-bar button:hover:not(:disabled) {
+  background: #45475a;
+  color: #cdd6f4;
+}
+
+.search-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .terminal-container {
   width: 100%;
   height: 100%;

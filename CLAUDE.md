@@ -43,6 +43,7 @@ Mutexes are locked via `pty::lock()`, which recovers from poisoning rather than 
 ### Frontend (`src/`)
 
 - `hooks/useTabManager.ts` — all IPC and event handling; the only place that talks to Rust. `components/Terminal.tsx` renders one xterm instance per tab; hidden tabs stay mounted (`visibility: hidden`) so they remain measurable and keep their size.
+- `lib/timeline.ts` — `TimelineTracker` derives the per-tab timeline (turn-start / notice / turn-end) from `tab-status` payload *transitions*; notice detection keys on `notice.at` changes, not null transitions (payloads re-send unchanged notices). Renderer-only by design: the history and its navigation targets die with the webview, and that is accepted. `lib/termRegistry.ts` maps tabId → xterm instance; `useTabManager` binds each timeline event to a terminal line with `registerMarker(0)` — markers track scrollback trimming (`onDispose` ⇒ the event grays out), and click-to-navigate is `scrollToLine(marker.line)` plus a 1.2 s `registerDecoration` highlight. The panel itself is `components/TimelinePanel.tsx` (constant right column, active tab only).
 - `types.ts` — payload types mirroring the Rust side (Rust responses are `camelCase` via serde to match).
 
 ### Data flow / invariants

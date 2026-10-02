@@ -15,6 +15,7 @@
 use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Runtime};
 
+pub const QUIT: &str = "quit";
 pub const NEW_TAB: &str = "new-tab";
 pub const CLOSE_TAB: &str = "close-tab";
 pub const NEXT_TAB: &str = "next-tab";
@@ -22,8 +23,9 @@ pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
 pub const NEXT_WAITING: &str = "next-waiting";
 
-/// Menu ids we forward to the renderer. Everything else (quit, copy, paste,
-/// minimize, ...) is handled natively by predefined menu items.
+/// Menu ids we forward to the renderer. Everything else is handled natively:
+/// `QUIT` in `lib.rs` (quit confirmation), copy/paste/minimize/... by
+/// predefined menu items.
 fn is_tab_action(id: &str) -> bool {
     matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB | NEXT_WAITING)
         || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
@@ -34,6 +36,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     #[cfg(target_os = "macos")]
     {
+        // A custom Quit item instead of the predefined one: the predefined
+        // item sends `terminate:` straight to NSApplication, which bypasses
+        // `RunEvent::ExitRequested` entirely (tao has no
+        // `applicationShouldTerminate:`), leaving no chance to confirm. The
+        // custom id arrives in `on_menu_event`, where lib.rs asks first.
+        let quit = item(app, QUIT, "Quit clitab", "CmdOrCtrl+Q")?;
         let app_menu = SubmenuBuilder::new(app, "clitab")
             .about(None)
             .separator()
@@ -42,7 +50,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             .hide_others()
             .show_all()
             .separator()
-            .quit()
+            .item(&quit)
             .build()?;
         menu = menu.item(&app_menu);
     }
@@ -137,8 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn predefined_items_are_left_to_the_platform() {
-        assert!(!is_tab_action("tauri::quit"));
+    fn non_tab_items_are_left_to_the_platform() {
+        // Quit is handled in lib.rs (confirmation), never forwarded.
+        assert!(!is_tab_action(QUIT));
         assert!(!is_tab_action("tauri::copy"));
         assert!(!is_tab_action("tauri::minimize"));
         // Guard against a prefix that is not one of our numbered ids.

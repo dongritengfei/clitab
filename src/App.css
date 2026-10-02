@@ -1,11 +1,17 @@
 /* Bundled terminal fonts. JetBrains Mono (OFL, via @fontsource — imported in
-   main.tsx) is the primary face, matching Ghostty's default. Symbols Nerd
-   Font Mono (MIT, see assets/fonts/LICENSE-symbols-nerd-font.txt) covers the
-   powerline arrows, devicons and other private-use-area glyphs that the
-   system fonts do not have — WKWebView's font fallback does not reach them. */
+   main.tsx) is the primary face, matching Ghostty's default. The Nerd-patched
+   JetBrains Mono "Mono" variant (OFL plus the symbol licenses, see
+   assets/fonts/LICENSE-*.txt) covers the powerline arrows, devicons and other
+   private-use-area glyphs that the system fonts do not have — WKWebView's
+   font fallback does not reach them. It has to be the patched Mono variant of
+   the primary face itself: CSS fallback renders a glyph at face size without
+   rescaling it to the cell (unlike native terminals), so only icons trimmed
+   to JetBrains Mono's 0.6em advance fit one terminal cell — the standalone
+   Symbols Nerd Font Mono ships 1em-wide icons, whose overflow into the
+   neighbouring cell's background showed up as half-drawn glyphs. */
 @font-face {
-  font-family: 'Symbols Nerd Font Mono';
-  src: url('./assets/fonts/SymbolsNerdFontMono-Regular.ttf') format('truetype');
+  font-family: 'JetBrainsMono Nerd Font Mono';
+  src: url('./assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');
   font-weight: 400;
   font-style: normal;
   font-display: block;

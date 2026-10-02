@@ -22,12 +22,13 @@ pub const NEXT_TAB: &str = "next-tab";
 pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
 pub const NEXT_WAITING: &str = "next-waiting";
+pub const FIND: &str = "find";
 
-/// Menu ids we forward to the renderer. Everything else is handled natively:
-/// `QUIT` in `lib.rs` (quit confirmation), copy/paste/minimize/... by
-/// predefined menu items.
+/// Menu ids we forward to the renderer (`FIND` opens its terminal search
+/// bar). Everything else is handled natively: `QUIT` in `lib.rs` (quit
+/// confirmation), copy/paste/minimize/... by predefined menu items.
 fn is_tab_action(id: &str) -> bool {
-    matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB | NEXT_WAITING)
+    matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB | NEXT_WAITING | FIND)
         || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
 }
 
@@ -86,6 +87,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let tabs = tabs.build()?;
     menu = menu.item(&tabs);
 
+    // A custom Find item (the platform has no predefined one): ⌘F is owned
+    // by the renderer's terminal search bar, not by WKWebView's page search.
+    let find = item(app, FIND, "Find…", "CmdOrCtrl+F")?;
+
     let edit = SubmenuBuilder::new(app, "Edit")
         .undo()
         .redo()
@@ -94,6 +99,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .copy()
         .paste()
         .select_all()
+        .separator()
+        .item(&find)
         .build()?;
     menu = menu.item(&edit);
 
@@ -140,6 +147,7 @@ mod tests {
         assert!(is_tab_action(NEXT_TAB));
         assert!(is_tab_action(PREV_TAB));
         assert!(is_tab_action(NEXT_WAITING));
+        assert!(is_tab_action(FIND));
         assert!(is_tab_action("select-tab-1"));
         assert!(is_tab_action("select-tab-9"));
     }

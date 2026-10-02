@@ -54,7 +54,8 @@ impl From<TabRecord> for TabResponse {
             has_claude_title: tab.has_program_title,
             status: tab.status,
             notice: tab.notice,
-            // `turn_start` is deliberately not exposed: backend-internal.
+            // `turn_start` and `answer` are deliberately not exposed:
+            // backend-internal, and timeline-only (arrives via `tab-status`).
             waiting: tab.waiting,
         }
     }
@@ -275,6 +276,7 @@ mod tests {
                 since: 1700000000000,
             }),
             notice: None,
+            answer: None,
             turn_start: Some(1700000000000),
         };
         let json = serde_json::to_value(TabResponse::from(record)).unwrap();
@@ -297,6 +299,7 @@ mod tests {
                 msg: Some("needs permission".into()),
                 at: 5,
             }),
+            answer: None,
             turn_start: None,
         };
         let json = serde_json::to_value(TabResponse::from(idle)).unwrap();

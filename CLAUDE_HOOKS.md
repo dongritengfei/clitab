@@ -9,9 +9,10 @@ in your global settings.
 
 ## Setup
 
-[jq](https://jqlang.github.io/jq/) is recommended: it powers tool names and
-notification text. Without jq everything degrades gracefully — turn start/stop
-and flashing still work, only the detail text is missing.
+[jq](https://jqlang.github.io/jq/) is recommended: it powers tool names,
+notification text, the submitted-prompt text and the recorded answers in the
+timeline. Without jq everything degrades gracefully — turn start/stop and
+flashing still work, only the detail text is missing.
 
 Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 
@@ -23,7 +24,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;{\"e\":\"prompt\"}\\033\\\\' > /dev/$t 2>/dev/null; true"
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"prompt\",msg:.prompt}' 2>/dev/null || printf '{\"e\":\"prompt\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -35,6 +36,17 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
           {
             "type": "command",
             "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c 'select(.tool_name==\"AskUserQuestion\") | {e:\"answer\",msg:(.tool_response|if type==\"string\" then (sub(\"^Your questions have been answered: \"; \"\") | sub(\"[.]? You can now continue with these answers in mind[.]?$\"; \"\")) else tostring end)}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
           }
         ]
       }
@@ -74,10 +86,12 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 - That tty *is* the clitab tab, so events reach the right tab without any
   tab id — and if Claude runs detached (no tty), the guard clause makes the
   hook a silent no-op.
-- Events: `{"e":"prompt"}` turn start · `{"e":"tool","tool":"Bash"}` running a
-  tool · `{"e":"stop"}` turn end (clitab computes the duration) ·
-  `{"e":"notify","msg":"…"}` needs attention — flashes the tab and shows the
-  message until you switch to it.
+- Events: `{"e":"prompt","msg":"…"}` turn start, with the submitted prompt for
+  the timeline (msg omitted without jq) · `{"e":"tool","tool":"Bash"}` running
+  a tool · `{"e":"answer","msg":"…"}` the user's choice in an AskUserQuestion
+  dialog (PostToolUse, other tools emit nothing) · `{"e":"stop"}` turn end
+  (clitab computes the duration) · `{"e":"notify","msg":"…"}` needs attention —
+  flashes the tab and shows the message until you switch to it.
 - Every command ends in `; true`: a failing hook must never block Claude
   Code. Missing jq produces an empty payload, which clitab ignores.
 

@@ -24,10 +24,15 @@ function formatTime(at: number): string {
 function labelOf(ev: TimelineEvent): string {
   switch (ev.kind) {
     case 'turn-start':
-      return 'Turn started';
+      // Show what the user submitted; the hook degrades to no message when
+      // jq is missing.
+      return ev.msg ?? 'Turn started';
     case 'notice':
       // The hook degrades to no message when jq is missing.
       return ev.msg ?? 'Needs attention';
+    case 'answer':
+      // The tool result text of the question dialog.
+      return ev.msg ?? 'Answered';
     case 'turn-end':
       return ev.duration != null
         ? `Turn finished · ${formatDuration(ev.duration)}`
@@ -90,7 +95,12 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
               >
                 <span className="timeline-dot" aria-hidden="true" />
                 <span className="timeline-time">{formatTime(ev.at)}</span>
-                <span className="timeline-label">{labelOf(ev)}</span>
+                {/* The label is clamped to two lines; hovering the full text
+                    reveals whatever overflowed. The button's own title keeps
+                    the navigation hint on the dot/time. */}
+                <span className="timeline-label" title={ev.msg ?? undefined}>
+                  {labelOf(ev)}
+                </span>
               </button>
             );
           })

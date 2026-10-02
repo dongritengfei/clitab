@@ -433,7 +433,11 @@ export function useTabManager(): TabManagerState {
           tracker = new TimelineTracker();
           trackers.current.set(tabId, tracker);
         }
-        const newEvents = tracker.push({ status: payload.status, notice: payload.notice });
+        const newEvents = tracker.push({
+          status: payload.status,
+          notice: payload.notice,
+          answer: payload.answer,
+        });
         if (newEvents.length === 0) return;
 
         const existing = markers.current.get(tabId);

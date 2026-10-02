@@ -4,13 +4,19 @@
  * `TabStatus` in `src-tauri/src/status.rs`.
  */
 export type TabStatus =
-  | { kind: 'thinking'; since: number }
+  | { kind: 'thinking'; since: number; msg: string | null }
   | { kind: 'tool'; name: string; since: number }
   | { kind: 'done'; duration: number | null; at: number };
 
 /** A Notification-hook message awaiting the user. Mirrors `Notice` in Rust. */
 export interface TabNotice {
   msg: string | null;
+  at: number;
+}
+
+/** The user's answer to an in-terminal question. Mirrors `Answer` in Rust. */
+export interface TabAnswer {
+  msg: string;
   at: number;
 }
 
@@ -84,6 +90,7 @@ export interface TabStatusPayload {
   tab_id: string;
   status: TabStatus | null;
   notice: TabNotice | null;
+  answer: TabAnswer | null;
 }
 
 export interface TabExitPayload {

@@ -127,6 +127,80 @@ add the configuration from [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) to your Claude
 Code settings (`~/.claude/settings.json`). That page has the details and
 troubleshooting.
 
+Or skip the manual edit entirely: paste the prompt below into Claude Code
+running in a clitab tab and press Enter — it merges the hooks into
+`~/.claude/settings.json` for you and validates the result. Restart Claude Code
+when it finishes.
+
+````text
+Merge the clitab terminal's Claude Code hooks config into my ~/.claude/settings.json:
+- Read the existing file first (create it if missing) and preserve everything already in it; for the five hook events (UserPromptSubmit / PreToolUse / PostToolUse / Stop / Notification) that already have entries, append the entries below to the existing arrays instead of replacing them; if one of the commands below is already present, skip it rather than adding a duplicate;
+- Merge the command strings verbatim — do not alter any escaping, quoting or whitespace;
+- When done, validate the file with `jq . ~/.claude/settings.json` (or `python3 -m json.tool` if jq is unavailable);
+- Check for jq with `command -v jq`; if it is missing, tell me `brew install jq` is optional (without it the dashboard just omits tool names and notification text; timers and flashing still work);
+- Finally, remind me to restart Claude Code so the hooks take effect.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"prompt\",msg:.prompt}' 2>/dev/null || printf '{\"e\":\"prompt\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c 'select(.tool_name==\"AskUserQuestion\") | {e:\"answer\",msg:(.tool_response|if type==\"string\" then (sub(\"^Your questions have been answered: \"; \"\") | sub(\"[.]? You can now continue with these answers in mind[.]?$\"; \"\")) else tostring end)}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;{\"e\":\"stop\"}\\033\\\\' > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"notify\",msg:.message}' 2>/dev/null || printf '{\"e\":\"notify\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+````
+
 ## Shortcuts
 
 Defined in the native menu (`src-tauri/src/menu.rs`), so they work even when

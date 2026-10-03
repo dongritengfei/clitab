@@ -19,12 +19,19 @@ import {
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
 import { getTerm } from '../lib/termRegistry';
 import { MAX_TIMELINE_EVENTS, TimelineTracker, type TimelineEvent } from '../lib/timeline';
-import type { IDecoration, IMarker } from '@xterm/xterm';
+import type { IDecoration, IMarker, Terminal as XTerm } from '@xterm/xterm';
 
-/** `isReplay` marks the attach-time ring replay, as opposed to live output. */
-type OutputHandler = (chunk: Uint8Array, isReplay?: boolean) => void;
-/** Internal sink: a live chunk plus its absolute position in the byte stream. */
-type StreamSink = (chunk: Uint8Array, seq: number) => void;
+/** `isReplay` marks the attach-time ring replay, as opposed to live output.
+ * `done` rides on fence writes (see the tab-status listener): xterm invokes it
+ * once that write — and everything queued before it — has been parsed. */
+type OutputHandler = (chunk: Uint8Array, isReplay?: boolean, done?: () => void) => void;
+/** Internal sink: a live chunk plus its absolute position in the byte stream.
+ * An empty chunk with `done` set is a fence: no bytes, just a callback ordered
+ * behind every write queued before it. */
+type StreamSink = (chunk: Uint8Array, seq: number, done?: () => void) => void;
+
+/** Zero-length chunk used to queue a marker-registration fence. */
+const FENCE = new Uint8Array(0);
 
 /** How long the jumped-to terminal line stays highlighted. */
 const HIGHLIGHT_MS = 1200;
@@ -77,8 +84,15 @@ export function useTabManager(): TabManagerState {
   // ref (tabId → eventId → marker), never in state.
   const trackers = useRef(new Map<string, TimelineTracker>());
   const markers = useRef(new Map<string, Map<number, IMarker>>());
-  // The one highlight decoration currently on screen, plus its expiry timer.
-  const highlight = useRef<{ decoration: IDecoration; timer: number } | null>(null);
+  // Mirror of the timelines state so navigateToEvent can look up sibling
+  // events without joining the callback's dependency list.
+  const timelinesRef = useRef(timelines);
+  timelinesRef.current = timelines;
+  // The one highlight decoration currently on screen, its expiry timer, and
+  // the throwaway marker it rides on (disposed together with it).
+  const highlight = useRef<{ decoration: IDecoration; owned: IMarker; timer: number } | null>(
+    null
+  );
 
   // Output handlers live in a ref: putting them in state would re-subscribe the
   // PTY listener on every tab mount, and the gap between unsubscribing the old
@@ -243,10 +257,10 @@ export function useTabManager(): TabManagerState {
       // Anything arriving while we catch up is queued, so the replay is always
       // written before the live stream instead of being interleaved with it.
       let live = false;
-      const queued: { chunk: Uint8Array; seq: number }[] = [];
-      const subscription: StreamSink = (chunk, seq) => {
-        if (live) handler(chunk);
-        else queued.push({ chunk, seq });
+      const queued: { chunk: Uint8Array; seq: number; done?: () => void }[] = [];
+      const subscription: StreamSink = (chunk, seq, done) => {
+        if (live) handler(chunk, false, done);
+        else queued.push({ chunk, seq, done });
       };
       handlers.current.set(tabId, subscription);
 
@@ -278,8 +292,13 @@ export function useTabManager(): TabManagerState {
         live = true;
       }
 
-      for (const { chunk, seq } of queued) {
-        if (seq >= replayEnd) {
+      for (const { chunk, seq, done } of queued) {
+        if (done) {
+          // Fence: carries no bytes, so there is nothing to dedup — forward
+          // as-is to keep its callback ordered behind the writes queued
+          // before it (the replay and any live chunks already drained).
+          handler(chunk, false, done);
+        } else if (seq >= replayEnd) {
           handler(chunk);
         } else if (seq + chunk.length > replayEnd) {
           // Straddles the boundary: the replay already showed the head.
@@ -319,31 +338,76 @@ export function useTabManager(): TabManagerState {
 
   const navigateToEvent = useCallback((tabId: string, eventId: number) => {
     const term = getTerm(tabId);
-    const marker = markers.current.get(tabId)?.get(eventId);
+    const markerMap = markers.current.get(tabId);
+    const marker = markerMap?.get(eventId);
     // A trimmed line has no valid position anymore: no-op (the UI grays the
     // event out via staleEvents, but double-guard here).
     if (!term || !marker || marker.isDisposed) return;
 
-    term.scrollToLine(marker.line);
+    // Markers are registered when the event's OSC arrives, but ink can
+    // rewrite the anchored line afterwards: a prompt queued mid-turn fires
+    // its OSC at queue time, anchoring on the transient queue display (the
+    // real transcript entry is committed only when the previous turn stops,
+    // arbitrarily later), and a turn-end anchored on the spinner block can
+    // shift when a queued next turn commits immediately. By click time
+    // everything has settled, so relocate here: a turn-start jumps to where
+    // its prompt text actually lives; a turn-end uses the settled layout
+    // invariant [done summary][blank][next entry] and jumps two lines above
+    // the next turn's (relocated) entry.
+    const events = timelinesRef.current[tabId] ?? [];
+    const ev = events.find((e) => e.id === eventId);
+    let line = marker.line;
+    if (ev?.kind === 'turn-start') {
+      line = relocatePromptLine(term, marker.line, ev.msg) ?? line;
+    } else if (ev?.kind === 'turn-end') {
+      // FIFO pairing: the k-th turn-end ends the k-th turn-start's turn, so
+      // the next turn's entry belongs to the (k+1)-th turn-start. A queued
+      // prompt's turn-start fires *before* this turn-end arrives, so
+      // scanning events after this one would miss it — index by rank.
+      const idx = events.findIndex((e) => e.id === eventId);
+      let rank = 0;
+      for (let j = 0; j <= idx; j++) {
+        if (events[j]?.kind === 'turn-end') rank++;
+      }
+      const starts = events.filter((e) => e.kind === 'turn-start');
+      const next = starts[rank];
+      const nextMarker = next ? markerMap?.get(next.id) : undefined;
+      if (next && nextMarker && !nextMarker.isDisposed) {
+        const nextLine = relocatePromptLine(term, nextMarker.line, next.msg) ?? nextMarker.line;
+        line = Math.max(0, nextLine - TURN_END_DONE_GAP);
+      }
+    }
+    term.scrollToLine(line);
 
     // Replace a still-showing highlight from a previous jump, so rapid clicks
     // never leave ghost decorations or timers behind.
     if (highlight.current) {
       window.clearTimeout(highlight.current.timer);
       highlight.current.decoration.dispose();
+      highlight.current.owned.dispose();
       highlight.current = null;
     }
+    // The decoration rides a throwaway marker so it lands on the relocated
+    // line even when the event's own marker names a rewritten one.
+    const buffer = term.buffer.active;
+    const owned = term.registerMarker(line - (buffer.baseY + buffer.cursorY));
+    if (!owned) return;
     const decoration = term.registerDecoration({
-      marker,
+      marker: owned,
       width: term.cols,
       height: 1,
       backgroundColor: HIGHLIGHT_COLOR,
     });
-    if (!decoration) return;
+    if (!decoration) {
+      owned.dispose();
+      return;
+    }
     highlight.current = {
       decoration,
+      owned,
       timer: window.setTimeout(() => {
         decoration.dispose();
+        owned.dispose();
         if (highlight.current?.decoration === decoration) highlight.current = null;
       }, HIGHLIGHT_MS),
     };
@@ -464,23 +528,57 @@ export function useTabManager(): TabManagerState {
         if (!existing) markers.current.set(tabId, markerMap);
 
         const term = getTerm(tabId);
+        const sink = handlers.current.get(tabId);
         for (const ev of newEvents) {
+          const key = `${tabId}:${ev.id}`;
           // No terminal mounted yet (mid-attach): record the event anyway,
           // but gray it out — there is no terminal line to jump to, so it
           // must not present itself as navigable.
-          const marker = term?.registerMarker(0);
-          if (!marker) {
-            setStaleEvents((prev) => new Set(prev).add(`${tabId}:${ev.id}`));
+          if (!term || !sink) {
+            setStaleEvents((prev) => new Set(prev).add(key));
             continue;
           }
-          markerMap.set(ev.id, marker);
-          const key = `${tabId}:${ev.id}`;
-          marker.onDispose(() => {
-            // Skip when the dispose was cleanup we initiated ourselves (tab
-            // closed, event dropped by the cap): the map entry is already
-            // gone in those cases, and the event is no longer rendered.
-            if (!markers.current.get(tabId)?.has(ev.id)) return;
-            setStaleEvents((prev) => new Set(prev).add(key));
+          // The backend emits this event *after* the output bytes preceding
+          // its OSC sequence, but xterm parses writes asynchronously: reading
+          // the cursor now would see a stale line. Queue an empty fence write
+          // through the same sink the chunks travel, and register the marker
+          // in its callback — by then the cursor sits exactly where the OSC
+          // sequence arrived, so the marker lands on the event's own line.
+          sink(FENCE, 0, () => {
+            // The tab may have closed or its terminal remounted while the
+            // fence was queued; both unregister before disposing, and the
+            // public Terminal type exposes no isDisposed to check directly.
+            if (getTerm(tabId) !== term || markers.current.get(tabId) !== markerMap) return;
+            // The OSC lands while ink's cursor sits at the bottom of its UI,
+            // but the lines users think of are a few rows higher: for a
+            // turn-start, the transcript entry showing the submitted prompt;
+            // for a turn-end, the spinner block above the input box. Anchor
+            // each to its content line instead of the raw cursor line.
+            let offset = 0;
+            if (ev.kind === 'turn-start') offset = turnStartOffset(term, ev.msg) ?? 0;
+            else if (ev.kind === 'turn-end') offset = turnEndOffset(term);
+            const marker = term.registerMarker(offset);
+            if (!marker) {
+              setStaleEvents((prev) => new Set(prev).add(key));
+              return;
+            }
+            markerMap.set(ev.id, marker);
+            const bind = (m: IMarker) =>
+              m.onDispose(() => {
+                // Skip when the dispose was cleanup we initiated ourselves
+                // (tab closed, event dropped by the cap): the map entry is
+                // already gone in those cases, and the event is either no
+                // longer rendered or still navigable.
+                if (markers.current.get(tabId) !== markerMap) return;
+                if (markerMap.get(ev.id) !== m) return;
+                setStaleEvents((prev) => new Set(prev).add(key));
+              });
+            bind(marker);
+            // The anchor can still end up stranded: ink may rewrite the line
+            // afterwards (the OSC beating the commit repaint, or a queued
+            // prompt's transient box display consumed at stop time).
+            // navigateToEvent relocates at click time, when everything has
+            // settled.
           });
         }
 
@@ -619,4 +717,152 @@ function messageOf(err: unknown): string {
   if (typeof err === 'string') return err;
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/** How far above the cursor to look for a turn's content line. */
+const ANCHOR_SCAN_LINES = 30;
+/** Longest prompt prefix used as the search needle. */
+const ANCHOR_PROBE_LEN = 40;
+/** How far to climb to the top of an anchored block (spinner blocks are 2–3 lines). */
+const ANCHOR_BLOCK_CLIMB = 10;
+
+/** The prompt-text needle for `msg`: first line, capped, with a flag telling
+ * `promptLineMatches` whether the probe is the whole line. */
+function promptProbe(msg: string | null | undefined): { probe: string; whole: boolean } | null {
+  const firstLine = msg?.split('\n')[0]?.trim();
+  if (!firstLine) return null;
+  const probe = firstLine.slice(0, ANCHOR_PROBE_LEN);
+  return { probe, whole: probe === firstLine };
+}
+
+/**
+ * The UserPromptSubmit hook's OSC reaches the PTY while ink's cursor is parked
+ * at the bottom of its UI (input box, hints), but the submitted prompt is
+ * already drawn a few lines up in the transcript — a marker on the raw cursor
+ * line lands below the line the user means by "this turn started". Scan
+ * upwards for the line showing the prompt text and return that line as a
+ * (negative) registerMarker offset, or null when the text is not visible
+ * (hook without jq, or the transcript repaint has not happened yet — the
+ * caller falls back to the cursor line and may re-anchor later).
+ */
+function turnStartOffset(term: XTerm, msg: string | null | undefined): number | null {
+  const needle = promptProbe(msg);
+  if (!needle) return null;
+  const buffer = term.buffer.active;
+  const cursor = buffer.baseY + buffer.cursorY;
+  let fallback: number | null = null;
+  for (let line = cursor; line >= Math.max(0, cursor - ANCHOR_SCAN_LINES); line--) {
+    const text = buffer.getLine(line)?.translateToString(true);
+    if (!text || !promptLineMatches(text, needle.probe, needle.whole)) continue;
+    // The transcript entry ("❯ prompt") wins over a bare text match: the
+    // response body can quote the prompt's words back (common with short
+    // CJK prompts like "再来一次"), and the nearest raw match would then sit
+    // mid-response instead of on the entry the user means.
+    if (text.trimStart().startsWith('❯')) return line - cursor;
+    fallback ??= line - cursor;
+  }
+  return fallback;
+}
+
+/** How many lines the box-region skip may consume (multi-line queued text + borders). */
+const ANCHOR_BOX_SKIP = 10;
+
+/**
+ * The stop hook's OSC lands while ink still shows its busy frame: spinner
+ * block, a blank, the input-box border rules, and the cursor inside the box.
+ * Everything down there is dynamic — the next turn's commit repaint erases
+ * and rewrites it, stranding a raw-cursor marker inside the *next* turn's
+ * content. The box may even carry text: Claude Code queues a prompt typed
+ * mid-turn and submits it the instant this turn stops, so at stop time the
+ * box holds the next prompt — content-looking text on a line that is about
+ * to be rewritten. The turn's actual last line is the top of the spinner
+ * block: ink pins the block's top row when it rewrites it in place into the
+ * "✻ … done" summary, which then stays put as static transcript.
+ *
+ * So: skip everything from the cursor (parked inside the box) through the
+ * box's top border rule — that whole region is the box, whatever it
+ * contains — then blanks and stray chrome, then anchor on the first content
+ * line and climb to the top of its contiguous block (the spinner can carry
+ * sub-lines like "⎿  Tip: …" that the done frame erases).
+ */
+function turnEndOffset(term: XTerm): number {
+  const buffer = term.buffer.active;
+  const cursor = buffer.baseY + buffer.cursorY;
+  const floor = Math.max(0, cursor - ANCHOR_SCAN_LINES);
+  const textAt = (line: number): string =>
+    buffer.getLine(line)?.translateToString(true)?.trim() ?? '';
+  const isBorder = (t: string): boolean => /^[\u2500-\u257F\s]+$/.test(t);
+  // ink's bottom-of-UI chrome: blanks, the empty box prompt, border rules.
+  const isChrome = (t: string): boolean => !t || t === '\u276f' || isBorder(t);
+  // Box region skip. Without a border in sight (unexpected layout), the
+  // budget keeps the skip bounded and the phases below still anchor on the
+  // nearest content line.
+  let line = cursor;
+  let budget = ANCHOR_BOX_SKIP;
+  while (line >= floor && budget-- > 0) {
+    const border = textAt(line) !== '' && isBorder(textAt(line));
+    line--;
+    if (border) break;
+  }
+  while (line >= floor && isChrome(textAt(line))) line--;
+  if (line < floor) return 0;
+  let top = line;
+  while (top - 1 >= Math.max(floor, line - ANCHOR_BLOCK_CLIMB) && !isChrome(textAt(top - 1))) {
+    top--;
+  }
+  return top - cursor;
+}
+
+/** Settled Claude Code layout: [✻ … done summary][blank][❯ next turn entry] —
+ * a turn's done line lives this many lines above the next turn's entry. */
+const TURN_END_DONE_GAP = 2;
+
+/**
+ * Click-time relocation for a stranded turn-start marker (see navigateToEvent).
+ * A marker's line can stop showing its prompt text after ink rewrites it: the
+ * OSC may beat the commit repaint, or a prompt queued mid-turn fires its OSC
+ * at queue time, anchoring on the transient "❯ <queued text>" box display —
+ * that display is consumed the moment the previous turn stops, and the real
+ * transcript entry is committed later, arbitrarily far below. At click time
+ * everything has settled, so if the marker's line no longer matches the probe,
+ * rescan the whole buffer for ❯-prefixed matches: prefer the nearest one
+ * *below* the stranded line (later-committed entries live below), else the
+ * nearest above. Returns null when the line still matches (nothing stranded)
+ * or the prompt text appears nowhere (unlocatable — the caller keeps the
+ * marker's line).
+ */
+function relocatePromptLine(
+  term: XTerm,
+  line: number,
+  msg: string | null | undefined
+): number | null {
+  const needle = promptProbe(msg);
+  if (!needle) return null;
+  const buffer = term.buffer.active;
+  const at = buffer.getLine(line)?.translateToString(true) ?? '';
+  if (promptLineMatches(at, needle.probe, needle.whole)) return null;
+  let below: number | null = null;
+  let above: number | null = null;
+  for (let i = 0; i < buffer.length; i++) {
+    const text = buffer.getLine(i)?.translateToString(true);
+    if (!text || !text.trimStart().startsWith('❯')) continue;
+    if (!promptLineMatches(text, needle.probe, needle.whole)) continue;
+    if (i > line && below === null) below = i;
+    else if (i < line) above = i;
+  }
+  return below ?? above;
+}
+
+/** Substring match with word-boundary guards, so an ink chrome line like
+ * "hint" cannot anchor a "hi" prompt. Boundaries only apply to ASCII word
+ * characters (CJK has none), and only at the probe's end when the probe is
+ * the whole first line — a truncated probe is followed by more prompt text. */
+function promptLineMatches(text: string, probe: string, whole: boolean): boolean {
+  const at = text.indexOf(probe);
+  if (at < 0) return false;
+  const word = /[A-Za-z0-9_]/;
+  if (at > 0 && word.test(probe.charAt(0)) && word.test(text.charAt(at - 1))) return false;
+  const after = text.charAt(at + probe.length); // '' when the probe ends the line
+  if (whole && after && word.test(probe.charAt(probe.length - 1)) && word.test(after)) return false;
+  return true;
 }

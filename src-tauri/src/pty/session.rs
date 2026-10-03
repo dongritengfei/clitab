@@ -255,7 +255,17 @@ impl PtySession {
                     let data = &buf[..n];
                     *lock(&last_activity) = Instant::now();
 
-                    for event in parser.parse(data) {
+                    // Split the chunk at OSC event boundaries and emit each
+                    // segment *before* announcing its event. `tab-status` is
+                    // what binds a timeline entry to a terminal line in the
+                    // renderer, and the marker only lands on the line where the
+                    // OSC sequence actually appeared if the bytes preceding it
+                    // were already on their way (the renderer fences marker
+                    // registration behind its own write queue).
+                    let mut cursor = 0;
+                    for (end, event) in parser.parse_with_end(data) {
+                        emit_segment(&app, &tab_id, &stream, &data[cursor..end]);
+                        cursor = end;
                         Self::handle_osc(
                             &tab_id,
                             &app,
@@ -266,19 +276,7 @@ impl PtySession {
                             event,
                         );
                     }
-
-                    // The ring is filled whether or not anyone is watching, so a
-                    // later attach can rebuild the screen. Emitting while still
-                    // holding the lock is what keeps the byte stream ordered
-                    // against a concurrent `attach_stream`. Chunks that were in
-                    // flight when the renderer re-attached carry a position the
-                    // replay already covers; the renderer dedups on it.
-                    let mut state = lock(&stream);
-                    push_recent(&mut state.recent, data);
-                    if state.attached {
-                        emit_output(&app, &tab_id, data, state.position);
-                    }
-                    state.position += data.len() as u64;
+                    emit_segment(&app, &tab_id, &stream, &data[cursor..]);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -458,6 +456,25 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Ring and forward one segment of a read chunk. The ring is filled whether or
+/// not anyone is watching, so a later attach can rebuild the screen. Emitting
+/// while still holding the lock is what keeps the byte stream ordered against
+/// a concurrent `attach_stream`; chunks (or segments) that were in flight when
+/// the renderer re-attached carry a position the replay already covers, and the
+/// renderer dedups on it. An attach landing *between* segments of one chunk is
+/// the same in-flight case — `position` advances per segment under the lock.
+fn emit_segment(app: &AppHandle, tab_id: &str, stream: &Mutex<StreamState>, segment: &[u8]) {
+    if segment.is_empty() {
+        return;
+    }
+    let mut state = lock(stream);
+    push_recent(&mut state.recent, segment);
+    if state.attached {
+        emit_output(app, tab_id, segment, state.position);
+    }
+    state.position += segment.len() as u64;
 }
 
 /// Forward raw PTY bytes. They travel base64-encoded because a Tauri event

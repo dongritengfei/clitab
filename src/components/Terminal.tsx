@@ -7,8 +7,13 @@ import { registerTerm, unregisterTerm } from '../lib/termRegistry';
 interface TerminalProps {
   tabId: string;
   isActive: boolean;
-  /** Subscribe to this tab's output; resolves once the live stream is flowing. */
-  attach: (tabId: string, write: (chunk: Uint8Array, isReplay?: boolean) => void) => Promise<void>;
+  /** Subscribe to this tab's output; resolves once the live stream is flowing.
+   * `done` (fence writes only) fires once xterm has parsed that write and
+   * everything queued before it. */
+  attach: (
+    tabId: string,
+    write: (chunk: Uint8Array, isReplay?: boolean, done?: () => void) => void
+  ) => Promise<void>;
   detach: (tabId: string) => void;
   onInput: (tabId: string, data: Uint8Array) => void;
   onResize: (tabId: string, rows: number, cols: number) => void;
@@ -307,10 +312,12 @@ export const Terminal: React.FC<TerminalProps> = ({
     // cursor-relative moves clamp to the top and resync; an alt-screen ring
     // is dropped entirely and the app repaints itself.
     void callbacks.current
-      .attach(tabId, (chunk, isReplay) => {
+      .attach(tabId, (chunk, isReplay, done) => {
         if (disposed) return;
         if (!isReplay) {
-          term.write(chunk);
+          // Live chunks and fences; xterm runs `done` after this write and
+          // everything queued before it has been parsed.
+          term.write(chunk, done);
           return;
         }
         switch (classifyReplay(chunk)) {

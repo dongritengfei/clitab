@@ -60,14 +60,31 @@ impl OscParser {
     }
 
     /// Feed a chunk of PTY output, returning every OSC event it completed.
+    /// Test convenience: production code needs the offsets, so `read_loop`
+    /// calls `parse_with_end` directly.
+    #[cfg(test)]
     pub fn parse(&mut self, data: &[u8]) -> Vec<OscEvent> {
+        self.parse_with_end(data)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// Like `parse`, but pairs every event with the offset in `data` just past
+    /// the byte that completed it (for a sequence carried over from a previous
+    /// chunk, the offset is relative to this chunk). Splitting the chunk at
+    /// these offsets lets the reader forward the bytes preceding an event
+    /// before announcing the event itself — that ordering is what allows the
+    /// renderer to bind a `tab-status` event to the exact terminal line where
+    /// its OSC sequence appeared.
+    pub fn parse_with_end(&mut self, data: &[u8]) -> Vec<(usize, OscEvent)> {
         let mut events = Vec::new();
 
-        for &byte in data {
+        for (i, &byte) in data.iter().enumerate() {
             match self.state {
                 State::Ground => match byte {
                     0x1b => self.state = State::AfterEsc,
-                    0x07 => events.push(OscEvent::Bell),
+                    0x07 => events.push((i + 1, OscEvent::Bell)),
                     _ => {}
                 },
                 State::AfterEsc => {
@@ -79,7 +96,7 @@ impl OscParser {
                     }
                 }
                 State::InOsc => match byte {
-                    0x07 => events.extend(self.finish_osc()),
+                    0x07 => events.extend(self.finish_osc().into_iter().map(|e| (i + 1, e))),
                     b';' => self.push_param(),
                     0x1b => {
                         // Either the start of an `ESC \` (ST) terminator, or a
@@ -101,7 +118,7 @@ impl OscParser {
                 State::InOscAfterEsc => {
                     if byte == b'\\' {
                         // ST terminator.
-                        events.extend(self.finish_osc());
+                        events.extend(self.finish_osc().into_iter().map(|e| (i + 1, e)));
                     } else if byte == b']' {
                         // A new OSC started before the previous one was
                         // terminated: the partial sequence is garbage, so throw
@@ -424,6 +441,32 @@ mod tests {
         assert!(parser.parse(b"\x1b[31mred\x1b[0m").is_empty());
         let events = parser.parse(b"\x1b]0;Title\x07");
         assert_eq!(events, vec![OscEvent::TitleChanged("Title".into())]);
+    }
+
+    #[test]
+    fn parse_with_end_reports_completion_offsets() {
+        let mut parser = OscParser::new();
+        // a(0) b(1) ESC(2) ](3) 0(4) ;(5) T(6) BEL(7) c(8) d(9):
+        // the event completes just past the BEL, at offset 8.
+        let events = parser.parse_with_end(b"ab\x1b]0;T\x07cd");
+        assert_eq!(events, vec![(8, OscEvent::TitleChanged("T".into()))]);
+
+        // A standalone BEL at index 0 ends at 1.
+        let events = parser.parse_with_end(b"\x07x");
+        assert_eq!(events, vec![(1, OscEvent::Bell)]);
+
+        // An ST-terminated sequence ends just past the backslash:
+        // ESC(0) ](1) 7777(2..5) ;(6) {(7) }(8) ESC(9) \(10) r(11) → end = 11.
+        let events = parser.parse_with_end(b"\x1b]7777;{}\x1b\\rest");
+        assert_eq!(events, vec![(11, OscEvent::Clitab("{}".into()))]);
+
+        // A sequence carried over from a previous chunk completes in this
+        // one; the offset is relative to the current chunk:
+        // t(0) l(1) e(2) BEL(3) t(4) … → end = 4.
+        let mut parser = OscParser::new();
+        assert!(parser.parse_with_end(b"\x1b]0;Ti").is_empty());
+        let events = parser.parse_with_end(b"tle\x07tail");
+        assert_eq!(events, vec![(4, OscEvent::TitleChanged("Title".into()))]);
     }
 
     #[test]

@@ -377,7 +377,16 @@ export function useTabManager(): TabManagerState {
         line = Math.max(0, nextLine - TURN_END_DONE_GAP);
       }
     }
-    term.scrollToLine(line);
+    // Center the target line in the viewport when the buffer allows, so the
+    // user sees context above and below it (scrollToLine would pin it to the
+    // top edge). Clamped at both ends: near the buffer start or end the
+    // viewport just rests at the nearest valid position.
+    const buffer = term.buffer.active;
+    const centered = Math.min(
+      Math.max(0, line - Math.floor(term.rows / 2)),
+      Math.max(0, buffer.length - term.rows)
+    );
+    term.scrollLines(centered - buffer.viewportY);
 
     // Replace a still-showing highlight from a previous jump, so rapid clicks
     // never leave ghost decorations or timers behind.
@@ -389,7 +398,6 @@ export function useTabManager(): TabManagerState {
     }
     // The decoration rides a throwaway marker so it lands on the relocated
     // line even when the event's own marker names a rewritten one.
-    const buffer = term.buffer.active;
     const owned = term.registerMarker(line - (buffer.baseY + buffer.cursorY));
     if (!owned) return;
     const decoration = term.registerDecoration({

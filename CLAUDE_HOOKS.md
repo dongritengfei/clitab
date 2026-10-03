@@ -14,7 +14,9 @@ notification text, the submitted-prompt text and the recorded answers in the
 timeline. Without jq everything degrades gracefully — turn start/stop and
 flashing still work, only the detail text is missing.
 
-Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
+Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`).
+The same JSON is embedded in the copy-paste setup prompt in both READMEs'
+"Claude Code integration" sections — keep the three copies in sync:
 
 ```json
 {

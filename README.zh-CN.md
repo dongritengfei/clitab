@@ -102,6 +102,79 @@ xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
 [CLAUDE_HOOKS.md](CLAUDE_HOOKS.md) 里的配置加进 Claude Code 设置
 (`~/.claude/settings.json`)即可,细节与排错也在该页。
 
+也可以不手动编辑:把下面整段提示词复制到 clitab 标签里的 Claude Code 中
+回车,它会替你把 hooks 合并进 `~/.claude/settings.json` 并完成校验;处理完
+重启 Claude Code 即可生效。
+
+````text
+请把 clitab 终端的 Claude Code hooks 配置合并进我的 ~/.claude/settings.json:
+- 先读取现有文件(不存在则创建),保留所有已有配置;五个 hook 事件(UserPromptSubmit / PreToolUse / PostToolUse / Stop / Notification)已有条目时,把下面的条目追加进对应数组,不要覆盖;下面某条命令已存在时跳过,不要重复添加;
+- 命令字符串必须逐字合并,不要改动任何转义、引号或空格;
+- 完成后运行 `jq . ~/.claude/settings.json` 校验 JSON 合法(没有 jq 就用 `python3 -m json.tool`);
+- 用 `command -v jq` 检查 jq;缺失时告诉我可选执行 `brew install jq`(不装也能用,仪表盘只是不显示工具名与通知文本,计时与闪烁不受影响);
+- 最后提醒我重启 Claude Code,hooks 才会生效。
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"prompt\",msg:.prompt}' 2>/dev/null || printf '{\"e\":\"prompt\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"tool\",tool:.tool_name}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c 'select(.tool_name==\"AskUserQuestion\") | {e:\"answer\",msg:(.tool_response|if type==\"string\" then (sub(\"^Your questions have been answered: \"; \"\") | sub(\"[.]? You can now continue with these answers in mind[.]?$\"; \"\")) else tostring end)}' 2>/dev/null); [ -n \"$t\" ] && [ \"$t\" != '??' ] && [ -n \"$j\" ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;{\"e\":\"stop\"}\\033\\\\' > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "t=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' '); j=$(jq -c '{e:\"notify\",msg:.message}' 2>/dev/null || printf '{\"e\":\"notify\"}'); [ -n \"$t\" ] && [ \"$t\" != '??' ] && printf '\\033]7777;%s\\033\\\\' \"$j\" > /dev/$t 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+````
+
 ## 快捷键
 
 定义在原生菜单(`src-tauri/src/menu.rs`)中,终端没有键盘焦点时也生效。

@@ -8,7 +8,23 @@
 
 use super::lock;
 use crate::status::{Answer, Notice, TabStatus};
+use std::collections::VecDeque;
 use std::sync::Mutex;
+
+/// PTY silence that marks a "running" turn as stale. An Esc interrupt fires no
+/// Stop hook (verified against a live PTY capture), so afterwards the record
+/// still looks mid-turn while Claude actually sits at an idle prompt. A live
+/// turn repaints its spinner several times a second, so its output gaps stay
+/// far below this; a prompt arriving after this much silence starts a fresh
+/// turn and drops the stale queue.
+const IDLE_GAP_MS: u64 = 3000;
+
+/// A Stop echoing the previous one within this window is the same hook firing
+/// from two settings levels, not a turn that ended — ignore it, or it would
+/// consume the auto-started turn and pop the queue a second time. A real turn
+/// cannot begin and end this fast (even a trivial queued answer needs an API
+/// round trip, observed ≥ ~600 ms).
+const DUPLICATE_STOP_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct TabRecord {
@@ -32,6 +48,14 @@ pub struct TabRecord {
     pub answer: Option<Answer>,
     /// Epoch ms of the current turn's start, consumed by `end_turn`.
     pub turn_start: Option<u64>,
+    /// Prompts submitted while a turn was in flight, oldest first. Claude
+    /// Code auto-submits the head at the stop without re-firing the hook, so
+    /// `end_turn` pops it and the caller models the submission
+    /// (`begin_auto_turn`).
+    pub prompt_queue: VecDeque<Option<String>>,
+    /// Epoch ms of the last accepted `end_turn`; anchors the duplicate-stop
+    /// burst guard.
+    pub last_stop_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +80,8 @@ impl Registry {
             notice: None,
             answer: None,
             turn_start: None,
+            prompt_queue: VecDeque::new(),
+            last_stop_ms: None,
         };
         lock(&self.tabs).push(record.clone());
         record
@@ -134,14 +160,40 @@ impl Registry {
         lock(&self.tabs).iter().filter(|t| t.waiting).count()
     }
 
-    /// UserPromptSubmit: a turn began. Any stale notice is by definition
-    /// answered — the user just typed.
-    pub fn begin_turn(&self, id: &str, now_ms: u64, msg: Option<String>) {
+    /// UserPromptSubmit: a turn began — or, when one is already in flight, a
+    /// prompt was queued (`idle_gap_ms` is the PTY silence before the chunk
+    /// carrying the hook; see `IDLE_GAP_MS`). A queued prompt must NOT restart
+    /// `turn_start`: the running turn's duration ends at its own stop. Any
+    /// stale notice is by definition answered — the user just typed.
+    pub fn begin_turn(&self, id: &str, now_ms: u64, msg: Option<String>, idle_gap_ms: u64) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.status = Some(TabStatus::Thinking { since: now_ms, msg });
-            tab.turn_start = Some(now_ms);
+            let running = tab.turn_start.is_some() && idle_gap_ms < IDLE_GAP_MS;
+            if running {
+                tab.prompt_queue.push_back(msg.clone());
+            } else {
+                // Fresh turn — also the self-heal after an Esc interrupt
+                // (which fires no Stop): a gap this large means Claude is
+                // genuinely idle, so the stale start mark is replaced and any
+                // stale queue dropped. (An interrupt with a non-empty queue
+                // never lands here: Claude auto-submits the head immediately,
+                // its output keeps the gap small, and the next prompt
+                // classifies as queued — which is what it is.)
+                tab.prompt_queue.clear();
+                tab.turn_start = Some(now_ms);
+            }
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: false });
             tab.notice = None;
+        }
+    }
+
+    /// The stop popped Claude's auto-submit: model it. `since` must be the
+    /// stop's own timestamp so the renderer sees `done.at == auto.since`.
+    pub fn begin_auto_turn(&self, id: &str, now_ms: u64, msg: Option<String>) {
+        let mut tabs = lock(&self.tabs);
+        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: true });
+            tab.turn_start = Some(now_ms);
         }
     }
 
@@ -163,23 +215,34 @@ impl Registry {
     }
 
     /// Stop: the turn ended. Duration is None when no start was ever
-    /// observed; the start mark is consumed either way. A duplicate Stop
-    /// (hooks fire once per settings level) finds no start mark and an
-    /// already-`Done` status, and must not clobber the first duration.
-    pub fn end_turn(&self, id: &str, now_ms: u64) {
+    /// observed; the start mark is consumed either way. Returns the queued
+    /// prompt Claude Code auto-submits at this stop (the caller emits the
+    /// `Done` snapshot first, then models the submission via
+    /// `begin_auto_turn`). A duplicate Stop (hooks fire once per settings
+    /// level) must not clobber the first duration nor pop the queue twice:
+    /// the idle-duplicate is caught by the missing start mark + already-
+    /// `Done` status, the burst (a second level's hook milliseconds later,
+    /// now racing an auto-started turn) by `DUPLICATE_STOP_MS`.
+    pub fn end_turn(&self, id: &str, now_ms: u64) -> Option<Option<String>> {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            if tab.turn_start.is_none() && matches!(tab.status, Some(TabStatus::Done { .. })) {
-                return;
+        let tab = tabs.iter_mut().find(|t| t.id == id)?;
+        if let Some(last) = tab.last_stop_ms {
+            if now_ms.saturating_sub(last) < DUPLICATE_STOP_MS {
+                return None;
             }
-            let duration = tab.turn_start.map(|start| now_ms.saturating_sub(start));
-            tab.status = Some(TabStatus::Done {
-                duration,
-                at: now_ms,
-            });
-            tab.turn_start = None;
-            tab.notice = None;
         }
+        if tab.turn_start.is_none() && matches!(tab.status, Some(TabStatus::Done { .. })) {
+            return None;
+        }
+        let duration = tab.turn_start.map(|start| now_ms.saturating_sub(start));
+        tab.status = Some(TabStatus::Done {
+            duration,
+            at: now_ms,
+        });
+        tab.turn_start = None;
+        tab.notice = None;
+        tab.last_stop_ms = Some(now_ms);
+        tab.prompt_queue.pop_front()
     }
 
     /// Notification: park a message for the user without touching the turn
@@ -329,11 +392,11 @@ mod tests {
     #[test]
     fn turn_lifecycle_thinking_tool_done() {
         let r = status_fixture();
-        r.begin_turn("t1", 1000, Some("fix the bug".into()));
+        r.begin_turn("t1", 1000, Some("fix the bug".into()), 0);
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()) })
+            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()), auto: false })
         );
         assert_eq!(tab.turn_start, Some(1000));
 
@@ -345,13 +408,104 @@ mod tests {
         );
         assert_eq!(tab.turn_start, Some(1000), "tool must not restart the clock");
 
-        r.end_turn("t1", 4200);
+        assert_eq!(r.end_turn("t1", 4200), None, "nothing queued to auto-submit");
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
             Some(TabStatus::Done { duration: Some(3200), at: 4200 })
         );
         assert_eq!(tab.turn_start, None, "end_turn consumes the start mark");
+    }
+
+    /// A prompt submitted mid-turn is queued by Claude Code: its hook fires at
+    /// queue time, but the running turn keeps its own clock (the duration must
+    /// cover the whole turn, not start over at every queued prompt).
+    #[test]
+    fn queued_prompt_keeps_the_running_turns_clock() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 5000, Some("B".into()), 100);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: false })
+        );
+        assert_eq!(tab.turn_start, Some(1000), "queued prompt must not restart the clock");
+        assert_eq!(tab.prompt_queue.len(), 1);
+    }
+
+    /// Stop with a non-empty queue: Claude Code auto-submits the head without
+    /// re-firing the hook, so end_turn hands it back and the caller models the
+    /// submission (begin_auto_turn) after emitting the Done snapshot.
+    #[test]
+    fn stop_with_queue_hands_back_the_auto_submit() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 5000, Some("B".into()), 100);
+        assert_eq!(r.end_turn("t1", 8000), Some(Some("B".into())));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(7000), at: 8000 }),
+            "duration covers the whole A turn"
+        );
+
+        r.begin_auto_turn("t1", 8000, Some("B".into()));
+        let tab = r.get("t1").unwrap();
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 8000, msg: Some("B".into()), auto: true })
+        );
+        assert_eq!(tab.turn_start, Some(8000));
+
+        assert_eq!(r.end_turn("t1", 12000), None);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(4000), at: 12000 }),
+            "the auto-started turn gets its own duration and stop"
+        );
+    }
+
+    /// The interrupt self-heal: Esc fires no Stop, so a stale "running" turn
+    /// must not swallow the next prompt as queued. PTY silence before the
+    /// prompt's chunk (idle_gap_ms) is the classifier — a live turn repaints
+    /// its spinner several times a second and never goes silent this long.
+    #[test]
+    fn idle_gap_makes_a_prompt_fresh_and_drops_the_queue() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 2000, Some("B".into()), 100); // queued behind A
+        // A was interrupted; 5s of silence later the user submits C.
+        r.begin_turn("t1", 9000, Some("C".into()), 5000);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.turn_start, Some(9000), "fresh turn, stale clock replaced");
+        assert!(tab.prompt_queue.is_empty(), "stale queue dropped");
+        assert_eq!(r.end_turn("t1", 10000), None);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(1000), at: 10000 })
+        );
+    }
+
+    /// Hooks merged across settings levels fire back-to-back. The burst must
+    /// not consume the auto-started turn nor pop the queue a second time.
+    #[test]
+    fn burst_duplicate_stop_spares_the_auto_turn() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 2000, Some("B".into()), 100);
+        assert_eq!(r.end_turn("t1", 5000), Some(Some("B".into())));
+        r.begin_auto_turn("t1", 5000, Some("B".into()));
+        assert_eq!(r.end_turn("t1", 5100), None, "burst duplicate ignored");
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true }),
+            "the auto turn is still running"
+        );
+        assert_eq!(r.end_turn("t1", 9000), None, "its real stop, queue empty");
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(4000), at: 9000 })
+        );
     }
 
     /// Hooks may be only partially installed: without UserPromptSubmit the
@@ -383,7 +537,7 @@ mod tests {
     #[test]
     fn duplicate_stop_keeps_first_duration() {
         let r = status_fixture();
-        r.begin_turn("t1", 1000, None);
+        r.begin_turn("t1", 1000, None, 0);
         r.end_turn("t1", 4200);
         r.end_turn("t1", 4300);
         assert_eq!(
@@ -418,9 +572,10 @@ mod tests {
     fn turn_events_clear_the_notice() {
         let r = status_fixture();
         for apply in [
-            |r: &Registry| r.begin_turn("t1", 300, None),
+            |r: &Registry| r.begin_turn("t1", 300, None, 0),
             |r: &Registry| r.set_tool("t1", "Bash", 300),
-            |r: &Registry| r.end_turn("t1", 300),
+            // end_turn now returns the queued prompt; discard it here.
+            |r: &Registry| { r.end_turn("t1", 300); },
         ] {
             r.set_notice("t1", Some("stale".into()), 200);
             apply(&r);
@@ -436,7 +591,7 @@ mod tests {
         assert_eq!(tab.answer, Some(Answer { msg: "Option B".into(), at: 1200 }));
         // A recorded answer is history, not pending state: a new turn must
         // not wipe it (the renderer dedups answers by `at`).
-        r.begin_turn("t1", 1300, None);
+        r.begin_turn("t1", 1300, None, 0);
         assert_eq!(
             r.get("t1").unwrap().answer,
             Some(Answer { msg: "Option B".into(), at: 1200 })
@@ -446,7 +601,7 @@ mod tests {
     #[test]
     fn unknown_tab_status_ops_are_noops() {
         let r = status_fixture();
-        r.begin_turn("nope", 1, None);
+        r.begin_turn("nope", 1, None, 0);
         r.set_tool("nope", "Bash", 1);
         r.end_turn("nope", 1);
         r.set_notice("nope", None, 1);

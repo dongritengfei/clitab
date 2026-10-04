@@ -253,6 +253,12 @@ impl PtySession {
                 Ok(0) => break, // EOF: the shell is gone
                 Ok(n) => {
                     let data = &buf[..n];
+                    // Silence before this chunk: how long the PTY was idle.
+                    // `begin_turn` uses it to tell a prompt queued behind a
+                    // live turn (spinner output keeps gaps tiny) from a fresh
+                    // prompt after an Esc interrupt, which fires no Stop and
+                    // leaves the record looking mid-turn (see IDLE_GAP_MS).
+                    let idle_gap_ms = lock(&last_activity).elapsed().as_millis() as u64;
                     *lock(&last_activity) = Instant::now();
 
                     // Split the chunk at OSC event boundaries and emit each
@@ -273,6 +279,7 @@ impl PtySession {
                             &program_active,
                             &last_activity,
                             &flashed,
+                            idle_gap_ms,
                             event,
                         );
                     }
@@ -293,6 +300,7 @@ impl PtySession {
         program_active: &AtomicBool,
         last_activity: &Mutex<Instant>,
         flashed: &AtomicBool,
+        idle_gap_ms: u64,
         event: OscEvent,
     ) {
         match event {
@@ -340,7 +348,7 @@ impl PtySession {
                 // dropped: a hook emitting something newer than this build
                 // must be a no-op, never an error.
                 if let Some(event) = status::decode(&json) {
-                    Self::handle_status(tab_id, app, registry, flashed, event);
+                    Self::handle_status(tab_id, app, registry, flashed, idle_gap_ms, event);
                 }
             }
         }
@@ -353,24 +361,39 @@ impl PtySession {
         app: &AppHandle,
         registry: &Registry,
         flashed: &AtomicBool,
+        idle_gap_ms: u64,
         event: StatusEvent,
     ) {
         let now = now_ms();
         match event {
-            StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg),
+            StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg, idle_gap_ms),
             StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
             StatusEvent::Stop => {
-                registry.end_turn(tab_id, now);
+                let queued = registry.end_turn(tab_id, now);
                 // An explicit turn-end beats the 2s idle heuristic: flash now
                 // and suppress the watcher's duplicate. Like every flash
                 // trigger, this enters the triage queue (set_waiting's
                 // transition guard keeps badge/notification exactly-once).
+                // With a prompt queued, skip all of that: Claude Code
+                // auto-submits it right now and needs no user — the next stop
+                // with an empty queue flashes instead.
                 flashed.store(true, Ordering::Relaxed);
-                crate::attention::enter_waiting(app, registry, tab_id);
-                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                if queued.is_none() {
+                    crate::attention::enter_waiting(app, registry, tab_id);
+                    let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                }
                 // Deliberately does NOT touch program_active or the title:
                 // Claude Code is still running between turns. (Title revert
                 // stays owned by the shell integration's `claude-done`.)
+                // Two ordered snapshots: the renderer derives the turn-end row
+                // from the `Done` one, then flips the queued prompt's row to
+                // executing on the auto-start (`Thinking { auto: true }`).
+                Self::emit_status(app, registry, tab_id);
+                if let Some(msg) = queued {
+                    registry.begin_auto_turn(tab_id, now, msg);
+                    Self::emit_status(app, registry, tab_id);
+                }
+                return;
             }
             StatusEvent::Notify { msg } => {
                 registry.set_notice(tab_id, msg, now);
@@ -381,6 +404,11 @@ impl PtySession {
             // no waiting-queue entry — just a timeline record.
             StatusEvent::Answer { msg } => registry.set_answer(tab_id, msg, now),
         }
+        Self::emit_status(app, registry, tab_id);
+    }
+
+    /// Broadcast the tab's full protocol state (replacement, not merge).
+    fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
         if let Some(tab) = registry.get(tab_id) {
             let _ = app.emit(
                 "tab-status",

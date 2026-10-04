@@ -56,8 +56,9 @@ impl From<TabRecord> for TabResponse {
             has_claude_title: tab.has_program_title,
             status: tab.status,
             notice: tab.notice,
-            // `turn_start` and `answer` are deliberately not exposed:
-            // backend-internal, and timeline-only (arrives via `tab-status`).
+            // `turn_start`, `prompt_queue`, `last_stop_ms` and `answer` are
+            // deliberately not exposed: backend-internal, and timeline-only
+            // (arrives via `tab-status`).
             waiting: tab.waiting,
         }
     }
@@ -338,6 +339,8 @@ mod tests {
             notice: None,
             answer: None,
             turn_start: Some(1700000000000),
+            prompt_queue: Default::default(),
+            last_stop_ms: None,
         };
         let json = serde_json::to_value(TabResponse::from(record)).unwrap();
         assert_eq!(
@@ -361,6 +364,8 @@ mod tests {
             }),
             answer: None,
             turn_start: None,
+            prompt_queue: Default::default(),
+            last_stop_ms: None,
         };
         let json = serde_json::to_value(TabResponse::from(idle)).unwrap();
         assert_eq!(json["status"], serde_json::Value::Null);

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import type { TimelineEvent } from '../lib/timeline';
+import { displayOrder, type TimelineEvent } from '../lib/timeline';
 import { formatDuration } from './TabItem';
 
 interface TimelinePanelProps {
@@ -67,11 +67,15 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_BOTTOM_PX;
   };
 
+  // Execution-time order for humans; the incoming array's arrival order is
+  // load-bearing elsewhere (FIFO navigation pairing), so sort a copy.
+  const ordered = displayOrder(events);
+
   return (
     <aside className="timeline-panel" aria-label="Session timeline">
       <div className="timeline-header">Timeline</div>
       <div className="timeline-items" ref={listRef} onScroll={onScroll}>
-        {events.length === 0 ? (
+        {ordered.length === 0 ? (
           <div className="timeline-empty">
             <p>No events yet</p>
             <p className="timeline-empty-hint">
@@ -79,7 +83,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
             </p>
           </div>
         ) : (
-          events.map((ev) => {
+          ordered.map((ev) => {
             const stale = isStale(ev.id);
             return (
               <button
@@ -94,7 +98,15 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                 }
               >
                 <span className="timeline-dot" aria-hidden="true" />
-                <span className="timeline-time">{formatTime(ev.at)}</span>
+                <span className="timeline-time">{formatTime(ev.startedAt ?? ev.at)}</span>
+                {ev.queued ? (
+                  <span
+                    className="timeline-tag"
+                    title="Submitted while the previous turn was still running; it executes when that turn finishes"
+                  >
+                    Queued
+                  </span>
+                ) : null}
                 {/* The label shows the message in full; the title still
                     exposes the raw hook text. The button's own title keeps
                     the navigation hint on the dot/time. */}

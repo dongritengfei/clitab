@@ -18,13 +18,20 @@ import {
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
 import { getTerm } from '../lib/termRegistry';
-import { MAX_TIMELINE_EVENTS, TimelineTracker, type TimelineEvent } from '../lib/timeline';
+import {
+  MAX_TIMELINE_EVENTS,
+  stampQueuedStarts,
+  startQueuedTurn,
+  TimelineTracker,
+  type TimelineEvent,
+} from '../lib/timeline';
 import type { IDecoration, IMarker, Terminal as XTerm } from '@xterm/xterm';
 
 /** `isReplay` marks the attach-time ring replay, as opposed to live output.
  * `done` rides on fence writes (see the tab-status listener): xterm invokes it
  * once that write — and everything queued before it — has been parsed. */
 type OutputHandler = (chunk: Uint8Array, isReplay?: boolean, done?: () => void) => void;
+
 /** Internal sink: a live chunk plus its absolute position in the byte stream.
  * An empty chunk with `done` set is a fence: no bytes, just a callback ordered
  * behind every write queued before it. */
@@ -529,7 +536,15 @@ export function useTabManager(): TabManagerState {
           notice: payload.notice,
           answer: payload.answer,
         });
-        if (newEvents.length === 0) return;
+        // The backend models Claude Code's auto-submission of the queue head
+        // as a `thinking` payload with `auto: true` (emitted right after the
+        // stop's Done snapshot): no new timeline event, but the queued
+        // prompt's row must flip to executing (exact time, badge cleared).
+        const autoSince =
+          payload.status?.kind === 'thinking' && payload.status.auto
+            ? payload.status.since
+            : null;
+        if (newEvents.length === 0 && autoSince == null) return;
 
         const existing = markers.current.get(tabId);
         const markerMap = existing ?? new Map<number, IMarker>();
@@ -591,7 +606,17 @@ export function useTabManager(): TabManagerState {
         }
 
         setTimelines((prev) => {
-          const merged = [...(prev[tabId] ?? []), ...newEvents];
+          let merged = [...(prev[tabId] ?? []), ...newEvents];
+          // A turn-end means the prompt queue's head just executed: stamp the
+          // oldest unstamped queued turn-start with the inferred execution
+          // time (see stampQueuedStarts).
+          for (const ev of newEvents) {
+            if (ev.kind === 'turn-end') merged = stampQueuedStarts(merged, ev.at);
+          }
+          // Auto-submission payload: the oldest still-queued prompt is
+          // executing NOW — exact time, badge off (overrides the fallback
+          // stamp above; see startQueuedTurn).
+          if (autoSince != null) merged = startQueuedTurn(merged, autoSince);
           if (merged.length <= MAX_TIMELINE_EVENTS) return { ...prev, [tabId]: merged };
           // Cap reached: drop the oldest events and release their markers.
           // Delete from the map *before* dispose so the onDispose guard above

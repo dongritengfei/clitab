@@ -71,8 +71,13 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum TabStatus {
     /// Turn in flight, no tool reported yet. `msg` is the prompt text that
-    /// started the turn, when the hook could supply it.
-    Thinking { since: u64, msg: Option<String> },
+    /// started the turn, when the hook could supply it. `auto` marks a turn
+    /// Claude Code started by itself: at a stop with a non-empty prompt queue
+    /// it auto-submits the head *without re-firing the hook*, so the backend
+    /// models the submission (registry `begin_auto_turn`). The renderer must
+    /// not add a timeline row for one — the queued prompt's row already exists
+    /// — it flips that row to executing (`startQueuedTurn`).
+    Thinking { since: u64, msg: Option<String>, auto: bool },
     Tool { name: String, since: u64 },
     /// Turn finished; `duration` is None when the start was never observed
     /// (partially installed hooks).
@@ -177,9 +182,16 @@ mod tests {
 
     #[test]
     fn tab_status_serializes_camel_case() {
-        let json =
-            serde_json::to_value(TabStatus::Thinking { since: 5, msg: Some("hi".into()) }).unwrap();
-        assert_eq!(json, serde_json::json!({"kind": "thinking", "since": 5, "msg": "hi"}));
+        let json = serde_json::to_value(TabStatus::Thinking {
+            since: 5,
+            msg: Some("hi".into()),
+            auto: false,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "thinking", "since": 5, "msg": "hi", "auto": false})
+        );
         let json = serde_json::to_value(TabStatus::Tool { name: "Bash".into(), since: 42 }).unwrap();
         assert_eq!(json, serde_json::json!({"kind": "tool", "name": "Bash", "since": 42}));
         let json = serde_json::to_value(TabStatus::Done { duration: None, at: 7 }).unwrap();

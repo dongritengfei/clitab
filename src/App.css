@@ -492,6 +492,20 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+/* "Queued" badge: the prompt arrived mid-turn and executes at the previous
+   stop; the displayed time flips to the inferred execution time then. */
+.timeline-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid #45475a;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 14px;
+  color: #a6adc8;
+  vertical-align: middle;
+}
+
 /* Shown in full: the label wraps freely and continuation lines start at the
    event's left edge (plain inline flow, no indent). */
 .timeline-label {

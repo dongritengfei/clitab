@@ -4,7 +4,10 @@
  * `TabStatus` in `src-tauri/src/status.rs`.
  */
 export type TabStatus =
-  | { kind: 'thinking'; since: number; msg: string | null }
+  /** `auto`: a turn Claude Code started by itself (auto-submitted queue head
+   *  after a stop, hook not re-fired) — modeled by the backend. The renderer
+   *  must not add a timeline row; it flips the queued prompt's existing row. */
+  | { kind: 'thinking'; since: number; msg: string | null; auto: boolean }
   | { kind: 'tool'; name: string; since: number }
   | { kind: 'done'; duration: number | null; at: number };
 

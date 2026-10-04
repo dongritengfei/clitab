@@ -52,13 +52,12 @@ parallel agents stays glanceable from whichever tab you are in.
   each tab shows what its session is doing: the running tool with a live
   timer, the last turn's duration, and notifications waiting for you. Built on
   a private OSC 7777 protocol other terminals simply ignore.
-- **Session timeline** — the right-hand panel logs the key moments of the
-  active tab's Claude Code session: turn started (showing the prompt you
-  submitted, clamped to two lines with the full text on hover), permission
-  requests, your answers to Claude's multiple-choice questions, turn finished
-  (with duration). Click an entry to scroll the
-  terminal to that point; entries whose output has scrolled out of the
-  5000-line history are grayed out. Powered by the same hooks as the dashboard.
+- **Session timeline** — the right-hand panel logs what you sent in the
+  active tab's Claude Code session: each prompt you submitted (clamped to two
+  lines with the full text on hover) and each answer you picked in Claude's
+  multiple-choice questions. Click an entry to scroll the terminal to that
+  point; entries whose output has scrolled out of the 5000-line history are
+  grayed out. Powered by the same hooks as the dashboard.
 - **Terminal search** — ⌘F finds text in the active tab's screen and
   scrollback: matches highlight as you type, Enter / Shift+Enter cycle
   through them, Esc returns the caret to the shell.

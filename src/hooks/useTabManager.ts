@@ -355,34 +355,13 @@ export function useTabManager(): TabManagerState {
     // rewrite the anchored line afterwards: a prompt queued mid-turn fires
     // its OSC at queue time, anchoring on the transient queue display (the
     // real transcript entry is committed only when the previous turn stops,
-    // arbitrarily later), and a turn-end anchored on the spinner block can
-    // shift when a queued next turn commits immediately. By click time
-    // everything has settled, so relocate here: a turn-start jumps to where
-    // its prompt text actually lives; a turn-end uses the settled layout
-    // invariant [done summary][blank][next entry] and jumps two lines above
-    // the next turn's (relocated) entry.
+    // arbitrarily later). By click time everything has settled, so relocate
+    // here: a turn-start jumps to where its prompt text actually lives.
     const events = timelinesRef.current[tabId] ?? [];
     const ev = events.find((e) => e.id === eventId);
     let line = marker.line;
     if (ev?.kind === 'turn-start') {
       line = relocatePromptLine(term, marker.line, ev.msg) ?? line;
-    } else if (ev?.kind === 'turn-end') {
-      // FIFO pairing: the k-th turn-end ends the k-th turn-start's turn, so
-      // the next turn's entry belongs to the (k+1)-th turn-start. A queued
-      // prompt's turn-start fires *before* this turn-end arrives, so
-      // scanning events after this one would miss it — index by rank.
-      const idx = events.findIndex((e) => e.id === eventId);
-      let rank = 0;
-      for (let j = 0; j <= idx; j++) {
-        if (events[j]?.kind === 'turn-end') rank++;
-      }
-      const starts = events.filter((e) => e.kind === 'turn-start');
-      const next = starts[rank];
-      const nextMarker = next ? markerMap?.get(next.id) : undefined;
-      if (next && nextMarker && !nextMarker.isDisposed) {
-        const nextLine = relocatePromptLine(term, nextMarker.line, next.msg) ?? nextMarker.line;
-        line = Math.max(0, nextLine - TURN_END_DONE_GAP);
-      }
     }
     // Center the target line in the viewport when the buffer allows, so the
     // user sees context above and below it (scrollToLine would pin it to the
@@ -544,7 +523,10 @@ export function useTabManager(): TabManagerState {
           payload.status?.kind === 'thinking' && payload.status.auto
             ? payload.status.since
             : null;
-        if (newEvents.length === 0 && autoSince == null) return;
+        // A Done payload produces no row either, but its timestamp is the
+        // queued prompt's fallback execution time (stampQueuedStarts).
+        const doneAt = payload.status?.kind === 'done' ? payload.status.at : null;
+        if (newEvents.length === 0 && autoSince == null && doneAt == null) return;
 
         const existing = markers.current.get(tabId);
         const markerMap = existing ?? new Map<number, IMarker>();
@@ -573,13 +555,11 @@ export function useTabManager(): TabManagerState {
             // public Terminal type exposes no isDisposed to check directly.
             if (getTerm(tabId) !== term || markers.current.get(tabId) !== markerMap) return;
             // The OSC lands while ink's cursor sits at the bottom of its UI,
-            // but the lines users think of are a few rows higher: for a
-            // turn-start, the transcript entry showing the submitted prompt;
-            // for a turn-end, the spinner block above the input box. Anchor
-            // each to its content line instead of the raw cursor line.
+            // but the line users think of is a few rows higher: for a
+            // turn-start, the transcript entry showing the submitted prompt.
+            // Anchor to that content line instead of the raw cursor line.
             let offset = 0;
             if (ev.kind === 'turn-start') offset = turnStartOffset(term, ev.msg) ?? 0;
-            else if (ev.kind === 'turn-end') offset = turnEndOffset(term);
             const marker = term.registerMarker(offset);
             if (!marker) {
               setStaleEvents((prev) => new Set(prev).add(key));
@@ -606,17 +586,19 @@ export function useTabManager(): TabManagerState {
         }
 
         setTimelines((prev) => {
-          let merged = [...(prev[tabId] ?? []), ...newEvents];
-          // A turn-end means the prompt queue's head just executed: stamp the
-          // oldest unstamped queued turn-start with the inferred execution
+          const existingEvents = prev[tabId] ?? [];
+          let merged = newEvents.length > 0 ? [...existingEvents, ...newEvents] : existingEvents;
+          // A Done payload means the prompt queue's head just executed: stamp
+          // the oldest unstamped queued turn-start with the inferred execution
           // time (see stampQueuedStarts).
-          for (const ev of newEvents) {
-            if (ev.kind === 'turn-end') merged = stampQueuedStarts(merged, ev.at);
-          }
+          if (doneAt != null) merged = stampQueuedStarts(merged, doneAt);
           // Auto-submission payload: the oldest still-queued prompt is
           // executing NOW — exact time, badge off (overrides the fallback
           // stamp above; see startQueuedTurn).
           if (autoSince != null) merged = startQueuedTurn(merged, autoSince);
+          // Nothing appended, nothing stamped (a re-sent Done payload): keep
+          // the state identity so the panel does not re-render.
+          if (merged === existingEvents) return prev;
           if (merged.length <= MAX_TIMELINE_EVENTS) return { ...prev, [tabId]: merged };
           // Cap reached: drop the oldest events and release their markers.
           // Delete from the map *before* dispose so the onDispose guard above
@@ -756,8 +738,6 @@ function messageOf(err: unknown): string {
 const ANCHOR_SCAN_LINES = 30;
 /** Longest prompt prefix used as the search needle. */
 const ANCHOR_PROBE_LEN = 40;
-/** How far to climb to the top of an anchored block (spinner blocks are 2–3 lines). */
-const ANCHOR_BLOCK_CLIMB = 10;
 
 /** The prompt-text needle for `msg`: first line, capped, with a flag telling
  * `promptLineMatches` whether the probe is the whole line. */
@@ -796,59 +776,6 @@ function turnStartOffset(term: XTerm, msg: string | null | undefined): number | 
   }
   return fallback;
 }
-
-/** How many lines the box-region skip may consume (multi-line queued text + borders). */
-const ANCHOR_BOX_SKIP = 10;
-
-/**
- * The stop hook's OSC lands while ink still shows its busy frame: spinner
- * block, a blank, the input-box border rules, and the cursor inside the box.
- * Everything down there is dynamic — the next turn's commit repaint erases
- * and rewrites it, stranding a raw-cursor marker inside the *next* turn's
- * content. The box may even carry text: Claude Code queues a prompt typed
- * mid-turn and submits it the instant this turn stops, so at stop time the
- * box holds the next prompt — content-looking text on a line that is about
- * to be rewritten. The turn's actual last line is the top of the spinner
- * block: ink pins the block's top row when it rewrites it in place into the
- * "✻ … done" summary, which then stays put as static transcript.
- *
- * So: skip everything from the cursor (parked inside the box) through the
- * box's top border rule — that whole region is the box, whatever it
- * contains — then blanks and stray chrome, then anchor on the first content
- * line and climb to the top of its contiguous block (the spinner can carry
- * sub-lines like "⎿  Tip: …" that the done frame erases).
- */
-function turnEndOffset(term: XTerm): number {
-  const buffer = term.buffer.active;
-  const cursor = buffer.baseY + buffer.cursorY;
-  const floor = Math.max(0, cursor - ANCHOR_SCAN_LINES);
-  const textAt = (line: number): string =>
-    buffer.getLine(line)?.translateToString(true)?.trim() ?? '';
-  const isBorder = (t: string): boolean => /^[\u2500-\u257F\s]+$/.test(t);
-  // ink's bottom-of-UI chrome: blanks, the empty box prompt, border rules.
-  const isChrome = (t: string): boolean => !t || t === '\u276f' || isBorder(t);
-  // Box region skip. Without a border in sight (unexpected layout), the
-  // budget keeps the skip bounded and the phases below still anchor on the
-  // nearest content line.
-  let line = cursor;
-  let budget = ANCHOR_BOX_SKIP;
-  while (line >= floor && budget-- > 0) {
-    const border = textAt(line) !== '' && isBorder(textAt(line));
-    line--;
-    if (border) break;
-  }
-  while (line >= floor && isChrome(textAt(line))) line--;
-  if (line < floor) return 0;
-  let top = line;
-  while (top - 1 >= Math.max(floor, line - ANCHOR_BLOCK_CLIMB) && !isChrome(textAt(top - 1))) {
-    top--;
-  }
-  return top - cursor;
-}
-
-/** Settled Claude Code layout: [✻ … done summary][blank][❯ next turn entry] —
- * a turn's done line lives this many lines above the next turn's entry. */
-const TURN_END_DONE_GAP = 2;
 
 /**
  * Click-time relocation for a stranded turn-start marker (see navigateToEvent).

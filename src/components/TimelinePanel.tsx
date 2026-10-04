@@ -1,6 +1,5 @@
 import React, { useEffect, useRef } from 'react';
 import { displayOrder, type TimelineEvent } from '../lib/timeline';
-import { formatDuration } from './TabItem';
 
 interface TimelinePanelProps {
   /** The active tab, or null when no tab is open. */
@@ -27,16 +26,9 @@ function labelOf(ev: TimelineEvent): string {
       // Show what the user submitted; the hook degrades to no message when
       // jq is missing.
       return ev.msg ?? 'Turn started';
-    case 'notice':
-      // The hook degrades to no message when jq is missing.
-      return ev.msg ?? 'Needs attention';
     case 'answer':
       // The tool result text of the question dialog.
       return ev.msg ?? 'Answered';
-    case 'turn-end':
-      return ev.duration != null
-        ? `Turn finished · ${formatDuration(ev.duration)}`
-        : 'Turn finished';
   }
 }
 
@@ -68,7 +60,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
   };
 
   // Execution-time order for humans; the incoming array's arrival order is
-  // load-bearing elsewhere (FIFO navigation pairing), so sort a copy.
+  // load-bearing elsewhere (FIFO stamping of queued prompts), so sort a copy.
   const ordered = displayOrder(events);
 
   return (

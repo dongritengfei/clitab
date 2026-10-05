@@ -48,7 +48,7 @@ impl TabManager {
 
         let session = match PtySession::new(
             tab_id.clone(),
-            cwd,
+            cwd.clone(),
             self.app.clone(),
             Arc::clone(&self.registry),
         ) {
@@ -60,6 +60,14 @@ impl TabManager {
         };
 
         lock(&self.sessions).insert(tab_id.clone(), session);
+
+        // Opening the tab counts as using its directory: a Finder-service tab
+        // becomes the last cwd even if the user never cds, and re-saving the
+        // restored startup cwd is a harmless same-value write. Only after a
+        // successful spawn — a failed one never became a working directory.
+        if let Some(dir) = crate::last_cwd::dir(&self.app) {
+            crate::last_cwd::save(&dir, &cwd);
+        }
 
         // Read the record back rather than returning the pre-spawn snapshot: by
         // now the shell may already have reported its title and directory, and
@@ -96,8 +104,16 @@ impl TabManager {
 
     pub fn write_input(&self, tab_id: &str, data: &[u8]) -> Result<(), ManagerError> {
         self.session(tab_id)?.write(data)?;
-        // Typing into the tab is the answer: it leaves the triage queue.
+        // Typing into the tab is the answer: it leaves the triage queue...
         crate::attention::respond(&self.app, &self.registry, tab_id);
+        // ...and it has seen any pending notice. Answering a permission
+        // dialog fires no hook event (PreToolUse ran before the dialog, and
+        // PostToolUse stays silent for non-AskUserQuestion tools), so without
+        // this the ⚠ text would linger until the next tool/prompt/stop. The
+        // snapshot reveals the turn state underneath, per `Notice`'s contract.
+        if self.registry.clear_notice(tab_id) {
+            PtySession::emit_status(&self.app, &self.registry, tab_id);
+        }
         Ok(())
     }
 

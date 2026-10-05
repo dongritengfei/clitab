@@ -120,14 +120,20 @@ impl Registry {
         }
     }
 
-    /// OSC 7 reported a new working directory.
-    pub fn set_cwd(&self, id: &str, cwd: &str) {
+    /// OSC 7 reported a new working directory. Returns true only when the
+    /// value actually changed: the hook fires on every prompt, and only a
+    /// real change is worth persisting (see the CwdChanged handler).
+    pub fn set_cwd(&self, id: &str, cwd: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.cwd = cwd.to_string();
-            if !tab.has_program_title {
-                tab.title = cwd.to_string();
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.cwd != cwd => {
+                tab.cwd = cwd.to_string();
+                if !tab.has_program_title {
+                    tab.title = cwd.to_string();
+                }
+                true
             }
+            _ => false,
         }
     }
 
@@ -269,6 +275,46 @@ impl Registry {
         }
     }
 
+    /// The turn ended without a Stop: an Esc interrupt (or a crashed turn)
+    /// fires no hook, and the live-turn model — turn_start, status, whatever
+    /// sits in prompt_queue — goes stale and poisons what follows: the next
+    /// typed prompt's own keystroke echo keeps `idle_gap` tiny, so it is
+    /// enqueued behind the dead turn instead of starting a fresh one, and its
+    /// real stop then pops the phantom and models a nonexistent auto turn
+    /// (the persistent hourglass over an idle Claude). The attention watcher
+    /// calls this on every PTY silence ≥ `TURN_IDLE`: a live turn repaints
+    /// its spinner constantly, so silence that long proves the turn ended
+    /// when the output did (`ended_at_ms`, the silence start).
+    ///
+    /// Pending dialogs are exempt — their silence is the user deliberating,
+    /// not a dead turn: a permission notice awaits an answer, and an
+    /// `AskUserQuestion` tool turn *is* the question. Returns true only on a
+    /// real demotion, so the watcher's 200ms poll emits once and then stays
+    /// silent (idempotent). A genuinely late Stop arriving afterwards hits
+    /// `end_turn`'s missing-start + already-`Done` guard and is ignored.
+    pub fn reconcile_idle_turn(&self, id: &str, ended_at_ms: u64) -> bool {
+        let mut tabs = lock(&self.tabs);
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab)
+                if tab.turn_start.is_some()
+                    && tab.notice.is_none()
+                    && !matches!(
+                        &tab.status,
+                        Some(TabStatus::Tool { name, .. }) if name.as_str() == "AskUserQuestion"
+                    ) =>
+            {
+                let duration = tab.turn_start.map(|start| ended_at_ms.saturating_sub(start));
+                tab.status = Some(TabStatus::Done { duration, at: ended_at_ms });
+                tab.turn_start = None;
+                // Anything still queued is stale by definition: a real
+                // auto-submission repaints within TURN_IDLE of the stop.
+                tab.prompt_queue.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Notification: park a message for the user without touching the turn
     /// state underneath.
     pub fn set_notice(&self, id: &str, msg: Option<String>, now_ms: u64) {
@@ -286,11 +332,19 @@ impl Registry {
         }
     }
 
-    /// The user switched to the tab and saw the notice.
-    pub fn clear_notice(&self, id: &str) {
+    /// The user has seen the notice: they switched to the tab, or typed into
+    /// it — answering a permission dialog fires no hook event of its own
+    /// (PreToolUse ran *before* the dialog), so the keystroke is the only
+    /// "answered" signal. Returns true only on the Some→None transition, so
+    /// callers know whether a fresh snapshot is worth emitting.
+    pub fn clear_notice(&self, id: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.notice = None;
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.notice.is_some() => {
+                tab.notice = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -341,6 +395,18 @@ mod tests {
         let tab = registry.get("t1").unwrap();
         assert!(!tab.has_program_title);
         assert_eq!(tab.title, "/tmp");
+    }
+
+    #[test]
+    fn set_cwd_reports_whether_the_directory_changed() {
+        // OSC 7 fires on every prompt: only a real change may trigger the
+        // last-cwd file write (see the CwdChanged handler in session.rs).
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp/a".into());
+        assert!(!registry.set_cwd("t1", "/tmp/a"), "same cwd is no change");
+        assert!(registry.set_cwd("t1", "/tmp/b"));
+        assert!(!registry.set_cwd("t1", "/tmp/b"), "second report of /tmp/b");
+        assert!(!registry.set_cwd("nope", "/tmp/c"), "unknown tab");
     }
 
     #[test]
@@ -682,6 +748,79 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(tab.notice, None);
         assert!(matches!(tab.status, Some(TabStatus::Tool { .. })));
+    }
+
+    /// Typing into a tab answers a pending notice (answering a permission
+    /// dialog fires no hook event of its own, so input is the only signal);
+    /// the transition report lets the caller decide whether a fresh
+    /// `tab-status` snapshot is worth emitting — every keystroke goes
+    /// through that path, so a no-op clear must stay silent.
+    #[test]
+    fn clear_notice_reports_the_transition() {
+        let r = status_fixture();
+        assert!(!r.clear_notice("t1"), "no notice: nothing cleared");
+        r.set_notice("t1", Some("needs permission".into()), 200);
+        assert!(r.clear_notice("t1"), "Some→None is the transition");
+        assert!(!r.clear_notice("t1"), "already cleared");
+        assert!(!r.clear_notice("nope"), "unknown tab");
+    }
+
+    /// An Esc interrupt fires no Stop hook, and the stale turn_start used to
+    /// misclassify the user's next typed prompt as queued (the keystroke echo
+    /// keeps idle_gap tiny, so the fresh-turn self-heal never triggers): the
+    /// prompt's real stop then popped the phantom and modeled a nonexistent
+    /// auto turn — the persistent hourglass over an idle Claude. Reconciling
+    /// the missed stop at TURN_IDLE of PTY silence both stamps the interrupted
+    /// turn Done and makes the next prompt classify fresh.
+    #[test]
+    fn reconciling_a_missed_stop_prevents_the_phantom_auto_turn() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("essay".into()), 5000);
+        // The user interrupts; no Stop ever arrives. PTY silence starts at 3000.
+        assert!(r.reconcile_idle_turn("t1", 3000));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(2000), at: 3000 })
+        );
+        // The next prompt arrives with a tiny gap (typing echo): fresh turn,
+        // not a phantom queue entry behind the dead one.
+        r.begin_turn("t1", 10_000, Some("hi".into()), 14);
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 0);
+        // Its stop is the real end: Idle, not a phantom AutoSubmit.
+        assert!(matches!(r.end_turn("t1", 20_000), StopOutcome::Idle));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(10_000), at: 20_000 })
+        );
+    }
+
+    /// Silence during a pending dialog is the user deliberating, not a missed
+    /// stop: a permission notice or an AskUserQuestion turn must survive
+    /// reconciliation untouched. A regular tool turn must not — and stale
+    /// queue entries die with it (2s of silence proves no auto turn runs: a
+    /// live one repaints its spinner constantly).
+    #[test]
+    fn reconcile_skips_dialogs_and_clears_stale_queues() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, None, 5000);
+        // Permission dialog: notice pending.
+        r.set_notice("t1", Some("needs permission".into()), 1500);
+        assert!(!r.reconcile_idle_turn("t1", 4000));
+        assert!(matches!(r.get("t1").unwrap().status, Some(TabStatus::Thinking { .. })));
+        // In-terminal question: no notice, but the tool says it all.
+        r.clear_notice("t1");
+        r.set_tool("t1", "AskUserQuestion", 2000);
+        assert!(!r.reconcile_idle_turn("t1", 5000));
+        assert!(matches!(r.get("t1").unwrap().status, Some(TabStatus::Tool { .. })));
+        // A regular tool turn does reconcile, taking stale queue entries along.
+        r.begin_turn("t1", 6000, Some("queued".into()), 10);
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 1);
+        r.set_tool("t1", "Bash", 6500);
+        assert!(r.reconcile_idle_turn("t1", 9000));
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 0);
+        // Already-idle states and unknown tabs are no-ops.
+        assert!(!r.reconcile_idle_turn("t1", 9500));
+        assert!(!r.reconcile_idle_turn("nope", 9500));
     }
 
     #[test]

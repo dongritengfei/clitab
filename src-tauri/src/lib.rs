@@ -1,4 +1,5 @@
 mod attention;
+mod last_cwd;
 mod menu;
 mod osc;
 mod pty;
@@ -254,11 +255,14 @@ pub fn run() {
                 if !handle.state::<AppState>().tab_manager.list_tabs().is_empty() {
                     return;
                 }
-                services::open_tab(
-                    &handle,
-                    pending.map(|p| p.to_string_lossy().into_owned()),
-                    false,
-                );
+                // The Finder service request wins; a normal launch restores
+                // the last-used working directory (no file, or a directory
+                // that has since vanished → `resolve_cwd` applies the
+                // default fallback).
+                let cwd = pending
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| last_cwd::dir(&handle).and_then(|dir| last_cwd::load(&dir)));
+                services::open_tab(&handle, cwd, false);
             });
 
             Ok(())

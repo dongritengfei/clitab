@@ -95,7 +95,8 @@ The same JSON is embedded in the copy-paste setup prompts in the wiki manuals
   a tool · `{"e":"answer","msg":"…"}` the user's choice in an AskUserQuestion
   dialog (PostToolUse, other tools emit nothing) · `{"e":"stop"}` turn end
   (clitab computes the duration) · `{"e":"notify","msg":"…"}` needs attention —
-  flashes the tab and shows the message until you switch to it.
+  flashes the tab and shows the message until you switch to it or type into
+  it (answering the dialog is typing — no hook fires at that moment).
 - Every command ends in `; true`: a failing hook must never block Claude
   Code. Missing jq produces an empty payload, which clitab ignores.
 

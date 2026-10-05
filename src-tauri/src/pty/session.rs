@@ -322,7 +322,13 @@ impl PtySession {
                 );
             }
             OscEvent::CwdChanged(cwd) => {
-                registry.set_cwd(tab_id, &cwd);
+                // Persist only on a real change: OSC 7 fires on every prompt,
+                // so an ungated save would hit the disk on every Enter.
+                if registry.set_cwd(tab_id, &cwd) {
+                    if let Some(dir) = crate::last_cwd::dir(app) {
+                        crate::last_cwd::save(&dir, &cwd);
+                    }
+                }
                 let _ = app.emit(
                     "tab-cwd",
                     serde_json::json!({ "tab_id": tab_id, "cwd": cwd }),
@@ -412,7 +418,11 @@ impl PtySession {
     }
 
     /// Broadcast the tab's full protocol state (replacement, not merge).
-    fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
+    /// `pub(crate)` because the manager emits it too: typing into a tab
+    /// clears a pending notice (the keystroke that answers a permission
+    /// dialog is the only "answered" signal — no hook fires at that moment),
+    /// and the renderer learns about it through this same snapshot.
+    pub(crate) fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
         if let Some(tab) = registry.get(tab_id) {
             let _ = app.emit(
                 "tab-status",

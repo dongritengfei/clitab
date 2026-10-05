@@ -120,14 +120,20 @@ impl Registry {
         }
     }
 
-    /// OSC 7 reported a new working directory.
-    pub fn set_cwd(&self, id: &str, cwd: &str) {
+    /// OSC 7 reported a new working directory. Returns true only when the
+    /// value actually changed: the hook fires on every prompt, and only a
+    /// real change is worth persisting (see the CwdChanged handler).
+    pub fn set_cwd(&self, id: &str, cwd: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.cwd = cwd.to_string();
-            if !tab.has_program_title {
-                tab.title = cwd.to_string();
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.cwd != cwd => {
+                tab.cwd = cwd.to_string();
+                if !tab.has_program_title {
+                    tab.title = cwd.to_string();
+                }
+                true
             }
+            _ => false,
         }
     }
 
@@ -341,6 +347,18 @@ mod tests {
         let tab = registry.get("t1").unwrap();
         assert!(!tab.has_program_title);
         assert_eq!(tab.title, "/tmp");
+    }
+
+    #[test]
+    fn set_cwd_reports_whether_the_directory_changed() {
+        // OSC 7 fires on every prompt: only a real change may trigger the
+        // last-cwd file write (see the CwdChanged handler in session.rs).
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp/a".into());
+        assert!(!registry.set_cwd("t1", "/tmp/a"), "same cwd is no change");
+        assert!(registry.set_cwd("t1", "/tmp/b"));
+        assert!(!registry.set_cwd("t1", "/tmp/b"), "second report of /tmp/b");
+        assert!(!registry.set_cwd("nope", "/tmp/c"), "unknown tab");
     }
 
     #[test]

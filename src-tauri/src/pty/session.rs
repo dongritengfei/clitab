@@ -322,7 +322,13 @@ impl PtySession {
                 );
             }
             OscEvent::CwdChanged(cwd) => {
-                registry.set_cwd(tab_id, &cwd);
+                // Persist only on a real change: OSC 7 fires on every prompt,
+                // so an ungated save would hit the disk on every Enter.
+                if registry.set_cwd(tab_id, &cwd) {
+                    if let Some(dir) = crate::last_cwd::dir(app) {
+                        crate::last_cwd::save(&dir, &cwd);
+                    }
+                }
                 let _ = app.emit(
                     "tab-cwd",
                     serde_json::json!({ "tab_id": tab_id, "cwd": cwd }),

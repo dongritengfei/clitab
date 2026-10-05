@@ -347,6 +347,14 @@ export function useTabManager(): TabManagerState {
   const writeInput = useCallback(async (tabId: string, data: Uint8Array) => {
     try {
       await invoke('pty_input', { tabId, data: bytesToBase64(data) });
+      // Typing acknowledges the ring, like switchTab does: stop the flash
+      // (the backend clears the waiting dot and the notice on the same
+      // signal). Returning `prev` unchanged keeps ordinary keystrokes — the
+      // tab is almost never flashing — out of React's re-render path.
+      setTabs((prev) => {
+        if (!prev.some((tab) => tab.id === tabId && tab.flashing)) return prev;
+        return prev.map((tab) => (tab.id === tabId ? { ...tab, flashing: false } : tab));
+      });
     } catch (err) {
       // Typing into a tab that just closed is normal; keep it quiet.
       console.debug('pty_input failed:', messageOf(err));

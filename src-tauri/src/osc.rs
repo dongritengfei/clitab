@@ -4,12 +4,19 @@
 //   * OSC 0 / 1 / 2 -> terminal title
 //   * OSC 7         -> current working directory (`file://host/path`)
 //   * OSC 9         -> custom notifications (`claude-done`)
+//   * OSC 7777      -> the clitab hook protocol (JSON, decoded in `status.rs`)
 //   * standalone BEL -> attention flash
 //
 // The parser is byte based and keeps its state between `parse()` calls, so a
 // sequence that straddles two PTY reads is still decoded correctly. It is
 // deliberately defensive: `cat`-ing a binary file must not make it accumulate
 // without bounds or lose every later sequence.
+//
+// Trust model: every event here originates *from the PTY*, so any program
+// running in the tab can emit one — a forged OSC 7777 fakes a status
+// transition, a forged OSC 7 fakes a cwd. That is inherent to terminal
+// escape sequences (window titles work the same way) and accepted: these
+// events drive UI state only (title, badge, timeline), never privilege.
 
 use std::str;
 
@@ -22,6 +29,10 @@ pub enum OscEvent {
     CwdChanged(String),
     Bell,
     PromptReady,
+    /// OSC 7777: the clitab hook protocol. The payload is the raw text after
+    /// the first `;` (parameters rejoined losslessly); JSON semantics live in
+    /// `crate::status`, not here.
+    Clitab(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,6 +53,12 @@ pub struct OscParser {
     state: State,
     buffer: Vec<u8>,
     params: Vec<Vec<u8>>,
+    /// Bytes accumulated into `params` after the code parameter, including
+    /// the `;` separators between them — i.e. the length the rejoined
+    /// payload will have. The `buffer` cap alone cannot bound a
+    /// many-delimiter sequence, because every `;` empties the buffer; this
+    /// runs across the whole sequence instead.
+    payload_len: usize,
 }
 
 impl OscParser {
@@ -50,14 +67,31 @@ impl OscParser {
     }
 
     /// Feed a chunk of PTY output, returning every OSC event it completed.
+    /// Test convenience: production code needs the offsets, so `read_loop`
+    /// calls `parse_with_end` directly.
+    #[cfg(test)]
     pub fn parse(&mut self, data: &[u8]) -> Vec<OscEvent> {
+        self.parse_with_end(data)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// Like `parse`, but pairs every event with the offset in `data` just past
+    /// the byte that completed it (for a sequence carried over from a previous
+    /// chunk, the offset is relative to this chunk). Splitting the chunk at
+    /// these offsets lets the reader forward the bytes preceding an event
+    /// before announcing the event itself — that ordering is what allows the
+    /// renderer to bind a `tab-status` event to the exact terminal line where
+    /// its OSC sequence appeared.
+    pub fn parse_with_end(&mut self, data: &[u8]) -> Vec<(usize, OscEvent)> {
         let mut events = Vec::new();
 
-        for &byte in data {
+        for (i, &byte) in data.iter().enumerate() {
             match self.state {
                 State::Ground => match byte {
                     0x1b => self.state = State::AfterEsc,
-                    0x07 => events.push(OscEvent::Bell),
+                    0x07 => events.push((i + 1, OscEvent::Bell)),
                     _ => {}
                 },
                 State::AfterEsc => {
@@ -69,16 +103,18 @@ impl OscParser {
                     }
                 }
                 State::InOsc => match byte {
-                    0x07 => events.extend(self.finish_osc()),
+                    0x07 => events.extend(self.finish_osc().into_iter().map(|e| (i + 1, e))),
                     b';' => self.push_param(),
                     0x1b => {
                         // Either the start of an `ESC \` (ST) terminator, or a
                         // nested OSC from truncated / binary output.
-                        self.push_param();
+                        self.flush_param();
                         self.state = State::InOscAfterEsc;
                     }
                     _ => {
-                        if self.buffer.len() >= MAX_OSC_LEN {
+                        if self.buffer.len() >= MAX_OSC_LEN
+                            || self.payload_len + self.buffer.len() > MAX_OSC_LEN
+                        {
                             // Runaway sequence: drop it and resynchronise.
                             self.abort_osc();
                         } else {
@@ -89,17 +125,24 @@ impl OscParser {
                 State::InOscAfterEsc => {
                     if byte == b'\\' {
                         // ST terminator.
-                        events.extend(self.finish_osc());
+                        events.extend(self.finish_osc().into_iter().map(|e| (i + 1, e)));
                     } else if byte == b']' {
                         // A new OSC started before the previous one was
                         // terminated: the partial sequence is garbage, so throw
                         // away everything accumulated so far and start clean.
                         self.begin_osc();
                     } else {
-                        // Not a terminator after all: keep the payload going.
-                        self.buffer.push(0x1b);
-                        self.buffer.push(byte);
-                        self.state = State::InOsc;
+                        // Not a terminator after all: keep the payload going —
+                        // but under the same whole-sequence cap as a data byte,
+                        // or a payload sitting exactly at the cap grows past it
+                        // here, two unchecked bytes per ESC.
+                        if self.payload_len + self.buffer.len() + 2 > MAX_OSC_LEN {
+                            self.abort_osc();
+                        } else {
+                            self.buffer.push(0x1b);
+                            self.buffer.push(byte);
+                            self.state = State::InOsc;
+                        }
                     }
                 }
             }
@@ -111,19 +154,39 @@ impl OscParser {
     fn begin_osc(&mut self) {
         self.buffer.clear();
         self.params.clear();
+        self.payload_len = 0;
         self.state = State::InOsc;
     }
 
+    /// A `;` inside the payload: always record the segment, even an empty
+    /// one, so a rejoined payload (title, JSON) keeps every separator.
     fn push_param(&mut self) {
+        let param = std::mem::take(&mut self.buffer);
+        match self.params.len() {
+            // The code parameter is framing, not payload.
+            0 => {}
+            // First payload segment: no separator precedes it.
+            1 => self.payload_len += param.len(),
+            _ => self.payload_len += param.len() + 1,
+        }
+        self.params.push(param);
+        if self.payload_len > MAX_OSC_LEN {
+            // Runaway many-delimiter sequence: drop it and resynchronise.
+            self.abort_osc();
+        }
+    }
+
+    /// End-of-sequence flush: a trailing empty segment carries no information
+    /// and would corrupt a rejoined payload, so drop it.
+    fn flush_param(&mut self) {
         if !self.buffer.is_empty() {
-            self.params.push(self.buffer.clone());
-            self.buffer.clear();
+            self.push_param();
         }
     }
 
     /// Close the current OSC sequence and interpret it.
     fn finish_osc(&mut self) -> Vec<OscEvent> {
-        self.push_param();
+        self.flush_param();
         let event = Self::interpret(&self.params);
         self.reset();
         event.into_iter().collect()
@@ -137,6 +200,7 @@ impl OscParser {
     fn reset(&mut self) {
         self.buffer.clear();
         self.params.clear();
+        self.payload_len = 0;
         self.state = State::Ground;
     }
 
@@ -145,12 +209,20 @@ impl OscParser {
             return None;
         }
         let code = str::from_utf8(&params[0]).ok()?;
-        let value = str::from_utf8(&params[1]).ok()?;
+        // The payload is everything after the first `;`, rejoined: `;` is a
+        // legal character inside titles, paths and OSC 7777 JSON, so the
+        // parameter split is only a framing convenience.
+        let parts: Option<Vec<&str>> = params[1..]
+            .iter()
+            .map(|p| str::from_utf8(p).ok())
+            .collect();
+        let value = parts?.join(";");
 
         match code {
-            "0" | "1" | "2" => Some(OscEvent::TitleChanged(value.to_string())),
-            "7" => Some(OscEvent::CwdChanged(parse_osc7_path(value))),
+            "0" | "1" | "2" => Some(OscEvent::TitleChanged(value)),
+            "7" => Some(OscEvent::CwdChanged(parse_osc7_path(&value))),
             "9" if value == "claude-done" => Some(OscEvent::PromptReady),
+            "7777" if !value.is_empty() => Some(OscEvent::Clitab(value)),
             _ => None,
         }
     }
@@ -173,7 +245,11 @@ fn parse_osc7_path(value: &str) -> String {
     percent_decode(rest)
 }
 
-fn percent_decode(input: &str) -> String {
+/// Percent-decode byte-wise, so multi-byte UTF-8 (e.g. Chinese directory
+/// names) reassembles correctly. Malformed escapes stay literal rather than
+/// erroring — a weird path should still open a tab; bytes that don't
+/// reassemble into UTF-8 become U+FFFD.
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -193,7 +269,7 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
 
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -290,6 +366,14 @@ mod tests {
         assert_eq!(events, vec![OscEvent::CwdChanged("/tmp/中文".into())]);
     }
 
+    /// Undecodable bytes cost only themselves (lossy replacement), not the
+    /// whole path: rolling back to the raw input would discard every escape
+    /// that *did* decode, leaving a worse path than the partial decode.
+    #[test]
+    fn percent_decode_is_lossy_on_invalid_utf8() {
+        assert_eq!(percent_decode("/tmp/a%20b%FF"), "/tmp/a b\u{FFFD}");
+    }
+
     #[test]
     fn osc7_bare_path() {
         let mut parser = OscParser::new();
@@ -344,6 +428,50 @@ mod tests {
         assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
     }
 
+    /// A many-delimiter sequence must not accumulate without bounds: the cap
+    /// has to hold across parameter separators, not just within one parameter
+    /// (an unterminated `ESC ] 7777 ; ; ; …` stream must not pin every
+    /// segment forever).
+    #[test]
+    fn semicolon_run_osc_is_capped() {
+        let mut parser = OscParser::new();
+        let mut flood = vec![0x1b_u8, b']'];
+        flood.extend_from_slice(b"7777");
+        flood.resize(flood.len() + MAX_OSC_LEN * 50, b';');
+        assert!(parser.parse(&flood).is_empty());
+        assert!(
+            parser.params.len() <= MAX_OSC_LEN + 2,
+            "params grew to {} segments",
+            parser.params.len()
+        );
+        // The flood was dropped, so a fresh sequence still parses.
+        let events = parser.parse(b"\x1b]0;OK\x07");
+        assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
+    }
+
+    /// The re-entry arm (an `ESC` inside the payload that turned out not to
+    /// start an ST terminator) pushes two more bytes: a payload flushed to
+    /// exactly `MAX_OSC_LEN` — which `push_param`'s `> MAX` check lets
+    /// through — plus that pair accumulates `MAX_OSC_LEN + 2` against the
+    /// whole-sequence cap unless the re-entry consults it too.
+    #[test]
+    fn esc_reentry_honors_the_whole_sequence_cap() {
+        let mut parser = OscParser::new();
+        let mut flood = vec![0x1b_u8, b']'];
+        flood.extend_from_slice(b"7777;");
+        flood.resize(flood.len() + MAX_OSC_LEN, b'a');
+        flood.extend_from_slice(b"\x1bx");
+        assert!(parser.parse(&flood).is_empty());
+        let accumulated = parser.payload_len + parser.buffer.len();
+        assert!(
+            accumulated <= MAX_OSC_LEN,
+            "accumulated {accumulated} bytes against a cap of {MAX_OSC_LEN}"
+        );
+        // The flood was dropped, so a fresh sequence still parses.
+        let events = parser.parse(b"\x1b]0;OK\x07");
+        assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
+    }
+
     #[test]
     fn deeply_nested_osc_resynchronises() {
         let mut parser = OscParser::new();
@@ -365,9 +493,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_with_end_reports_completion_offsets() {
+        let mut parser = OscParser::new();
+        // a(0) b(1) ESC(2) ](3) 0(4) ;(5) T(6) BEL(7) c(8) d(9):
+        // the event completes just past the BEL, at offset 8.
+        let events = parser.parse_with_end(b"ab\x1b]0;T\x07cd");
+        assert_eq!(events, vec![(8, OscEvent::TitleChanged("T".into()))]);
+
+        // A standalone BEL at index 0 ends at 1.
+        let events = parser.parse_with_end(b"\x07x");
+        assert_eq!(events, vec![(1, OscEvent::Bell)]);
+
+        // An ST-terminated sequence ends just past the backslash:
+        // ESC(0) ](1) 7777(2..5) ;(6) {(7) }(8) ESC(9) \(10) r(11) → end = 11.
+        let events = parser.parse_with_end(b"\x1b]7777;{}\x1b\\rest");
+        assert_eq!(events, vec![(11, OscEvent::Clitab("{}".into()))]);
+
+        // A sequence carried over from a previous chunk completes in this
+        // one; the offset is relative to the current chunk:
+        // t(0) l(1) e(2) BEL(3) t(4) … → end = 4.
+        let mut parser = OscParser::new();
+        assert!(parser.parse_with_end(b"\x1b]0;Ti").is_empty());
+        let events = parser.parse_with_end(b"tle\x07tail");
+        assert_eq!(events, vec![(4, OscEvent::TitleChanged("Title".into()))]);
+    }
+
+    #[test]
     fn path_heuristic() {
         assert!(looks_like_path("/Users/yiyi/code"));
         assert!(looks_like_path("~/code"));
         assert!(!looks_like_path("✳ Fix the build"));
+    }
+
+    #[test]
+    fn osc7777_json_payload() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"stop\"}\x1b\\");
+        assert_eq!(events, vec![OscEvent::Clitab("{\"e\":\"stop\"}".into())]);
+    }
+
+    /// `;` is legal inside JSON strings; the parameter splitter must not eat
+    /// it, and consecutive semicolons must survive the rejoin.
+    #[test]
+    fn semicolons_inside_json_survive_rejoin() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"notify\",\"msg\":\"a;b;;c\"}\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::Clitab("{\"e\":\"notify\",\"msg\":\"a;b;;c\"}".into())]
+        );
+    }
+
+    #[test]
+    fn osc7777_empty_payload_is_ignored() {
+        let mut parser = OscParser::new();
+        assert!(parser.parse(b"\x1b]7777;\x07").is_empty());
+        assert!(parser.parse(b"\x1b]7777;\x1b\\").is_empty());
+        // The parser is still healthy afterwards.
+        let events = parser.parse(b"\x1b]7777;{\"e\":\"prompt\"}\x07");
+        assert_eq!(events, vec![OscEvent::Clitab("{\"e\":\"prompt\"}".into())]);
+    }
+
+    #[test]
+    fn osc7777_split_across_reads() {
+        let mut parser = OscParser::new();
+        assert!(parser.parse(b"\x1b]7777;{\"e\":").is_empty());
+        let events = parser.parse(b"\"tool\",\"tool\":\"Bash\"}\x1b\\");
+        assert_eq!(
+            events,
+            vec![OscEvent::Clitab("{\"e\":\"tool\",\"tool\":\"Bash\"}".into())]
+        );
+    }
+
+    /// The rejoin also makes multi-semicolon titles faithful instead of
+    /// truncating at the first `;`.
+    #[test]
+    fn title_with_semicolon_keeps_full_payload() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]0;user@host;project\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::TitleChanged("user@host;project".into())]
+        );
     }
 }

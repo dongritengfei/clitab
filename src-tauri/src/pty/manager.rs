@@ -3,6 +3,7 @@ use super::registry::{Registry, TabRecord};
 use super::session::{self, PtySession};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 
@@ -32,9 +33,13 @@ impl TabManager {
         }
     }
 
-    pub fn create_tab(&self) -> Result<TabRecord, ManagerError> {
+    /// `cwd` is the directory the new tab should start in — typically the
+    /// working directory of the tab that was active when the user asked for a
+    /// new one. `None` (app startup) or a directory that no longer exists
+    /// falls back to the default.
+    pub fn create_tab(&self, cwd: Option<String>) -> Result<TabRecord, ManagerError> {
         let tab_id = uuid::Uuid::new_v4().to_string();
-        let cwd = session::default_cwd().to_string_lossy().to_string();
+        let cwd = resolve_cwd(cwd).to_string_lossy().to_string();
 
         // Register the tab *before* spawning the shell: the reader thread can
         // emit a title/cwd within milliseconds of the process starting, and
@@ -70,6 +75,7 @@ impl TabManager {
 
         session.kill();
         self.registry.remove(tab_id);
+        crate::attention::update_badge(&self.app, &self.registry);
         Ok(())
     }
 
@@ -77,6 +83,7 @@ impl TabManager {
     pub fn remove_session(&self, tab_id: &str) {
         lock(&self.sessions).remove(tab_id);
         self.registry.remove(tab_id);
+        crate::attention::update_badge(&self.app, &self.registry);
     }
 
     /// Copy the handle out so the map lock is not held while we use it.
@@ -89,6 +96,8 @@ impl TabManager {
 
     pub fn write_input(&self, tab_id: &str, data: &[u8]) -> Result<(), ManagerError> {
         self.session(tab_id)?.write(data)?;
+        // Typing into the tab is the answer: it leaves the triage queue.
+        crate::attention::respond(&self.app, &self.registry, tab_id);
         Ok(())
     }
 
@@ -126,7 +135,45 @@ impl TabManager {
             .unwrap_or(false)
     }
 
+    /// The renderer acknowledges a tab's notice by switching to it. Unknown
+    /// tabs are a silent no-op: the notice died with the tab.
+    pub fn ack_notice(&self, tab_id: &str) {
+        self.registry.clear_notice(tab_id);
+    }
+
     pub fn list_tabs(&self) -> Vec<TabRecord> {
         self.registry.list()
+    }
+}
+
+/// Where a new tab starts: the requested directory if it still exists (the
+/// source tab's cwd can be deleted out from under us), otherwise the default.
+fn resolve_cwd(requested: Option<String>) -> PathBuf {
+    if let Some(path) = requested {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    session::default_cwd()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_directory_wins_when_it_exists() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        assert_eq!(resolve_cwd(Some(dir.clone())), PathBuf::from(dir));
+    }
+
+    #[test]
+    fn missing_or_absent_request_falls_back_to_default() {
+        assert_eq!(
+            resolve_cwd(Some("/clitab-no-such-dir".into())),
+            session::default_cwd()
+        );
+        assert_eq!(resolve_cwd(None), session::default_cwd());
     }
 }

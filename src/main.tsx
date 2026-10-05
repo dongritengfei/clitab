@@ -12,7 +12,7 @@ import App from './App';
 Promise.all([
   document.fonts.load('14px "JetBrains Mono"'),
   document.fonts.load('bold 14px "JetBrains Mono"'),
-  document.fonts.load('14px "Symbols Nerd Font Mono"'),
+  document.fonts.load('14px "JetBrainsMono Nerd Font Mono"'),
 ])
   .then(() => document.fonts.ready)
   .then(() => {

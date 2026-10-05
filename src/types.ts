@@ -1,11 +1,43 @@
+/**
+ * Turn state reported via the OSC 7777 hook protocol. `kind` discriminates;
+ * all timestamps are epoch milliseconds from the backend's clock. Mirrors
+ * `TabStatus` in `src-tauri/src/status.rs`.
+ */
+export type TabStatus =
+  /** `auto`: a turn Claude Code started by itself (auto-submitted queue head
+   *  after a stop, hook not re-fired) — modeled by the backend. The renderer
+   *  must not add a timeline row; it flips the queued prompt's existing row. */
+  | { kind: 'thinking'; since: number; msg: string | null; auto: boolean }
+  | { kind: 'tool'; name: string; since: number }
+  | { kind: 'done'; duration: number | null; at: number };
+
+/** A Notification-hook message awaiting the user. Mirrors `Notice` in Rust. */
+export interface TabNotice {
+  msg: string | null;
+  at: number;
+}
+
+/** The user's answer to an in-terminal question. Mirrors `Answer` in Rust. */
+export interface TabAnswer {
+  msg: string;
+  at: number;
+}
+
 export interface Tab {
   id: string;
   title: string;
   cwd: string;
   /** True when a program (e.g. Claude Code) owns the title, not the cwd. */
   hasClaudeTitle: boolean;
+  /** Hook-protocol turn state; null until this tab's session speaks it. */
+  status: TabStatus | null;
+  /** Notification awaiting the user; null once seen or superseded. */
+  notice: TabNotice | null;
   /** Renderer-only: the tab is asking for attention. */
   flashing: boolean;
+  /** Backend-owned: the tab is waiting for input (triage queue). Cleared
+   *  only by typing into it, never by switching. */
+  waiting: boolean;
 }
 
 /** Shape returned by the `create_tab` / `list_tabs` commands. */
@@ -14,6 +46,11 @@ export interface TabResponse {
   title: string;
   cwd: string;
   hasClaudeTitle: boolean;
+  /** Hook-protocol turn state; null until this tab's session speaks it. */
+  status: TabStatus | null;
+  /** Notification awaiting the user; null once acknowledged. */
+  notice: TabNotice | null;
+  waiting: boolean;
 }
 
 export interface PtyOutputPayload {
@@ -51,6 +88,22 @@ export interface TabFlashPayload {
   tab_id: string;
 }
 
+/**
+ * Emitted when Claude's turn ends (OSC 9 `claude-done`): the program title
+ * is cleared and the tab reverts to its cwd title.
+ */
+export interface PromptReadyPayload {
+  tab_id: string;
+}
+
+/** Full replacement state for one tab's protocol fields. */
+export interface TabStatusPayload {
+  tab_id: string;
+  status: TabStatus | null;
+  notice: TabNotice | null;
+  answer: TabAnswer | null;
+}
+
 export interface TabExitPayload {
   tab_id: string;
   code: number;
@@ -59,6 +112,16 @@ export interface TabExitPayload {
 /** Emitted by the native menu when a tab accelerator is pressed. */
 export interface MenuShortcutPayload {
   id: string;
+}
+
+export interface TabWaitingPayload {
+  tab_id: string;
+  waiting: boolean;
+}
+
+/** Emitted when the user clicks a "Waiting for input" notification. */
+export interface FocusTabPayload {
+  tab_id: string;
 }
 
 /**

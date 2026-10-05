@@ -1,7 +1,8 @@
 use super::lock;
-use super::registry::Registry;
+use super::registry::{Registry, StopOutcome};
 use super::shell_integration;
 use crate::osc::{self, OscEvent, OscParser};
+use crate::status::{self, StatusEvent};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::VecDeque;
@@ -142,6 +143,15 @@ impl PtySession {
         // foreground, and cleared when its turn ends / the shell prompt returns.
         let program_active = Arc::new(AtomicBool::new(false));
 
+        // The attention watcher needs the registry too (enter_waiting), and
+        // the reader thread takes ownership of the original below.
+        let watcher_registry = Arc::clone(&registry);
+
+        // Set when the tab flashed for the current turn — shared between the
+        // idle watcher and the hook protocol so an explicit `stop` event can
+        // flash immediately without the watcher repeating it 2s later.
+        let flashed = Arc::new(AtomicBool::new(false));
+
         // Reader thread: pump PTY output into the renderer + OSC parser.
         {
             let tab_id = tab_id.clone();
@@ -150,6 +160,7 @@ impl PtySession {
             let running = Arc::clone(&running);
             let last_activity = Arc::clone(&last_activity);
             let program_active = Arc::clone(&program_active);
+            let flashed = Arc::clone(&flashed);
             thread::spawn(move || {
                 Self::read_loop(
                     tab_id,
@@ -160,6 +171,7 @@ impl PtySession {
                     running,
                     last_activity,
                     program_active,
+                    flashed,
                 );
             });
         }
@@ -172,20 +184,22 @@ impl PtySession {
             let running = Arc::clone(&running);
             let last_activity = Arc::clone(&last_activity);
             let program_active = Arc::clone(&program_active);
+            let registry = watcher_registry;
+            let flashed = Arc::clone(&flashed);
             thread::spawn(move || {
-                let mut flashed = false;
                 while running.load(Ordering::Relaxed) {
                     thread::sleep(WATCHER_POLL);
                     if !program_active.load(Ordering::Relaxed) {
-                        flashed = false;
+                        flashed.store(false, Ordering::Relaxed);
                         continue;
                     }
                     let idle = lock(&last_activity).elapsed();
                     if idle < TURN_IDLE {
                         continue; // still streaming
                     }
-                    if !flashed {
-                        flashed = true;
+                    // swap: only the first caller of a turn emits the flash.
+                    if !flashed.swap(true, Ordering::Relaxed) {
+                        crate::attention::enter_waiting(&app, &registry, &tab_id);
                         let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                     }
                 }
@@ -229,6 +243,7 @@ impl PtySession {
         running: Arc<AtomicBool>,
         last_activity: Arc<Mutex<Instant>>,
         program_active: Arc<AtomicBool>,
+        flashed: Arc<AtomicBool>,
     ) {
         let mut buf = vec![0u8; READ_CHUNK];
         let mut parser = OscParser::new();
@@ -238,31 +253,37 @@ impl PtySession {
                 Ok(0) => break, // EOF: the shell is gone
                 Ok(n) => {
                     let data = &buf[..n];
+                    // Silence before this chunk: how long the PTY was idle.
+                    // `begin_turn` uses it to tell a prompt queued behind a
+                    // live turn (spinner output keeps gaps tiny) from a fresh
+                    // prompt after an Esc interrupt, which fires no Stop and
+                    // leaves the record looking mid-turn (see IDLE_GAP_MS).
+                    let idle_gap_ms = lock(&last_activity).elapsed().as_millis() as u64;
                     *lock(&last_activity) = Instant::now();
 
-                    for event in parser.parse(data) {
+                    // Split the chunk at OSC event boundaries and emit each
+                    // segment *before* announcing its event. `tab-status` is
+                    // what binds a timeline entry to a terminal line in the
+                    // renderer, and the marker only lands on the line where the
+                    // OSC sequence actually appeared if the bytes preceding it
+                    // were already on their way (the renderer fences marker
+                    // registration behind its own write queue).
+                    let mut cursor = 0;
+                    for (end, event) in parser.parse_with_end(data) {
+                        emit_segment(&app, &tab_id, &stream, &data[cursor..end]);
+                        cursor = end;
                         Self::handle_osc(
                             &tab_id,
                             &app,
                             &registry,
                             &program_active,
                             &last_activity,
+                            &flashed,
+                            idle_gap_ms,
                             event,
                         );
                     }
-
-                    // The ring is filled whether or not anyone is watching, so a
-                    // later attach can rebuild the screen. Emitting while still
-                    // holding the lock is what keeps the byte stream ordered
-                    // against a concurrent `attach_stream`. Chunks that were in
-                    // flight when the renderer re-attached carry a position the
-                    // replay already covers; the renderer dedups on it.
-                    let mut state = lock(&stream);
-                    push_recent(&mut state.recent, data);
-                    if state.attached {
-                        emit_output(&app, &tab_id, data, state.position);
-                    }
-                    state.position += data.len() as u64;
+                    emit_segment(&app, &tab_id, &stream, &data[cursor..]);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -278,6 +299,8 @@ impl PtySession {
         registry: &Registry,
         program_active: &AtomicBool,
         last_activity: &Mutex<Instant>,
+        flashed: &AtomicBool,
+        idle_gap_ms: u64,
         event: OscEvent,
     ) {
         match event {
@@ -306,6 +329,7 @@ impl PtySession {
                 );
             }
             OscEvent::Bell => {
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
             }
             OscEvent::PromptReady => {
@@ -313,9 +337,90 @@ impl PtySession {
                 program_active.store(false, Ordering::Relaxed);
                 registry.clear_program_title(tab_id);
                 *lock(last_activity) = Instant::now();
+                // After clear_program_title: the notification then carries the
+                // same title the tab bar shows (the cwd it reverted to).
+                crate::attention::enter_waiting(app, registry, tab_id);
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }
+            OscEvent::Clitab(json) => {
+                // Unknown kinds and malformed payloads decode to None and are
+                // dropped: a hook emitting something newer than this build
+                // must be a no-op, never an error.
+                if let Some(event) = status::decode(&json) {
+                    Self::handle_status(tab_id, app, registry, flashed, idle_gap_ms, event);
+                }
+            }
+        }
+    }
+
+    /// Apply one hook-protocol event: registry transition, then broadcast the
+    /// tab's full protocol state so the renderer replaces (not merges) it.
+    fn handle_status(
+        tab_id: &str,
+        app: &AppHandle,
+        registry: &Registry,
+        flashed: &AtomicBool,
+        idle_gap_ms: u64,
+        event: StatusEvent,
+    ) {
+        let now = now_ms();
+        match event {
+            StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg, idle_gap_ms),
+            StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
+            StatusEvent::Stop => {
+                let outcome = registry.end_turn(tab_id, now);
+                // An accepted stop with an empty queue beats the 2s idle
+                // heuristic: flash now and suppress the watcher's duplicate.
+                // Like every flash trigger, this enters the triage queue
+                // (set_waiting's transition guard keeps badge/notification
+                // exactly-once). Every other outcome stays silent: with a
+                // prompt queued, Claude Code auto-submits it right now and
+                // needs no user — the next stop with an empty queue flashes
+                // instead — and a duplicate Stop (`Ignored`) must not
+                // re-enter waiting while the auto turn is running.
+                flashed.store(true, Ordering::Relaxed);
+                if outcome == StopOutcome::Idle {
+                    crate::attention::enter_waiting(app, registry, tab_id);
+                    let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+                }
+                // Deliberately does NOT touch program_active or the title:
+                // Claude Code is still running between turns. (Title revert
+                // stays owned by the shell integration's `claude-done`.)
+                // Two ordered snapshots: the renderer derives the turn-end row
+                // from the `Done` one, then flips the queued prompt's row to
+                // executing on the auto-start (`Thinking { auto: true }`).
+                Self::emit_status(app, registry, tab_id);
+                if let StopOutcome::AutoSubmit(msg) = outcome {
+                    registry.begin_auto_turn(tab_id, now, msg);
+                    Self::emit_status(app, registry, tab_id);
+                }
+                return;
+            }
+            StatusEvent::Notify { msg } => {
+                registry.set_notice(tab_id, msg, now);
+                crate::attention::enter_waiting(app, registry, tab_id);
+                let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
+            }
+            // An answer means the user is already at the keyboard: no flash,
+            // no waiting-queue entry — just a timeline record.
+            StatusEvent::Answer { msg } => registry.set_answer(tab_id, msg, now),
+        }
+        Self::emit_status(app, registry, tab_id);
+    }
+
+    /// Broadcast the tab's full protocol state (replacement, not merge).
+    fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
+        if let Some(tab) = registry.get(tab_id) {
+            let _ = app.emit(
+                "tab-status",
+                serde_json::json!({
+                    "tab_id": tab_id,
+                    "status": tab.status,
+                    "notice": tab.notice,
+                    "answer": tab.answer,
+                }),
+            );
         }
     }
 
@@ -369,9 +474,41 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        // Kill before deleting the rc files: a live shell can still re-exec
+        // itself (`exec zsh`), and sourcing a ZDOTDIR/rcfile that teardown
+        // just removed would bring it up without the clitab hooks. Once the
+        // child is gone, nothing can observe the files disappearing.
         self.kill();
         self.integration.cleanup();
     }
+}
+
+/// Epoch milliseconds, the clock the whole protocol speaks: `Instant` would
+/// not survive the IPC boundary or a webview reload.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Ring and forward one segment of a read chunk. The ring is filled whether or
+/// not anyone is watching, so a later attach can rebuild the screen. Emitting
+/// while still holding the lock is what keeps the byte stream ordered against
+/// a concurrent `attach_stream`; chunks (or segments) that were in flight when
+/// the renderer re-attached carry a position the replay already covers, and the
+/// renderer dedups on it. An attach landing *between* segments of one chunk is
+/// the same in-flight case — `position` advances per segment under the lock.
+fn emit_segment(app: &AppHandle, tab_id: &str, stream: &Mutex<StreamState>, segment: &[u8]) {
+    if segment.is_empty() {
+        return;
+    }
+    let mut state = lock(stream);
+    push_recent(&mut state.recent, segment);
+    if state.attached {
+        emit_output(app, tab_id, segment, state.position);
+    }
+    state.position += segment.len() as u64;
 }
 
 /// Forward raw PTY bytes. They travel base64-encoded because a Tauri event

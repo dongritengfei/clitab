@@ -2,12 +2,18 @@ import React, { useEffect, useRef } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import { registerTerm, unregisterTerm } from '../lib/termRegistry';
 
 interface TerminalProps {
   tabId: string;
   isActive: boolean;
-  /** Subscribe to this tab's output; resolves once the live stream is flowing. */
-  attach: (tabId: string, write: (chunk: Uint8Array, isReplay?: boolean) => void) => Promise<void>;
+  /** Subscribe to this tab's output; resolves once the live stream is flowing.
+   * `done` (fence writes only) fires once xterm has parsed that write and
+   * everything queued before it. */
+  attach: (
+    tabId: string,
+    write: (chunk: Uint8Array, isReplay?: boolean, done?: () => void) => void
+  ) => Promise<void>;
   detach: (tabId: string) => void;
   onInput: (tabId: string, data: Uint8Array) => void;
   onResize: (tabId: string, rows: number, cols: number) => void;
@@ -126,12 +132,16 @@ export const Terminal: React.FC<TerminalProps> = ({
     let resizeTimer: number | undefined;
 
     const term = new XTerm({
+      // registerDecoration (the timeline jump highlight) is proposed API;
+      // without this flag the call throws instead of returning a decoration.
+      allowProposedApi: true,
       cursorBlink: true,
       fontSize: 14,
-      // JetBrains Mono and the Nerd symbol fallback are bundled with the app
+      // JetBrains Mono and the Nerd-patched fallback are bundled with the app
       // (see main.tsx / App.css), so the stack resolves the same everywhere —
-      // Ghostty-like metrics, and powerline/devicon PUA glyphs always render.
-      fontFamily: '"JetBrains Mono", "Symbols Nerd Font Mono", Menlo, monospace',
+      // Ghostty-like metrics, and powerline/devicon PUA glyphs always render
+      // inside a single cell.
+      fontFamily: '"JetBrains Mono", "JetBrainsMono Nerd Font Mono", Menlo, monospace',
       scrollback: 5000,
       theme: {
         background: '#1e1e2e',
@@ -146,6 +156,7 @@ export const Terminal: React.FC<TerminalProps> = ({
     term.open(container);
     fitRef.current = fitAddon;
     termRef.current = term;
+    registerTerm(tabId, term);
 
     // No WebGL renderer, on purpose. Every tab keeps its terminal mounted (hidden
     // ones use `visibility: hidden` so they stay measurable), so one GL context
@@ -250,6 +261,19 @@ export const Terminal: React.FC<TerminalProps> = ({
         }
         return false;
       }
+      /* With a CJK input source active, WebKit reports Cmd presses as
+         keyCode-229 "Process" keydowns — the IME marked the key handled, even
+         when nothing is composing (xterm.js #5887 documents exactly this).
+         xterm's composition path treats *every* 229 keydown as user input and,
+         via scrollOnUserInput, snaps a scrolled-up viewport to the bottom — so
+         ⌘C while reading history threw away the scroll position. A Cmd combo
+         never sends data to the terminal, so dropping it before xterm's
+         handler is safe: real composition keys (229 without Cmd) still take
+         the normal path, and native copy/paste runs through the Edit menu
+         (menu.rs), not through this handler. */
+      if (event.type === 'keydown' && event.metaKey && event.keyCode === 229) {
+        return false;
+      }
       return true;
     });
 
@@ -288,10 +312,12 @@ export const Terminal: React.FC<TerminalProps> = ({
     // cursor-relative moves clamp to the top and resync; an alt-screen ring
     // is dropped entirely and the app repaints itself.
     void callbacks.current
-      .attach(tabId, (chunk, isReplay) => {
+      .attach(tabId, (chunk, isReplay, done) => {
         if (disposed) return;
         if (!isReplay) {
-          term.write(chunk);
+          // Live chunks and fences; xterm runs `done` after this write and
+          // everything queued before it has been parsed.
+          term.write(chunk, done);
           return;
         }
         switch (classifyReplay(chunk)) {
@@ -367,6 +393,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       callbacks.current.detach(tabId);
       if (fitRef.current === fitAddon) fitRef.current = null;
       if (termRef.current === term) termRef.current = null;
+      unregisterTerm(tabId, term);
       term.dispose();
     };
   }, [tabId]);

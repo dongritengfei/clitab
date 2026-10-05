@@ -1,8 +1,14 @@
 import { useCallback } from 'react';
+import { SearchBar } from './components/SearchBar';
 import { TabList } from './components/TabList';
 import { Terminal } from './components/Terminal';
+import { TimelinePanel } from './components/TimelinePanel';
 import { useTabManager } from './hooks/useTabManager';
+import type { TimelineEvent } from './lib/timeline';
 import './App.css';
+
+/** Stable empty array, so an eventless panel does not re-render every tick. */
+const NO_EVENTS: TimelineEvent[] = [];
 
 function App() {
   const {
@@ -17,6 +23,11 @@ function App() {
     detachTab,
     writeInput,
     resizePty,
+    searchNonce,
+    closeSearch,
+    timelines,
+    staleEvents,
+    navigateToEvent,
   } = useTabManager();
 
   // Clicking (or pressing Enter/Space on) a tab must land the caret in its
@@ -55,6 +66,9 @@ function App() {
             </button>
           </div>
         )}
+        {searchNonce > 0 && activeTabId && (
+          <SearchBar tabId={activeTabId} nonce={searchNonce} onClose={closeSearch} />
+        )}
         {tabs.length === 0 ? (
           <div className="empty-state">
             <p>No tabs open</p>
@@ -81,6 +95,14 @@ function App() {
           ))
         )}
       </div>
+      <TimelinePanel
+        tabId={activeTabId}
+        events={activeTabId ? timelines[activeTabId] ?? NO_EVENTS : NO_EVENTS}
+        isStale={(eventId) => activeTabId !== null && staleEvents.has(`${activeTabId}:${eventId}`)}
+        onNavigate={(eventId) => {
+          if (activeTabId) navigateToEvent(activeTabId, eventId);
+        }}
+      />
     </div>
   );
 }

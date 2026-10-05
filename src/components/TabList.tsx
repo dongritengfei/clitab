@@ -70,7 +70,7 @@ export const TabList: React.FC<TabListProps> = ({
   return (
     <nav className="tab-list" aria-label="Terminals">
       <div className="tab-list-header">
-        <span>Terminal Tabs</span>
+        <span>CLI Tabs</span>
       </div>
       <div
         className="tab-list-items"

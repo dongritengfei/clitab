@@ -292,11 +292,19 @@ impl Registry {
         }
     }
 
-    /// The user switched to the tab and saw the notice.
-    pub fn clear_notice(&self, id: &str) {
+    /// The user has seen the notice: they switched to the tab, or typed into
+    /// it — answering a permission dialog fires no hook event of its own
+    /// (PreToolUse ran *before* the dialog), so the keystroke is the only
+    /// "answered" signal. Returns true only on the Some→None transition, so
+    /// callers know whether a fresh snapshot is worth emitting.
+    pub fn clear_notice(&self, id: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.notice = None;
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.notice.is_some() => {
+                tab.notice = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -700,6 +708,21 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(tab.notice, None);
         assert!(matches!(tab.status, Some(TabStatus::Tool { .. })));
+    }
+
+    /// Typing into a tab answers a pending notice (answering a permission
+    /// dialog fires no hook event of its own, so input is the only signal);
+    /// the transition report lets the caller decide whether a fresh
+    /// `tab-status` snapshot is worth emitting — every keystroke goes
+    /// through that path, so a no-op clear must stay silent.
+    #[test]
+    fn clear_notice_reports_the_transition() {
+        let r = status_fixture();
+        assert!(!r.clear_notice("t1"), "no notice: nothing cleared");
+        r.set_notice("t1", Some("needs permission".into()), 200);
+        assert!(r.clear_notice("t1"), "Some→None is the transition");
+        assert!(!r.clear_notice("t1"), "already cleared");
+        assert!(!r.clear_notice("nope"), "unknown tab");
     }
 
     #[test]

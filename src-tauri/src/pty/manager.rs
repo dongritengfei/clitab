@@ -104,8 +104,16 @@ impl TabManager {
 
     pub fn write_input(&self, tab_id: &str, data: &[u8]) -> Result<(), ManagerError> {
         self.session(tab_id)?.write(data)?;
-        // Typing into the tab is the answer: it leaves the triage queue.
+        // Typing into the tab is the answer: it leaves the triage queue...
         crate::attention::respond(&self.app, &self.registry, tab_id);
+        // ...and it has seen any pending notice. Answering a permission
+        // dialog fires no hook event (PreToolUse ran before the dialog, and
+        // PostToolUse stays silent for non-AskUserQuestion tools), so without
+        // this the ⚠ text would linger until the next tool/prompt/stop. The
+        // snapshot reveals the turn state underneath, per `Notice`'s contract.
+        if self.registry.clear_notice(tab_id) {
+            PtySession::emit_status(&self.app, &self.registry, tab_id);
+        }
         Ok(())
     }
 

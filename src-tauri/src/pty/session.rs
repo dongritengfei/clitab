@@ -418,7 +418,11 @@ impl PtySession {
     }
 
     /// Broadcast the tab's full protocol state (replacement, not merge).
-    fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
+    /// `pub(crate)` because the manager emits it too: typing into a tab
+    /// clears a pending notice (the keystroke that answers a permission
+    /// dialog is the only "answered" signal — no hook fires at that moment),
+    /// and the renderer learns about it through this same snapshot.
+    pub(crate) fn emit_status(app: &AppHandle, registry: &Registry, tab_id: &str) {
         if let Some(tab) = registry.get(tab_id) {
             let _ = app.emit(
                 "tab-status",

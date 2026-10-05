@@ -12,20 +12,11 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 
 ## Screenshots
 
-![Three tabs, each a live shell named after its working directory](docs/screenshots/tabs.png)
+![clitab overview: the tab list, a live Claude Code session with its dashboard, and the session timeline panel](docs/screenshots/overview.jpg)
 
-Every tab is a real shell named after its working directory — three
-projects side by side in one window.
-
-![A Claude Code session running in a tab](docs/screenshots/session.png)
-
-Run `claude` in any tab: while the session runs, the tab switches from
-the directory to the session's own title, and reverts when the turn ends.
-
-![A background tab lit up because its session needs attention](docs/screenshots/attention.png)
-
-When a session needs you, its tab flashes (BEL / OSC 9) — a row of
-parallel agents stays glanceable from whichever tab you are in.
+The tab list (left) names every tab after its working directory or its Claude
+Code session, with a live timer while a turn runs; the session itself runs in
+the middle; the timeline panel (right) logs what you sent.
 
 ## Features
 
@@ -80,40 +71,12 @@ parallel agents stays glanceable from whichever tab you are in.
 
 Download the `.dmg` for your chip from [Releases](../../releases) —
 `aarch64` for Apple Silicon (M1–M4), `x64` for Intel — and drag **clitab**
-into Applications.
-
-Release builds are ad-hoc signed but **not notarized**, and downloaded
-files carry the quarantine attribute, so on a fresh download macOS
-Gatekeeper intervenes twice — once for the `.dmg`, once for the app.
-Both are one-time **Open Anyway** clicks:
-
-1. Double-click the `.dmg`; macOS refuses with a dialog saying the file
-   "cannot be opened" / does not have permission to open it. Click
-   **OK**.
-2. Open **System Settings → Privacy & Security** and scroll to the
-   **Security** section: "*clitab_….dmg* was blocked to protect
-   your Mac" with an **Open Anyway** button. Click it and confirm with
-   your password (or Touch ID); the disk image then mounts normally.
-3. Drag **clitab** into Applications. The first time you open it, the
-   app itself is blocked the same way: back in **Privacy & Security**,
-   click **Open Anyway** next to "*clitab* was blocked…". One-time —
-   later launches open normally.
-
-Terminal shortcut (skips both prompts): clear the quarantine flag on the
-downloaded `.dmg` *before* opening it; apps copied from it then inherit
-nothing:
-
-```bash
-xattr -d com.apple.quarantine ~/Downloads/clitab_*.dmg
-```
-
-(On macOS 15 Sequoia and later, right-click → Open no longer bypasses
-Gatekeeper for a signature like this one — use **Open Anyway** above.)
-
-Building from source (`npm run package:macos`) needs no such step: the
-bundle is ad-hoc signed and never quarantined, so it opens directly.
-
-Both builds are native; nothing needs Rosetta.
+into Applications. Release builds are ad-hoc signed but **not notarized**,
+so a fresh download trips macOS Gatekeeper twice; the
+[User Manual](https://github.com/dongritengfei/clitab/wiki/Manual#2-installation-and-first-launch)
+walks through both one-time **Open Anyway** clicks, plus a terminal shortcut
+that skips them. Building from source (`npm run package:macos`) needs no such
+step. Both builds are native; nothing needs Rosetta.
 
 ## Claude Code integration
 

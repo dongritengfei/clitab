@@ -389,7 +389,9 @@ impl PtySession {
                 // stays owned by the shell integration's `claude-done`.)
                 // Two ordered snapshots: the renderer derives the turn-end row
                 // from the `Done` one, then flips the queued prompt's row to
-                // executing on the auto-start (`Thinking { auto: true }`).
+                // executing on the auto-start (`Thinking { auto: true }`) —
+                // unless the popped head is system-injected (`system: true`,
+                // e.g. a task notification): that turn has no row to flip.
                 Self::emit_status(app, registry, tab_id);
                 if let StopOutcome::AutoSubmit(msg) = outcome {
                     registry.begin_auto_turn(tab_id, now, msg);

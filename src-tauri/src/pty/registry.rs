@@ -7,7 +7,7 @@
 //! and means `list_tabs` survives a webview reload with the right titles.
 
 use super::lock;
-use crate::status::{Answer, Notice, TabStatus};
+use crate::status::{is_injected_prompt, Answer, Notice, TabStatus};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -180,6 +180,10 @@ impl Registry {
     pub fn begin_turn(&self, id: &str, now_ms: u64, msg: Option<String>, idle_gap_ms: u64) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            // Classify from the raw text and keep the msg verbatim: when the
+            // prompt is queued, `begin_auto_turn` re-derives the flag from the
+            // popped text at stop time (a rewritten msg would misclassify it).
+            let system = msg.as_deref().map(is_injected_prompt).unwrap_or(false);
             let running = tab.turn_start.is_some() && idle_gap_ms < IDLE_GAP_MS;
             if running {
                 tab.prompt_queue.push_back(msg.clone());
@@ -194,7 +198,7 @@ impl Registry {
                 tab.prompt_queue.clear();
                 tab.turn_start = Some(now_ms);
             }
-            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: false });
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: false, system });
             tab.notice = None;
         }
     }
@@ -204,7 +208,8 @@ impl Registry {
     pub fn begin_auto_turn(&self, id: &str, now_ms: u64, msg: Option<String>) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: true });
+            let system = msg.as_deref().map(is_injected_prompt).unwrap_or(false);
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: true, system });
             tab.turn_start = Some(now_ms);
         }
     }
@@ -415,7 +420,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()), auto: false })
+            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()), auto: false, system: false })
         );
         assert_eq!(tab.turn_start, Some(1000));
 
@@ -447,7 +452,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: false })
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: false, system: false })
         );
         assert_eq!(tab.turn_start, Some(1000), "queued prompt must not restart the clock");
         assert_eq!(tab.prompt_queue.len(), 1);
@@ -472,7 +477,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 8000, msg: Some("B".into()), auto: true })
+            Some(TabStatus::Thinking { since: 8000, msg: Some("B".into()), auto: true, system: false })
         );
         assert_eq!(tab.turn_start, Some(8000));
 
@@ -481,6 +486,72 @@ mod tests {
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(4000), at: 12000 }),
             "the auto-started turn gets its own duration and stop"
+        );
+    }
+
+    /// Claude Code injects background-task notifications through the user
+    /// prompt pipeline: the turn is real (the clock runs, the duration is
+    /// reported) but flagged `system` so the renderer keeps it out of the
+    /// timeline.
+    #[test]
+    fn injected_prompt_turn_is_flagged_system_and_keeps_the_clock() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some(xml.into()), 5000);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.turn_start, Some(1000), "the turn is real: the clock runs");
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 1000, msg: Some(xml.into()), auto: false, system: true })
+        );
+        assert_eq!(r.end_turn("t1", 3000), StopOutcome::Idle);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(2000), at: 3000 })
+        );
+    }
+
+    /// An injected prompt arriving mid-turn is queued like a user one — the
+    /// queue models Claude Code's own, which holds both — without restarting
+    /// the running turn's clock.
+    #[test]
+    fn injected_prompt_queued_mid_turn_keeps_the_running_clock() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 5000, Some(xml.into()), 100);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.turn_start, Some(1000));
+        assert_eq!(tab.prompt_queue.len(), 1);
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 5000, msg: Some(xml.into()), auto: false, system: true })
+        );
+    }
+
+    /// Mixed FIFO: the injected head pops first as `{auto, system}` (the
+    /// renderer must NOT flip any row for it), then the user's prompt pops as
+    /// `{auto, system:false}` (its row flips). The raw queue text carries the
+    /// classification across the pop — msg must never be rewritten.
+    #[test]
+    fn mixed_queue_pops_injected_head_then_user_prompt() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 2000, Some(xml.into()), 100); // injected, queued
+        r.begin_turn("t1", 3000, Some("P".into()), 100); // user, queued
+        assert_eq!(r.end_turn("t1", 4000), StopOutcome::AutoSubmit(Some(xml.into())));
+        r.begin_auto_turn("t1", 4000, Some(xml.into()));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Thinking { since: 4000, msg: Some(xml.into()), auto: true, system: true })
+        );
+        assert_eq!(r.end_turn("t1", 6000), StopOutcome::AutoSubmit(Some("P".into())));
+        r.begin_auto_turn("t1", 6000, Some("P".into()));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Thinking { since: 6000, msg: Some("P".into()), auto: true, system: false }),
+            "a user's auto-submit must still flip its row"
         );
     }
 
@@ -517,7 +588,7 @@ mod tests {
         assert_eq!(r.end_turn("t1", 5100), StopOutcome::Ignored, "burst duplicate ignored");
         assert_eq!(
             r.get("t1").unwrap().status,
-            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true }),
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true, system: false }),
             "the auto turn is still running"
         );
         assert_eq!(r.end_turn("t1", 9000), StopOutcome::Idle, "its real stop, queue empty");

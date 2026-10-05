@@ -1,5 +1,5 @@
 use super::lock;
-use super::registry::Registry;
+use super::registry::{Registry, StopOutcome};
 use super::shell_integration;
 use crate::osc::{self, OscEvent, OscParser};
 use crate::status::{self, StatusEvent};
@@ -369,16 +369,18 @@ impl PtySession {
             StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg, idle_gap_ms),
             StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
             StatusEvent::Stop => {
-                let queued = registry.end_turn(tab_id, now);
-                // An explicit turn-end beats the 2s idle heuristic: flash now
-                // and suppress the watcher's duplicate. Like every flash
-                // trigger, this enters the triage queue (set_waiting's
-                // transition guard keeps badge/notification exactly-once).
-                // With a prompt queued, skip all of that: Claude Code
-                // auto-submits it right now and needs no user — the next stop
-                // with an empty queue flashes instead.
+                let outcome = registry.end_turn(tab_id, now);
+                // An accepted stop with an empty queue beats the 2s idle
+                // heuristic: flash now and suppress the watcher's duplicate.
+                // Like every flash trigger, this enters the triage queue
+                // (set_waiting's transition guard keeps badge/notification
+                // exactly-once). Every other outcome stays silent: with a
+                // prompt queued, Claude Code auto-submits it right now and
+                // needs no user — the next stop with an empty queue flashes
+                // instead — and a duplicate Stop (`Ignored`) must not
+                // re-enter waiting while the auto turn is running.
                 flashed.store(true, Ordering::Relaxed);
-                if queued.is_none() {
+                if outcome == StopOutcome::Idle {
                     crate::attention::enter_waiting(app, registry, tab_id);
                     let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 }
@@ -389,7 +391,7 @@ impl PtySession {
                 // from the `Done` one, then flips the queued prompt's row to
                 // executing on the auto-start (`Thinking { auto: true }`).
                 Self::emit_status(app, registry, tab_id);
-                if let Some(msg) = queued {
+                if let StopOutcome::AutoSubmit(msg) = outcome {
                     registry.begin_auto_turn(tab_id, now, msg);
                     Self::emit_status(app, registry, tab_id);
                 }
@@ -472,6 +474,10 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        // Kill before deleting the rc files: a live shell can still re-exec
+        // itself (`exec zsh`), and sourcing a ZDOTDIR/rcfile that teardown
+        // just removed would bring it up without the clitab hooks. Once the
+        // child is gone, nothing can observe the files disappearing.
         self.kill();
         self.integration.cleanup();
     }

@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::osc::percent_decode;
+
 /// How long startup waits for a Finder service request before creating the
 /// default tab. The request can only be delivered once the event loop runs,
 /// so this wait must not block `setup` itself (see the startup thread in
@@ -39,35 +41,6 @@ impl ServiceState {
         self.settled = true;
         self.pending.take()
     }
-}
-
-/// Percent-decode a URL path component byte-wise, so multi-byte UTF-8
-/// (e.g. Chinese directory names) reassembles correctly. Malformed escapes
-/// stay literal rather than erroring — a weird path should still open a tab.
-pub fn percent_decode(input: &str) -> String {
-    fn hex(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(hi * 16 + lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Normalize whatever string the pasteboard carried into a filesystem path:

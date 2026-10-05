@@ -12,7 +12,7 @@ clitab is a tabbed terminal for macOS built for Claude Code sessions: each tab i
 npm install
 npm run tauri dev       # dev: vite + tauri (requires Rust toolchain)
 npm run dev:log         # same, tee'd to /tmp/clitab-dev.log for bug reports
-npm run typecheck       # tsc --noEmit (no JS test suite or linter exists)
+npm run typecheck       # tsc --noEmit
 npm run build           # typecheck + vite build
 npm test                # cargo test --lib (Rust only: OSC parser, registry, shell integration, replay ring, menu ids)
 npm run package:macos   # tauri build --bundles app + ad-hoc codesign (scripts/macos-sign.sh)

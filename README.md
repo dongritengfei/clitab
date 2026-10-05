@@ -1,6 +1,6 @@
 # clitab
 
-[中文 README](README.zh-CN.md)
+[中文 README](README.zh-CN.md) · 📖 [User Manual (Wiki)](https://github.com/dongritengfei/clitab/wiki/Manual)
 
 A tabbed terminal built for Claude Code sessions: every tab is a real PTY
 running your shell, named after its working directory — or after the session,
@@ -91,7 +91,7 @@ Both are one-time **Open Anyway** clicks:
    "cannot be opened" / does not have permission to open it. Click
    **OK**.
 2. Open **System Settings → Privacy & Security** and scroll to the
-   **Security** section: "*clitab_0.1.0_….dmg* was blocked to protect
+   **Security** section: "*clitab_….dmg* was blocked to protect
    your Mac" with an **Open Anyway** button. Click it and confirm with
    your password (or Touch ID); the disk image then mounts normally.
 3. Drag **clitab** into Applications. The first time you open it, the
@@ -104,7 +104,7 @@ downloaded `.dmg` *before* opening it; apps copied from it then inherit
 nothing:
 
 ```bash
-xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
+xattr -d com.apple.quarantine ~/Downloads/clitab_*.dmg
 ```
 
 (On macOS 15 Sequoia and later, right-click → Open no longer bypasses
@@ -202,8 +202,10 @@ Merge the clitab terminal's Claude Code hooks config into my ~/.claude/settings.
 
 ## Shortcuts
 
-Defined in the native menu (`src-tauri/src/menu.rs`), so they work even when
-the terminal does not have keyboard focus.
+The tab shortcuts are defined in the native menu (`src-tauri/src/menu.rs`),
+so they work even when the terminal does not have keyboard focus. `⌘C` /
+`⌘V` / `⌘A` are the standard macOS Edit menu items and act on the current
+text selection.
 
 | Key | Action |
 | --- | --- |

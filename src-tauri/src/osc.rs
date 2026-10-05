@@ -4,12 +4,19 @@
 //   * OSC 0 / 1 / 2 -> terminal title
 //   * OSC 7         -> current working directory (`file://host/path`)
 //   * OSC 9         -> custom notifications (`claude-done`)
+//   * OSC 7777      -> the clitab hook protocol (JSON, decoded in `status.rs`)
 //   * standalone BEL -> attention flash
 //
 // The parser is byte based and keeps its state between `parse()` calls, so a
 // sequence that straddles two PTY reads is still decoded correctly. It is
 // deliberately defensive: `cat`-ing a binary file must not make it accumulate
 // without bounds or lose every later sequence.
+//
+// Trust model: every event here originates *from the PTY*, so any program
+// running in the tab can emit one — a forged OSC 7777 fakes a status
+// transition, a forged OSC 7 fakes a cwd. That is inherent to terminal
+// escape sequences (window titles work the same way) and accepted: these
+// events drive UI state only (title, badge, timeline), never privilege.
 
 use std::str;
 
@@ -125,10 +132,17 @@ impl OscParser {
                         // away everything accumulated so far and start clean.
                         self.begin_osc();
                     } else {
-                        // Not a terminator after all: keep the payload going.
-                        self.buffer.push(0x1b);
-                        self.buffer.push(byte);
-                        self.state = State::InOsc;
+                        // Not a terminator after all: keep the payload going —
+                        // but under the same whole-sequence cap as a data byte,
+                        // or a payload sitting exactly at the cap grows past it
+                        // here, two unchecked bytes per ESC.
+                        if self.payload_len + self.buffer.len() + 2 > MAX_OSC_LEN {
+                            self.abort_osc();
+                        } else {
+                            self.buffer.push(0x1b);
+                            self.buffer.push(byte);
+                            self.state = State::InOsc;
+                        }
                     }
                 }
             }
@@ -231,7 +245,11 @@ fn parse_osc7_path(value: &str) -> String {
     percent_decode(rest)
 }
 
-fn percent_decode(input: &str) -> String {
+/// Percent-decode byte-wise, so multi-byte UTF-8 (e.g. Chinese directory
+/// names) reassembles correctly. Malformed escapes stay literal rather than
+/// erroring — a weird path should still open a tab; bytes that don't
+/// reassemble into UTF-8 become U+FFFD.
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -251,7 +269,7 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
 
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -348,6 +366,14 @@ mod tests {
         assert_eq!(events, vec![OscEvent::CwdChanged("/tmp/中文".into())]);
     }
 
+    /// Undecodable bytes cost only themselves (lossy replacement), not the
+    /// whole path: rolling back to the raw input would discard every escape
+    /// that *did* decode, leaving a worse path than the partial decode.
+    #[test]
+    fn percent_decode_is_lossy_on_invalid_utf8() {
+        assert_eq!(percent_decode("/tmp/a%20b%FF"), "/tmp/a b\u{FFFD}");
+    }
+
     #[test]
     fn osc7_bare_path() {
         let mut parser = OscParser::new();
@@ -417,6 +443,29 @@ mod tests {
             parser.params.len() <= MAX_OSC_LEN + 2,
             "params grew to {} segments",
             parser.params.len()
+        );
+        // The flood was dropped, so a fresh sequence still parses.
+        let events = parser.parse(b"\x1b]0;OK\x07");
+        assert_eq!(events, vec![OscEvent::TitleChanged("OK".into())]);
+    }
+
+    /// The re-entry arm (an `ESC` inside the payload that turned out not to
+    /// start an ST terminator) pushes two more bytes: a payload flushed to
+    /// exactly `MAX_OSC_LEN` — which `push_param`'s `> MAX` check lets
+    /// through — plus that pair accumulates `MAX_OSC_LEN + 2` against the
+    /// whole-sequence cap unless the re-entry consults it too.
+    #[test]
+    fn esc_reentry_honors_the_whole_sequence_cap() {
+        let mut parser = OscParser::new();
+        let mut flood = vec![0x1b_u8, b']'];
+        flood.extend_from_slice(b"7777;");
+        flood.resize(flood.len() + MAX_OSC_LEN, b'a');
+        flood.extend_from_slice(b"\x1bx");
+        assert!(parser.parse(&flood).is_empty());
+        let accumulated = parser.payload_len + parser.buffer.len();
+        assert!(
+            accumulated <= MAX_OSC_LEN,
+            "accumulated {accumulated} bytes against a cap of {MAX_OSC_LEN}"
         );
         // The flood was dropped, so a fresh sequence still parses.
         let events = parser.parse(b"\x1b]0;OK\x07");

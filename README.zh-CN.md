@@ -1,6 +1,6 @@
 # clitab
 
-[English README](README.md)
+[English README](README.md) · 📖 [使用手册 (Wiki)](https://github.com/dongritengfei/clitab/wiki/%E6%89%8B%E5%86%8C)
 
 为 Claude Code 会话打造的多标签终端:每个标签都是一个运行你 shell 的真实
 PTY,以工作目录命名 —— 当 Claude Code 为会话设置标题后,则显示会话名。
@@ -71,7 +71,7 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 1. 双击 `.dmg`,macOS 弹窗拒绝:提示文件"无法打开"/没有权限打开,
    点**好**;
 2. 打开**系统设置 → 隐私与安全性**,向下滚动到**安全性**区域:
-   "已阻止'clitab_0.1.0_….dmg'以保护你的 Mac"旁边是**仍要打开**按钮,
+   "已阻止'clitab_….dmg'以保护你的 Mac"旁边是**仍要打开**按钮,
    点击并按提示输入密码(或 Touch ID)确认,镜像随即正常挂载;
 3. 把 **clitab** 拖入应用程序。首次打开时应用本身会被同样拦截:
    回到**隐私与安全性**,在"已阻止'clitab'…"旁点**仍要打开**。
@@ -81,7 +81,7 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 属性,从它拷贝出去的应用就不带该属性:
 
 ```bash
-xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
+xattr -d com.apple.quarantine ~/Downloads/clitab_*.dmg
 ```
 
 (macOS 15 Sequoia 起,"右键 → 打开"对这种签名不再能绕过 Gatekeeper,
@@ -176,7 +176,8 @@ xattr -d com.apple.quarantine ~/Downloads/clitab_0.1.0_*.dmg
 
 ## 快捷键
 
-定义在原生菜单(`src-tauri/src/menu.rs`)中,终端没有键盘焦点时也生效。
+标签快捷键定义在原生菜单(`src-tauri/src/menu.rs`)中,终端没有键盘焦点时也生效。
+`⌘C` / `⌘V` / `⌘A` 是 macOS 标准的"编辑"菜单项,作用于当前选中的文本。
 
 | 按键 | 动作 |
 | --- | --- |

@@ -63,6 +63,18 @@ pub struct Registry {
     tabs: Mutex<Vec<TabRecord>>,
 }
 
+/// What a Stop hook means for the caller (session.rs): `Idle` is the cue to
+/// flash and enter the waiting queue; `AutoSubmit` carries the queued prompt
+/// Claude Code is submitting right now (text is None when the hook had no jq
+/// to extract it) — no flash, the caller models the turn via
+/// `begin_auto_turn`; `Ignored` (duplicate, unknown tab) changes nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    Ignored,
+    Idle,
+    AutoSubmit(Option<String>),
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
@@ -215,24 +227,28 @@ impl Registry {
     }
 
     /// Stop: the turn ended. Duration is None when no start was ever
-    /// observed; the start mark is consumed either way. Returns the queued
-    /// prompt Claude Code auto-submits at this stop (the caller emits the
-    /// `Done` snapshot first, then models the submission via
-    /// `begin_auto_turn`). A duplicate Stop (hooks fire once per settings
-    /// level) must not clobber the first duration nor pop the queue twice:
-    /// the idle-duplicate is caught by the missing start mark + already-
-    /// `Done` status, the burst (a second level's hook milliseconds later,
-    /// now racing an auto-started turn) by `DUPLICATE_STOP_MS`.
-    pub fn end_turn(&self, id: &str, now_ms: u64) -> Option<Option<String>> {
+    /// observed; the start mark is consumed either way.
+    ///
+    /// A duplicate Stop (hooks fire once per settings level) must not
+    /// clobber the first duration, pop the queue twice, nor re-trigger the
+    /// caller's flash/waiting side effects — it reports `Ignored`, as does
+    /// an unknown tab. The idle-duplicate is caught by the missing start
+    /// mark + already-`Done` status, the burst (a second level's hook
+    /// milliseconds later, now racing an auto-started turn) by
+    /// `DUPLICATE_STOP_MS`.
+    pub fn end_turn(&self, id: &str, now_ms: u64) -> StopOutcome {
         let mut tabs = lock(&self.tabs);
-        let tab = tabs.iter_mut().find(|t| t.id == id)?;
+        let tab = match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) => tab,
+            None => return StopOutcome::Ignored,
+        };
         if let Some(last) = tab.last_stop_ms {
             if now_ms.saturating_sub(last) < DUPLICATE_STOP_MS {
-                return None;
+                return StopOutcome::Ignored;
             }
         }
         if tab.turn_start.is_none() && matches!(tab.status, Some(TabStatus::Done { .. })) {
-            return None;
+            return StopOutcome::Ignored;
         }
         let duration = tab.turn_start.map(|start| now_ms.saturating_sub(start));
         tab.status = Some(TabStatus::Done {
@@ -242,7 +258,10 @@ impl Registry {
         tab.turn_start = None;
         tab.notice = None;
         tab.last_stop_ms = Some(now_ms);
-        tab.prompt_queue.pop_front()
+        match tab.prompt_queue.pop_front() {
+            Some(msg) => StopOutcome::AutoSubmit(msg),
+            None => StopOutcome::Idle,
+        }
     }
 
     /// Notification: park a message for the user without touching the turn
@@ -408,7 +427,7 @@ mod tests {
         );
         assert_eq!(tab.turn_start, Some(1000), "tool must not restart the clock");
 
-        assert_eq!(r.end_turn("t1", 4200), None, "nothing queued to auto-submit");
+        assert_eq!(r.end_turn("t1", 4200), StopOutcome::Idle, "nothing queued to auto-submit");
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
@@ -442,7 +461,7 @@ mod tests {
         let r = status_fixture();
         r.begin_turn("t1", 1000, Some("A".into()), 0);
         r.begin_turn("t1", 5000, Some("B".into()), 100);
-        assert_eq!(r.end_turn("t1", 8000), Some(Some("B".into())));
+        assert_eq!(r.end_turn("t1", 8000), StopOutcome::AutoSubmit(Some("B".into())));
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(7000), at: 8000 }),
@@ -457,7 +476,7 @@ mod tests {
         );
         assert_eq!(tab.turn_start, Some(8000));
 
-        assert_eq!(r.end_turn("t1", 12000), None);
+        assert_eq!(r.end_turn("t1", 12000), StopOutcome::Idle);
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(4000), at: 12000 }),
@@ -479,7 +498,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(tab.turn_start, Some(9000), "fresh turn, stale clock replaced");
         assert!(tab.prompt_queue.is_empty(), "stale queue dropped");
-        assert_eq!(r.end_turn("t1", 10000), None);
+        assert_eq!(r.end_turn("t1", 10000), StopOutcome::Idle);
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(1000), at: 10000 })
@@ -493,18 +512,44 @@ mod tests {
         let r = status_fixture();
         r.begin_turn("t1", 1000, Some("A".into()), 0);
         r.begin_turn("t1", 2000, Some("B".into()), 100);
-        assert_eq!(r.end_turn("t1", 5000), Some(Some("B".into())));
+        assert_eq!(r.end_turn("t1", 5000), StopOutcome::AutoSubmit(Some("B".into())));
         r.begin_auto_turn("t1", 5000, Some("B".into()));
-        assert_eq!(r.end_turn("t1", 5100), None, "burst duplicate ignored");
+        assert_eq!(r.end_turn("t1", 5100), StopOutcome::Ignored, "burst duplicate ignored");
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true }),
             "the auto turn is still running"
         );
-        assert_eq!(r.end_turn("t1", 9000), None, "its real stop, queue empty");
+        assert_eq!(r.end_turn("t1", 9000), StopOutcome::Idle, "its real stop, queue empty");
         assert_eq!(
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(4000), at: 9000 })
+        );
+    }
+
+    /// The caller flashes for an accepted stop with an empty queue but must
+    /// stay silent for a duplicate (session.rs): a burst duplicate landing
+    /// right after a queued-prompt stop would otherwise re-enter the waiting
+    /// queue — badge, notification, flash — while the auto turn is running.
+    /// So the two outcomes have to be tellable apart: `Ignored` vs `Idle`.
+    #[test]
+    fn accepted_stop_with_empty_queue_differs_from_a_duplicate() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, None, 0);
+        assert_eq!(
+            r.end_turn("t1", 2000),
+            StopOutcome::Idle,
+            "accepted stop, nothing queued: the caller flashes"
+        );
+        assert_eq!(
+            r.end_turn("t1", 2100),
+            StopOutcome::Ignored,
+            "burst duplicate: the caller stays silent"
+        );
+        assert_eq!(
+            r.end_turn("nope", 2200),
+            StopOutcome::Ignored,
+            "unknown tab: nothing to flash"
         );
     }
 

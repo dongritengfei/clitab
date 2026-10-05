@@ -6,6 +6,7 @@ import {
   type AttachStreamResponse,
   type FocusTabPayload,
   type MenuShortcutPayload,
+  type PromptReadyPayload,
   type PtyOutputPayload,
   type Tab,
   type TabCwdPayload,
@@ -106,12 +107,20 @@ export function useTabManager(): TabManagerState {
   // listener and subscribing the new one would silently drop terminal output.
   const handlers = useRef(new Map<string, StreamSink>());
 
+  // Defense in depth: whatever sets activeTabId, the UI must never point at a
+  // tab that is gone — a ghost active id blanks the tab bar and terminal.
+  // (null stays null: "no tabs" is a legal state, not a ghost.)
+  const safeActiveTabId =
+    activeTabId !== null && !tabs.some((tab) => tab.id === activeTabId)
+      ? tabs[0]?.id ?? null
+      : activeTabId;
+
   // Mirrors for use inside async callbacks and event listeners, which otherwise
   // see the values captured when they were created.
   const tabsRef = useRef<Tab[]>([]);
   const activeTabRef = useRef<string | null>(null);
   tabsRef.current = tabs;
-  activeTabRef.current = activeTabId;
+  activeTabRef.current = safeActiveTabId;
 
   // Resolves once the `pty-output` listener is live: a tab may only ask for its
   // replay after that, or the replay and the live stream would interleave.
@@ -141,14 +150,23 @@ export function useTabManager(): TabManagerState {
       }
       return next ?? prev;
     });
-    const remaining = tabsRef.current.filter((tab) => tab.id !== tabId);
-    const closedIndex = tabsRef.current.findIndex((tab) => tab.id === tabId);
-    setTabs(remaining);
-    setActiveTabId((current) => {
-      if (current !== tabId) return current;
-      // Focus the tab that took the closed one's slot.
-      const next = remaining[Math.min(closedIndex, remaining.length - 1)];
-      return next?.id ?? null;
+    // All tab-list math happens inside the setTabs updater: two tab-exit
+    // events landing in one React batch would each read the same stale
+    // tabsRef snapshot, and the second setTabs would resurrect the first
+    // removal. Queued updaters run against the latest state instead. The
+    // nested setActiveTabId is a same-component render-phase update and
+    // idempotent, so StrictMode's double invoke is safe.
+    setTabs((prev) => {
+      const closedIndex = prev.findIndex((tab) => tab.id === tabId);
+      if (closedIndex === -1) return prev;
+      const remaining = prev.filter((tab) => tab.id !== tabId);
+      setActiveTabId((current) => {
+        if (current !== tabId) return current;
+        // Focus the tab that took the closed one's slot.
+        const next = remaining[Math.min(closedIndex, remaining.length - 1)];
+        return next?.id ?? null;
+      });
+      return remaining;
     });
   }, []);
 
@@ -618,7 +636,7 @@ export function useTabManager(): TabManagerState {
           prev.map((tab) => (tab.id === payload.tab_id ? { ...tab, flashing: true } : tab))
         );
       }),
-      listen<TabFlashPayload>('prompt-ready', ({ payload }) => {
+      listen<PromptReadyPayload>('prompt-ready', ({ payload }) => {
         setTabs((prev) =>
           prev.map((tab) =>
             tab.id === payload.tab_id
@@ -703,7 +721,7 @@ export function useTabManager(): TabManagerState {
 
   return {
     tabs,
-    activeTabId,
+    activeTabId: safeActiveTabId,
     error,
     dismissError,
     createTab,

@@ -88,6 +88,14 @@ export interface TabFlashPayload {
   tab_id: string;
 }
 
+/**
+ * Emitted when Claude's turn ends (OSC 9 `claude-done`): the program title
+ * is cleared and the tab reverts to its cwd title.
+ */
+export interface PromptReadyPayload {
+  tab_id: string;
+}
+
 /** Full replacement state for one tab's protocol fields. */
 export interface TabStatusPayload {
   tab_id: string;

@@ -111,7 +111,7 @@ The same JSON is embedded in the copy-paste setup prompt in both READMEs'
 1. **Dashboard never appears** — test the protocol directly, without Claude:
    in a clitab tab run
    `printf '\033]7777;{"e":"tool","tool":"Test"}\033\\'`
-   The tab's third line should read `⚙ Test · 0s`. If it does, the protocol
+   The tab's status line should read `⚙ Test · 0s`. If it does, the protocol
    works and the hook config is the problem — validate your settings JSON
    (`jq . ~/.claude/settings.json`).
 2. **Timer/duration works but no tool names or notice text** — jq is missing;

@@ -79,8 +79,11 @@ export class TimelineTracker {
       // An `auto` thinking is the backend modeling Claude Code's
       // auto-submission of the queue head (no hook re-fires): the queued
       // prompt's turn-start row already exists, so no new row — the caller
-      // flips the existing one via `startQueuedTurn`.
-      if (!status.auto) {
+      // flips the existing one via `startQueuedTurn`. A `system` thinking is
+      // a prompt Claude Code authored itself (an injected task notification):
+      // a real turn, but not the user's input, so it gets no row either —
+      // the backend ships the verdict, the renderer never re-derives it.
+      if (!status.auto && !status.system) {
         const turnStart: TimelineEvent = {
           id: this.nextId++,
           kind: 'turn-start',

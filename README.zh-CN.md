@@ -11,19 +11,10 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 
 ## 截图
 
-![三个标签,每个都是按工作目录命名的真实 shell](docs/screenshots/tabs.png)
+![clitab 整体界面:左侧标签列表、中间运行中的 Claude Code 会话及其仪表盘、右侧会话时间线面板](docs/screenshots/overview.jpg)
 
-每个标签都是一个真实 shell,以工作目录命名 —— 三个项目并排,只占一个窗口。
-
-![在标签中运行的 Claude Code 会话](docs/screenshots/session.png)
-
-在任意标签里运行 `claude`:会话期间标签改用会话自己的标题,回合结束后
-恢复为目录名。
-
-![后台标签因会话需要关注而亮起](docs/screenshots/attention.png)
-
-会话需要你时响铃(BEL / OSC 9),后台标签随之闪烁 —— 一排并行 agent
-的状态,在任何一个标签里都一目了然。
+左侧标签列表以工作目录或 Claude Code 会话名命名每个标签,回合运行时带实时
+计时;中间是会话本身;右侧时间线面板记录你发送的内容。
 
 ## 特性
 
@@ -62,35 +53,8 @@ Claude Code 需要你关注时标签会闪烁,一排并行 agent 的状态一目
 ## 安装 (macOS)
 
 从 [Releases](../../releases) 按芯片下载 `.dmg`——Apple Silicon(M1–M4)选
-`aarch64`,Intel 选 `x64`——把 **clitab** 拖入应用程序。
-
-发布版做了 ad-hoc 签名但**没有 Apple 公证**,而下载来的文件带有隔离属性,
-所以全新下载时 macOS 的 Gatekeeper 会拦两道:`.dmg` 一道、应用一道,
-各需一次**仍要打开**:
-
-1. 双击 `.dmg`,macOS 弹窗拒绝:提示文件"无法打开"/没有权限打开,
-   点**好**;
-2. 打开**系统设置 → 隐私与安全性**,向下滚动到**安全性**区域:
-   "已阻止'clitab_….dmg'以保护你的 Mac"旁边是**仍要打开**按钮,
-   点击并按提示输入密码(或 Touch ID)确认,镜像随即正常挂载;
-3. 把 **clitab** 拖入应用程序。首次打开时应用本身会被同样拦截:
-   回到**隐私与安全性**,在"已阻止'clitab'…"旁点**仍要打开**。
-   均为一次性操作,之后可正常打开。
-
-终端捷径(两道弹窗都跳过):在打开**之前**先清掉下载来的 `.dmg` 的隔离
-属性,从它拷贝出去的应用就不带该属性:
-
-```bash
-xattr -d com.apple.quarantine ~/Downloads/clitab_*.dmg
-```
-
-(macOS 15 Sequoia 起,"右键 → 打开"对这种签名不再能绕过 Gatekeeper,
-请以系统设置里的**仍要打开**为准。)
-
-从源码构建(`npm run package:macos`)不需要上述步骤:产物同样是 ad-hoc
-签名但从不带隔离属性,可以直接打开。
-
-两种构建均为对应芯片原生运行,无需 Rosetta。
+`aarch64`,Intel 选 `x64`——把 **clitab** 拖入应用程序。发布版为 ad-hoc 签名
+但**未公证**,全新下载会被 Gatekeeper 拦两道;[使用手册](https://github.com/dongritengfei/clitab/wiki/%E6%89%8B%E5%86%8C#2-%E5%AE%89%E8%A3%85%E4%B8%8E%E9%A6%96%E6%AC%A1%E5%90%AF%E5%8A%A8)里有两次一次性**仍要打开**的完整步骤,以及跳过两道弹窗的终端捷径。从源码构建(`npm run package:macos`)无需这些步骤。两种构建均为对应芯片原生运行,无需 Rosetta。
 
 ## Claude Code 集成
 

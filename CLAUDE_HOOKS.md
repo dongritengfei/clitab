@@ -15,8 +15,10 @@ timeline. Without jq everything degrades gracefully — turn start/stop and
 flashing still work, only the detail text is missing.
 
 Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`).
-The same JSON is embedded in the copy-paste setup prompt in both READMEs'
-"Claude Code integration" sections — keep the three copies in sync:
+The same JSON is embedded in the copy-paste setup prompts in the wiki manuals
+([Manual](https://github.com/dongritengfei/clitab/wiki/Manual#what-the-hooks-add) /
+[手册](https://github.com/dongritengfei/clitab/wiki/%E6%89%8B%E5%86%8C#hooks-%E5%A2%9E%E5%BC%BA%E7%9A%84%E9%83%A8%E5%88%86))
+— keep the three copies in sync:
 
 ```json
 {

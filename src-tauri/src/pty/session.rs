@@ -197,6 +197,15 @@ impl PtySession {
                     if idle < TURN_IDLE {
                         continue; // still streaming
                     }
+                    // Silence this long with no Stop means the turn is over
+                    // without the hook having fired (an Esc interrupt fires
+                    // none): demote the stale mid-turn record, or the next
+                    // typed prompt lands in its queue as a phantom. The turn
+                    // ended when the output did — backdate past the silence.
+                    let ended_at = now_ms().saturating_sub(idle.as_millis() as u64);
+                    if registry.reconcile_idle_turn(&tab_id, ended_at) {
+                        Self::emit_status(&app, &registry, &tab_id);
+                    }
                     // swap: only the first caller of a turn emits the flash.
                     if !flashed.swap(true, Ordering::Relaxed) {
                         crate::attention::enter_waiting(&app, &registry, &tab_id);

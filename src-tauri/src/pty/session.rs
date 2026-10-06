@@ -150,6 +150,8 @@ impl PtySession {
         // Set when the tab flashed for the current turn — shared between the
         // idle watcher and the hook protocol so an explicit `stop` event can
         // flash immediately without the watcher repeating it 2s later.
+        // Cleared when a new turn starts (`prompt` hook) or the program
+        // title goes away, so the watcher's flash re-arms every turn.
         let flashed = Arc::new(AtomicBool::new(false));
 
         // Reader thread: pump PTY output into the renderer + OSC parser.
@@ -381,7 +383,14 @@ impl PtySession {
     ) {
         let now = now_ms();
         match event {
-            StatusEvent::Prompt { msg } => registry.begin_turn(tab_id, now, msg, idle_gap_ms),
+            StatusEvent::Prompt { msg } => {
+                // A new turn re-arms the watcher's one-shot flash: `flashed`
+                // outliving the turn would silently skip every later
+                // watcher-path flash — an Esc-interrupted turn ends without a
+                // Stop, and the reconcile fall-through is its only flash.
+                flashed.store(false, Ordering::Relaxed);
+                registry.begin_turn(tab_id, now, msg, idle_gap_ms)
+            }
             StatusEvent::Tool { name } => registry.set_tool(tab_id, &name, now),
             StatusEvent::Stop => {
                 let outcome = registry.end_turn(tab_id, now);

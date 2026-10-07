@@ -347,6 +347,14 @@ export function useTabManager(): TabManagerState {
   const writeInput = useCallback(async (tabId: string, data: Uint8Array) => {
     try {
       await invoke('pty_input', { tabId, data: bytesToBase64(data) });
+      // Typing acknowledges the ring, like switchTab does: stop the flash
+      // (the backend clears the waiting dot and the notice on the same
+      // signal). Returning `prev` unchanged keeps ordinary keystrokes — the
+      // tab is almost never flashing — out of React's re-render path.
+      setTabs((prev) => {
+        if (!prev.some((tab) => tab.id === tabId && tab.flashing)) return prev;
+        return prev.map((tab) => (tab.id === tabId ? { ...tab, flashing: false } : tab));
+      });
     } catch (err) {
       // Typing into a tab that just closed is normal; keep it quiet.
       console.debug('pty_input failed:', messageOf(err));
@@ -537,8 +545,11 @@ export function useTabManager(): TabManagerState {
         // as a `thinking` payload with `auto: true` (emitted right after the
         // stop's Done snapshot): no new timeline event, but the queued
         // prompt's row must flip to executing (exact time, badge cleared).
+        // A `system` auto-submission (injected task notification popped from
+        // the queue) has no row of its own and must not flip a genuine
+        // queued user row — skip it entirely.
         const autoSince =
-          payload.status?.kind === 'thinking' && payload.status.auto
+          payload.status?.kind === 'thinking' && payload.status.auto && !payload.status.system
             ? payload.status.since
             : null;
         // A Done payload produces no row either, but its timestamp is the

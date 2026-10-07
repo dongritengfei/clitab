@@ -6,8 +6,12 @@
 export type TabStatus =
   /** `auto`: a turn Claude Code started by itself (auto-submitted queue head
    *  after a stop, hook not re-fired) — modeled by the backend. The renderer
-   *  must not add a timeline row; it flips the queued prompt's existing row. */
-  | { kind: 'thinking'; since: number; msg: string | null; auto: boolean }
+   *  must not add a timeline row; it flips the queued prompt's existing row.
+   *  `system`: the prompt was authored by Claude Code, not the user (an
+   *  injected background-task notification). The turn is real — timer and
+   *  duration apply — but it never gets a timeline row, and its
+   *  auto-submission flips no queued row (there is none). */
+  | { kind: 'thinking'; since: number; msg: string | null; auto: boolean; system: boolean }
   | { kind: 'tool'; name: string; since: number }
   | { kind: 'done'; duration: number | null; at: number };
 

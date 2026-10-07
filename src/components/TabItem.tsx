@@ -138,7 +138,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   const hasStatusRow = tab.status !== null || tab.notice !== null;
   let statusText = '';
   if (tab.notice) {
-    statusText = `⚠ ${tab.notice.msg ?? 'Claude needs attention'}`;
+    statusText = `⚠ ${tab.notice.msg ?? 'Agent needs attention'}`;
   } else if (tab.status?.kind === 'tool') {
     statusText = `⚙ ${tab.status.name} · ${formatDuration(now - tab.status.since)}`;
   } else if (tab.status?.kind === 'thinking') {

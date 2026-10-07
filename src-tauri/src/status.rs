@@ -1,11 +1,12 @@
 //! The clitab hook protocol: OSC 7777 carrying a small JSON payload.
 //!
-//! Claude Code hooks (UserPromptSubmit / PreToolUse / Stop / Notification)
-//! printf these sequences to the tab's PTY; the OSC parser hands us the raw
-//! JSON text and this module gives it meaning. Everything is deliberately
-//! tolerant: unknown event kinds, extra fields (v2 will add token/cost) and
-//! malformed payloads decode to `None` and are silently dropped — a terminal
-//! must never break because a hook emitted something new.
+//! Claude Code and Qoder CLI hooks (UserPromptSubmit / PreToolUse / Stop /
+//! Notification) printf these sequences to the tab's PTY; the OSC parser
+//! hands us the raw JSON text and this module gives it meaning. Everything
+//! is deliberately tolerant: unknown event kinds, extra fields (v2 will add
+//! token/cost) and malformed payloads decode to `None` and are silently
+//! dropped — a terminal must never break because a hook emitted something
+//! new.
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,18 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
     }
 }
 
+/// Classifies a prompt hook's text: Claude Code injects background-task
+/// completion notices (`<task-notification>` XML) through the user prompt
+/// pipeline — the UserPromptSubmit hook fires with the XML as the prompt.
+/// Such a turn is real (Claude processes it) but is not user input, so it is
+/// flagged for the renderer (`Thinking.system`), which keeps it out of the
+/// timeline. A user-typed prompt literally starting with the tag shares the
+/// fate — acceptably rare. This is the single extension point should other
+/// injected wrappers ever need it; do not generalize speculatively.
+pub fn is_injected_prompt(msg: &str) -> bool {
+    msg.trim_start().starts_with("<task-notification>")
+}
+
 /// The turn state shown on a tab's status line. Timestamps are epoch
 /// milliseconds (not `Instant`): the state crosses the IPC boundary and must
 /// still make sense after a webview reload. "Idle" is represented as `None`
@@ -71,13 +84,20 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum TabStatus {
     /// Turn in flight, no tool reported yet. `msg` is the prompt text that
-    /// started the turn, when the hook could supply it. `auto` marks a turn
-    /// Claude Code started by itself: at a stop with a non-empty prompt queue
-    /// it auto-submits the head *without re-firing the hook*, so the backend
-    /// models the submission (registry `begin_auto_turn`). The renderer must
-    /// not add a timeline row for one — the queued prompt's row already exists
-    /// — it flips that row to executing (`startQueuedTurn`).
-    Thinking { since: u64, msg: Option<String>, auto: bool },
+    /// started the turn, when the hook could supply it. The two flags are
+    /// orthogonal — `auto` is about *who submitted*, `system` about *who
+    /// authored*:
+    /// - `auto`: a turn Claude Code started by itself — at a stop with a
+    ///   non-empty prompt queue it auto-submits the head *without re-firing
+    ///   the hook*, so the backend models the submission (registry
+    ///   `begin_auto_turn`). The renderer must not add a timeline row for one
+    ///   — the queued prompt's row already exists — it flips that row to
+    ///   executing (`startQueuedTurn`), unless `system` (no row to flip).
+    /// - `system`: the prompt was authored by Claude Code, not the user
+    ///   (`is_injected_prompt`). The turn is real — timer and duration apply
+    ///   — but the renderer adds no timeline row for it, fresh or popped
+    ///   (`{auto:false, system:true}` and `{auto:true, system:true}`).
+    Thinking { since: u64, msg: Option<String>, auto: bool, system: bool },
     Tool { name: String, since: u64 },
     /// Turn finished; `duration` is None when the start was never observed
     /// (partially installed hooks).
@@ -147,6 +167,21 @@ mod tests {
         );
     }
 
+    /// Background-task completion notices ride the user-prompt pipeline:
+    /// only the exact injected wrapper classifies, and the tag must be
+    /// complete and at the start.
+    #[test]
+    fn injected_prompt_classification() {
+        assert!(is_injected_prompt(
+            "<task-notification>\n<task-id>x</task-id>\n</task-notification>"
+        ));
+        assert!(is_injected_prompt("  \n<task-notification>x</task-notification>"));
+        assert!(!is_injected_prompt("see <task-notification> below"));
+        assert!(!is_injected_prompt("<task-notificationx>"));
+        assert!(!is_injected_prompt("<task-notification"));
+        assert!(!is_injected_prompt("fix the bug"));
+    }
+
     /// The answer hook carries the user's choice from an in-terminal
     /// question; without msg there is nothing to show, so the event is
     /// ignored rather than rendered as an empty row.
@@ -186,11 +221,12 @@ mod tests {
             since: 5,
             msg: Some("hi".into()),
             auto: false,
+            system: false,
         })
         .unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"kind": "thinking", "since": 5, "msg": "hi", "auto": false})
+            serde_json::json!({"kind": "thinking", "since": 5, "msg": "hi", "auto": false, "system": false})
         );
         let json = serde_json::to_value(TabStatus::Tool { name: "Bash".into(), since: 42 }).unwrap();
         assert_eq!(json, serde_json::json!({"kind": "tool", "name": "Bash", "since": 42}));

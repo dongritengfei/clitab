@@ -7,7 +7,7 @@
 //! and means `list_tabs` survives a webview reload with the right titles.
 
 use super::lock;
-use crate::status::{Answer, Notice, TabStatus};
+use crate::status::{is_injected_prompt, Answer, Notice, TabStatus};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -120,14 +120,20 @@ impl Registry {
         }
     }
 
-    /// OSC 7 reported a new working directory.
-    pub fn set_cwd(&self, id: &str, cwd: &str) {
+    /// OSC 7 reported a new working directory. Returns true only when the
+    /// value actually changed: the hook fires on every prompt, and only a
+    /// real change is worth persisting (see the CwdChanged handler).
+    pub fn set_cwd(&self, id: &str, cwd: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.cwd = cwd.to_string();
-            if !tab.has_program_title {
-                tab.title = cwd.to_string();
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.cwd != cwd => {
+                tab.cwd = cwd.to_string();
+                if !tab.has_program_title {
+                    tab.title = cwd.to_string();
+                }
+                true
             }
+            _ => false,
         }
     }
 
@@ -180,6 +186,10 @@ impl Registry {
     pub fn begin_turn(&self, id: &str, now_ms: u64, msg: Option<String>, idle_gap_ms: u64) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+            // Classify from the raw text and keep the msg verbatim: when the
+            // prompt is queued, `begin_auto_turn` re-derives the flag from the
+            // popped text at stop time (a rewritten msg would misclassify it).
+            let system = msg.as_deref().map(is_injected_prompt).unwrap_or(false);
             let running = tab.turn_start.is_some() && idle_gap_ms < IDLE_GAP_MS;
             if running {
                 tab.prompt_queue.push_back(msg.clone());
@@ -194,7 +204,7 @@ impl Registry {
                 tab.prompt_queue.clear();
                 tab.turn_start = Some(now_ms);
             }
-            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: false });
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: false, system });
             tab.notice = None;
         }
     }
@@ -204,7 +214,8 @@ impl Registry {
     pub fn begin_auto_turn(&self, id: &str, now_ms: u64, msg: Option<String>) {
         let mut tabs = lock(&self.tabs);
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: true });
+            let system = msg.as_deref().map(is_injected_prompt).unwrap_or(false);
+            tab.status = Some(TabStatus::Thinking { since: now_ms, msg, auto: true, system });
             tab.turn_start = Some(now_ms);
         }
     }
@@ -264,6 +275,46 @@ impl Registry {
         }
     }
 
+    /// The turn ended without a Stop: an Esc interrupt (or a crashed turn)
+    /// fires no hook, and the live-turn model — turn_start, status, whatever
+    /// sits in prompt_queue — goes stale and poisons what follows: the next
+    /// typed prompt's own keystroke echo keeps `idle_gap` tiny, so it is
+    /// enqueued behind the dead turn instead of starting a fresh one, and its
+    /// real stop then pops the phantom and models a nonexistent auto turn
+    /// (the persistent hourglass over an idle Claude). The attention watcher
+    /// calls this on every PTY silence ≥ `TURN_IDLE`: a live turn repaints
+    /// its spinner constantly, so silence that long proves the turn ended
+    /// when the output did (`ended_at_ms`, the silence start).
+    ///
+    /// Pending dialogs are exempt — their silence is the user deliberating,
+    /// not a dead turn: a permission notice awaits an answer, and an
+    /// `AskUserQuestion` tool turn *is* the question. Returns true only on a
+    /// real demotion, so the watcher's 200ms poll emits once and then stays
+    /// silent (idempotent). A genuinely late Stop arriving afterwards hits
+    /// `end_turn`'s missing-start + already-`Done` guard and is ignored.
+    pub fn reconcile_idle_turn(&self, id: &str, ended_at_ms: u64) -> bool {
+        let mut tabs = lock(&self.tabs);
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab)
+                if tab.turn_start.is_some()
+                    && tab.notice.is_none()
+                    && !matches!(
+                        &tab.status,
+                        Some(TabStatus::Tool { name, .. }) if name.as_str() == "AskUserQuestion"
+                    ) =>
+            {
+                let duration = tab.turn_start.map(|start| ended_at_ms.saturating_sub(start));
+                tab.status = Some(TabStatus::Done { duration, at: ended_at_ms });
+                tab.turn_start = None;
+                // Anything still queued is stale by definition: a real
+                // auto-submission repaints within TURN_IDLE of the stop.
+                tab.prompt_queue.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Notification: park a message for the user without touching the turn
     /// state underneath.
     pub fn set_notice(&self, id: &str, msg: Option<String>, now_ms: u64) {
@@ -281,11 +332,19 @@ impl Registry {
         }
     }
 
-    /// The user switched to the tab and saw the notice.
-    pub fn clear_notice(&self, id: &str) {
+    /// The user has seen the notice: they switched to the tab, or typed into
+    /// it — answering a permission dialog fires no hook event of its own
+    /// (PreToolUse ran *before* the dialog), so the keystroke is the only
+    /// "answered" signal. Returns true only on the Some→None transition, so
+    /// callers know whether a fresh snapshot is worth emitting.
+    pub fn clear_notice(&self, id: &str) -> bool {
         let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.notice = None;
+        match tabs.iter_mut().find(|t| t.id == id) {
+            Some(tab) if tab.notice.is_some() => {
+                tab.notice = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -336,6 +395,18 @@ mod tests {
         let tab = registry.get("t1").unwrap();
         assert!(!tab.has_program_title);
         assert_eq!(tab.title, "/tmp");
+    }
+
+    #[test]
+    fn set_cwd_reports_whether_the_directory_changed() {
+        // OSC 7 fires on every prompt: only a real change may trigger the
+        // last-cwd file write (see the CwdChanged handler in session.rs).
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp/a".into());
+        assert!(!registry.set_cwd("t1", "/tmp/a"), "same cwd is no change");
+        assert!(registry.set_cwd("t1", "/tmp/b"));
+        assert!(!registry.set_cwd("t1", "/tmp/b"), "second report of /tmp/b");
+        assert!(!registry.set_cwd("nope", "/tmp/c"), "unknown tab");
     }
 
     #[test]
@@ -415,7 +486,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()), auto: false })
+            Some(TabStatus::Thinking { since: 1000, msg: Some("fix the bug".into()), auto: false, system: false })
         );
         assert_eq!(tab.turn_start, Some(1000));
 
@@ -447,7 +518,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: false })
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: false, system: false })
         );
         assert_eq!(tab.turn_start, Some(1000), "queued prompt must not restart the clock");
         assert_eq!(tab.prompt_queue.len(), 1);
@@ -472,7 +543,7 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(
             tab.status,
-            Some(TabStatus::Thinking { since: 8000, msg: Some("B".into()), auto: true })
+            Some(TabStatus::Thinking { since: 8000, msg: Some("B".into()), auto: true, system: false })
         );
         assert_eq!(tab.turn_start, Some(8000));
 
@@ -481,6 +552,72 @@ mod tests {
             r.get("t1").unwrap().status,
             Some(TabStatus::Done { duration: Some(4000), at: 12000 }),
             "the auto-started turn gets its own duration and stop"
+        );
+    }
+
+    /// Claude Code injects background-task notifications through the user
+    /// prompt pipeline: the turn is real (the clock runs, the duration is
+    /// reported) but flagged `system` so the renderer keeps it out of the
+    /// timeline.
+    #[test]
+    fn injected_prompt_turn_is_flagged_system_and_keeps_the_clock() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some(xml.into()), 5000);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.turn_start, Some(1000), "the turn is real: the clock runs");
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 1000, msg: Some(xml.into()), auto: false, system: true })
+        );
+        assert_eq!(r.end_turn("t1", 3000), StopOutcome::Idle);
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(2000), at: 3000 })
+        );
+    }
+
+    /// An injected prompt arriving mid-turn is queued like a user one — the
+    /// queue models Claude Code's own, which holds both — without restarting
+    /// the running turn's clock.
+    #[test]
+    fn injected_prompt_queued_mid_turn_keeps_the_running_clock() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 5000, Some(xml.into()), 100);
+        let tab = r.get("t1").unwrap();
+        assert_eq!(tab.turn_start, Some(1000));
+        assert_eq!(tab.prompt_queue.len(), 1);
+        assert_eq!(
+            tab.status,
+            Some(TabStatus::Thinking { since: 5000, msg: Some(xml.into()), auto: false, system: true })
+        );
+    }
+
+    /// Mixed FIFO: the injected head pops first as `{auto, system}` (the
+    /// renderer must NOT flip any row for it), then the user's prompt pops as
+    /// `{auto, system:false}` (its row flips). The raw queue text carries the
+    /// classification across the pop — msg must never be rewritten.
+    #[test]
+    fn mixed_queue_pops_injected_head_then_user_prompt() {
+        let r = status_fixture();
+        let xml = "<task-notification>x</task-notification>";
+        r.begin_turn("t1", 1000, Some("A".into()), 0);
+        r.begin_turn("t1", 2000, Some(xml.into()), 100); // injected, queued
+        r.begin_turn("t1", 3000, Some("P".into()), 100); // user, queued
+        assert_eq!(r.end_turn("t1", 4000), StopOutcome::AutoSubmit(Some(xml.into())));
+        r.begin_auto_turn("t1", 4000, Some(xml.into()));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Thinking { since: 4000, msg: Some(xml.into()), auto: true, system: true })
+        );
+        assert_eq!(r.end_turn("t1", 6000), StopOutcome::AutoSubmit(Some("P".into())));
+        r.begin_auto_turn("t1", 6000, Some("P".into()));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Thinking { since: 6000, msg: Some("P".into()), auto: true, system: false }),
+            "a user's auto-submit must still flip its row"
         );
     }
 
@@ -517,7 +654,7 @@ mod tests {
         assert_eq!(r.end_turn("t1", 5100), StopOutcome::Ignored, "burst duplicate ignored");
         assert_eq!(
             r.get("t1").unwrap().status,
-            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true }),
+            Some(TabStatus::Thinking { since: 5000, msg: Some("B".into()), auto: true, system: false }),
             "the auto turn is still running"
         );
         assert_eq!(r.end_turn("t1", 9000), StopOutcome::Idle, "its real stop, queue empty");
@@ -611,6 +748,79 @@ mod tests {
         let tab = r.get("t1").unwrap();
         assert_eq!(tab.notice, None);
         assert!(matches!(tab.status, Some(TabStatus::Tool { .. })));
+    }
+
+    /// Typing into a tab answers a pending notice (answering a permission
+    /// dialog fires no hook event of its own, so input is the only signal);
+    /// the transition report lets the caller decide whether a fresh
+    /// `tab-status` snapshot is worth emitting — every keystroke goes
+    /// through that path, so a no-op clear must stay silent.
+    #[test]
+    fn clear_notice_reports_the_transition() {
+        let r = status_fixture();
+        assert!(!r.clear_notice("t1"), "no notice: nothing cleared");
+        r.set_notice("t1", Some("needs permission".into()), 200);
+        assert!(r.clear_notice("t1"), "Some→None is the transition");
+        assert!(!r.clear_notice("t1"), "already cleared");
+        assert!(!r.clear_notice("nope"), "unknown tab");
+    }
+
+    /// An Esc interrupt fires no Stop hook, and the stale turn_start used to
+    /// misclassify the user's next typed prompt as queued (the keystroke echo
+    /// keeps idle_gap tiny, so the fresh-turn self-heal never triggers): the
+    /// prompt's real stop then popped the phantom and modeled a nonexistent
+    /// auto turn — the persistent hourglass over an idle Claude. Reconciling
+    /// the missed stop at TURN_IDLE of PTY silence both stamps the interrupted
+    /// turn Done and makes the next prompt classify fresh.
+    #[test]
+    fn reconciling_a_missed_stop_prevents_the_phantom_auto_turn() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, Some("essay".into()), 5000);
+        // The user interrupts; no Stop ever arrives. PTY silence starts at 3000.
+        assert!(r.reconcile_idle_turn("t1", 3000));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(2000), at: 3000 })
+        );
+        // The next prompt arrives with a tiny gap (typing echo): fresh turn,
+        // not a phantom queue entry behind the dead one.
+        r.begin_turn("t1", 10_000, Some("hi".into()), 14);
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 0);
+        // Its stop is the real end: Idle, not a phantom AutoSubmit.
+        assert!(matches!(r.end_turn("t1", 20_000), StopOutcome::Idle));
+        assert_eq!(
+            r.get("t1").unwrap().status,
+            Some(TabStatus::Done { duration: Some(10_000), at: 20_000 })
+        );
+    }
+
+    /// Silence during a pending dialog is the user deliberating, not a missed
+    /// stop: a permission notice or an AskUserQuestion turn must survive
+    /// reconciliation untouched. A regular tool turn must not — and stale
+    /// queue entries die with it (2s of silence proves no auto turn runs: a
+    /// live one repaints its spinner constantly).
+    #[test]
+    fn reconcile_skips_dialogs_and_clears_stale_queues() {
+        let r = status_fixture();
+        r.begin_turn("t1", 1000, None, 5000);
+        // Permission dialog: notice pending.
+        r.set_notice("t1", Some("needs permission".into()), 1500);
+        assert!(!r.reconcile_idle_turn("t1", 4000));
+        assert!(matches!(r.get("t1").unwrap().status, Some(TabStatus::Thinking { .. })));
+        // In-terminal question: no notice, but the tool says it all.
+        r.clear_notice("t1");
+        r.set_tool("t1", "AskUserQuestion", 2000);
+        assert!(!r.reconcile_idle_turn("t1", 5000));
+        assert!(matches!(r.get("t1").unwrap().status, Some(TabStatus::Tool { .. })));
+        // A regular tool turn does reconcile, taking stale queue entries along.
+        r.begin_turn("t1", 6000, Some("queued".into()), 10);
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 1);
+        r.set_tool("t1", "Bash", 6500);
+        assert!(r.reconcile_idle_turn("t1", 9000));
+        assert_eq!(r.get("t1").unwrap().prompt_queue.len(), 0);
+        // Already-idle states and unknown tabs are no-ops.
+        assert!(!r.reconcile_idle_turn("t1", 9500));
+        assert!(!r.reconcile_idle_turn("nope", 9500));
     }
 
     #[test]

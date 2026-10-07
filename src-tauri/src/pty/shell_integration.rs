@@ -26,13 +26,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Sourced after the user's own rc file. Reports the working directory on every
-/// prompt (OSC 7) and, when the previous command looked like `claude`, signals
-/// that the assistant's turn is over (OSC 9).
+/// prompt (OSC 7) and, when the previous command looked like an agent CLI
+/// (`claude`, `qodercli`), signals that the assistant's turn is over (OSC 9).
+/// The event name stays `claude-done` for both agents — it is a protocol-level
+/// identifier, not a brand statement.
 const ZSH_SNIPPET: &str = r#"# clitab shell integration
 _clitab_claude_running=0
 _clitab_preexec() {
     case "$1" in
-        *[cC]laude*) _clitab_claude_running=1 ;;
+        *[cC]laude*|*[qQ]oder*) _clitab_claude_running=1 ;;
     esac
 }
 _clitab_precmd() {
@@ -51,7 +53,7 @@ const BASH_SNIPPET: &str = r#"# clitab shell integration
 _clitab_claude_running=0
 _clitab_preexec() {
     case "$BASH_COMMAND" in
-        *[cC]laude*) _clitab_claude_running=1 ;;
+        *[cC]laude*|*[qQ]oder*) _clitab_claude_running=1 ;;
     esac
 }
 _clitab_prompt() {
@@ -582,6 +584,35 @@ mod tests {
             2,
             "every prompt should report the cwd:\n{output}"
         );
+    }
+
+    /// Qoder CLI is a second agent whose exit must trigger the same title
+    /// revert, so its invocation has to raise the flag in both shells.
+    #[cfg(unix)]
+    #[test]
+    fn qoder_done_is_reported_once_per_turn() {
+        for (shell, rc_name, prompt_fn) in [
+            ("/bin/bash", "bashrc", "_clitab_prompt"),
+            ("/bin/zsh", ".zshrc", "_clitab_precmd"),
+        ] {
+            let name = Path::new(shell)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let script = format!("_clitab_preexec 'qodercli'; {prompt_fn}; {prompt_fn}");
+            let Some(output) =
+                source_wrapper(&format!("probe-qoder-{name}"), shell, rc_name, &script)
+            else {
+                eprintln!("skipped: {shell} unavailable");
+                continue;
+            };
+            assert_eq!(
+                output.matches("\u{1b}]9;claude-done").count(),
+                1,
+                "{shell}: expected exactly one done notification after qodercli:\n{output}"
+            );
+        }
     }
 
     /// The wrapper and the OSC parser were written independently, so nothing yet

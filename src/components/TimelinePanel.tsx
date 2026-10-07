@@ -71,7 +71,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
           <div className="timeline-empty">
             <p>No events yet</p>
             <p className="timeline-empty-hint">
-              Claude Code hooks report turn events — see CLAUDE_HOOKS.md for the one-time setup.
+              Agent hooks (Claude Code / Qoder CLI) report turn events — see AGENT_HOOKS.md for the one-time setup.
             </p>
           </div>
         ) : (

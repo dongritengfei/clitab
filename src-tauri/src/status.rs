@@ -1,11 +1,12 @@
 //! The clitab hook protocol: OSC 7777 carrying a small JSON payload.
 //!
-//! Claude Code hooks (UserPromptSubmit / PreToolUse / Stop / Notification)
-//! printf these sequences to the tab's PTY; the OSC parser hands us the raw
-//! JSON text and this module gives it meaning. Everything is deliberately
-//! tolerant: unknown event kinds, extra fields (v2 will add token/cost) and
-//! malformed payloads decode to `None` and are silently dropped — a terminal
-//! must never break because a hook emitted something new.
+//! Claude Code and Qoder CLI hooks (UserPromptSubmit / PreToolUse / Stop /
+//! Notification) printf these sequences to the tab's PTY; the OSC parser
+//! hands us the raw JSON text and this module gives it meaning. Everything
+//! is deliberately tolerant: unknown event kinds, extra fields (v2 will add
+//! token/cost) and malformed payloads decode to `None` and are silently
+//! dropped — a terminal must never break because a hook emitted something
+//! new.
 
 use serde::{Deserialize, Serialize};
 

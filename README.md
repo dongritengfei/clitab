@@ -2,10 +2,10 @@
 
 [中文 README](README.zh-CN.md) · 📖 [User Manual (Wiki)](https://github.com/dongritengfei/clitab/wiki/Manual)
 
-A tabbed terminal built for Claude Code sessions: every tab is a real PTY
-running your shell, named after its working directory — or after the session,
-once Claude Code gives it a title. Tabs flash when Claude Code needs your
-attention, so a row of parallel agents stays glanceable.
+A tabbed terminal built for agent CLI sessions (Claude Code, Qoder CLI):
+every tab is a real PTY running your shell, named after its working directory
+— or after the session, once the agent gives it a title. Tabs flash when a
+session needs your attention, so a row of parallel agents stays glanceable.
 
 Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 [xterm.js](https://xtermjs.org).
@@ -14,18 +14,18 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 
 ![clitab overview: the tab list, a live Claude Code session with its dashboard, and the session timeline panel](docs/screenshots/overview.jpg)
 
-The tab list (left) names every tab after its working directory or its Claude
-Code session, with a live timer while a turn runs; the session itself runs in
+The tab list (left) names every tab after its working directory or its agent
+session, with a live timer while a turn runs; the session itself runs in
 the middle; the timeline panel (right) logs what you sent.
 
 ## Features
 
 - **Real PTY tabs** named after their working directory — or after the
-  Claude Code session running in them.
+  agent session (Claude Code, Qoder CLI) running in them.
 - **Attention flash and triage** — flashing tabs, a Dock badge, `⌘J` and
   macOS notifications pointing you at the sessions waiting on you.
 - **Tab dashboard and session timeline** — live tool timer, turn duration
-  and a log of what you sent, via the optional Claude Code hooks.
+  and a log of what you sent, via the optional agent hooks.
 - **Open from Finder** — Services → "New clitab Tab Here".
 - **Terminal search, desktop-grade shortcuts, 5000-line scrollback.**
 
@@ -41,15 +41,18 @@ so a fresh download trips macOS Gatekeeper twice; the
 [User Manual](https://github.com/dongritengfei/clitab/wiki/Manual#2-installation-and-first-launch)
 walks through both one-time **Open Anyway** clicks.
 
-## Claude Code integration
+## Agent integration
 
-Run `claude` in any tab like you would in a normal terminal — clitab picks up
-the session title from the escape sequences Claude Code already emits.
+Run `claude` or `qodercli` in any tab like you would in a normal terminal —
+clitab picks up the session title from the escape sequences the agent already
+emits.
 
 The attention flash, the tab dashboard and the session timeline are powered by
-Claude Code hooks; the
+agent hooks: the
 [User Manual](https://github.com/dongritengfei/clitab/wiki/Manual#what-the-hooks-add)
-has a copy-paste prompt that sets them up for you.
+has a copy-paste prompt that sets up the Claude Code side, and
+[AGENT_HOOKS.md](AGENT_HOOKS.md) carries both configs (Claude Code and Qoder
+CLI) plus the protocol details.
 
 ## Shortcuts
 

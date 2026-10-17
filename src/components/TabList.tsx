@@ -23,6 +23,8 @@ interface DragState {
 }
 
 interface TabListProps {
+  /** Column width in px, dragged via the splitter beside the list (App.tsx). */
+  width: number;
   tabs: Tab[];
   activeTabId: string | null;
   /** Activate without moving focus out of the list; used by arrow navigation. */
@@ -39,6 +41,7 @@ interface TabListProps {
 }
 
 export const TabList: React.FC<TabListProps> = ({
+  width,
   tabs,
   activeTabId,
   onTabClick,
@@ -215,7 +218,7 @@ export const TabList: React.FC<TabListProps> = ({
   };
 
   return (
-    <nav className="tab-list" aria-label="Terminals">
+    <nav className="tab-list" aria-label="Terminals" style={{ width }}>
       <div className="tab-list-header">
         <span>CLI Tabs</span>
       </div>

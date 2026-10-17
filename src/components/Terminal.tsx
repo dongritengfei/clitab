@@ -7,6 +7,9 @@ import { registerTerm, unregisterTerm } from '../lib/termRegistry';
 interface TerminalProps {
   tabId: string;
   isActive: boolean;
+  /** xterm font size, shared by every terminal (View ▸ Zoom, persisted by
+   * useTabManager). Changes apply live via `options.fontSize` + refit. */
+  fontSize: number;
   /** Subscribe to this tab's output; resolves once the live stream is flowing.
    * `done` (fence writes only) fires once xterm has parsed that write and
    * everything queued before it. */
@@ -110,6 +113,7 @@ function classifyReplay(bytes: Uint8Array): ReplayKind {
 export const Terminal: React.FC<TerminalProps> = ({
   tabId,
   isActive,
+  fontSize,
   attach,
   detach,
   onInput,
@@ -123,6 +127,10 @@ export const Terminal: React.FC<TerminalProps> = ({
   // on every parent render).
   const callbacks = useRef({ attach, detach, onInput, onResize });
   callbacks.current = { attach, detach, onInput, onResize };
+  // Same for the font size: the creation effect reads the current value
+  // through a ref; live changes go through the dedicated effect below.
+  const fontSizeRef = useRef(fontSize);
+  fontSizeRef.current = fontSize;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -136,7 +144,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       // without this flag the call throws instead of returning a decoration.
       allowProposedApi: true,
       cursorBlink: true,
-      fontSize: 14,
+      fontSize: fontSizeRef.current,
       // JetBrains Mono and the Nerd-patched fallback are bundled with the app
       // (see main.tsx / App.css), so the stack resolves the same everywhere —
       // Ghostty-like metrics, and powerline/devicon PUA glyphs always render
@@ -397,6 +405,23 @@ export const Terminal: React.FC<TerminalProps> = ({
       term.dispose();
     };
   }, [tabId]);
+
+  // A font zoom (View menu) applies to every mounted terminal live. The cell
+  // size changed but the container's box did not, so the ResizeObserver stays
+  // silent — refit explicitly; fit feeds the debounced PTY resize via the
+  // onResize path above. An unmeasurable container is skipped (same guard as
+  // the observer's fit); the option is set either way, so the next fit picks
+  // it up.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    const container = containerRef.current;
+    if (!container || container.offsetWidth < MIN_SIZE || container.offsetHeight < MIN_SIZE) {
+      return;
+    }
+    fitRef.current?.fit();
+  }, [fontSize]);
 
   // A tab that was hidden gets its box back on activation; ResizeObserver is
   // not guaranteed to fire for a display:none -> block change, so fit directly.

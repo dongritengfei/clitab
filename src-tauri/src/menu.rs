@@ -23,13 +23,27 @@ pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
 pub const NEXT_WAITING: &str = "next-waiting";
 pub const FIND: &str = "find";
+pub const ZOOM_IN: &str = "zoom-in";
+pub const ZOOM_OUT: &str = "zoom-out";
+pub const ZOOM_RESET: &str = "zoom-reset";
 
 /// Menu ids we forward to the renderer (`FIND` opens its terminal search
-/// bar). Everything else is handled natively: `QUIT` in `lib.rs` (quit
-/// confirmation), copy/paste/minimize/... by predefined menu items.
-fn is_tab_action(id: &str) -> bool {
-    matches!(id, NEW_TAB | CLOSE_TAB | NEXT_TAB | PREV_TAB | NEXT_WAITING | FIND)
-        || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
+/// bar; the zoom items adjust the renderer's terminal font size). Everything
+/// else is handled natively: `QUIT` in `lib.rs` (quit confirmation),
+/// copy/paste/minimize/... by predefined menu items.
+fn is_renderer_action(id: &str) -> bool {
+    matches!(
+        id,
+        NEW_TAB
+            | CLOSE_TAB
+            | NEXT_TAB
+            | PREV_TAB
+            | NEXT_WAITING
+            | FIND
+            | ZOOM_IN
+            | ZOOM_OUT
+            | ZOOM_RESET
+    ) || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
 }
 
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -104,6 +118,21 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .build()?;
     menu = menu.item(&edit);
 
+    // Terminal font zoom, the standard macOS terminal gesture (iTerm2/Ghostty).
+    // Accelerators are muda code names: "Equal" is the physical key that reads
+    // ⌘+ unshifted, so Zoom In shows as ⌘= and matches the code, not the
+    // shifted glyph (⌘⇧= does not fire). The renderer owns the font size; it
+    // clamps and persists it.
+    let zoom_in = item(app, ZOOM_IN, "Zoom In", "CmdOrCtrl+Equal")?;
+    let zoom_out = item(app, ZOOM_OUT, "Zoom Out", "CmdOrCtrl+Minus")?;
+    let zoom_reset = item(app, ZOOM_RESET, "Actual Size", "CmdOrCtrl+Digit0")?;
+    let view = SubmenuBuilder::new(app, "View")
+        .item(&zoom_in)
+        .item(&zoom_out)
+        .item(&zoom_reset)
+        .build()?;
+    menu = menu.item(&view);
+
     #[cfg(target_os = "macos")]
     {
         let window = SubmenuBuilder::new(app, "Window")
@@ -130,7 +159,7 @@ fn item<R: Runtime>(
 
 /// Forward a menu click to the renderer.
 pub fn forward(app: &AppHandle, id: &str) {
-    if !is_tab_action(id) {
+    if !is_renderer_action(id) {
         return;
     }
     let _ = app.emit("menu-shortcut", serde_json::json!({ "id": id }));
@@ -141,25 +170,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tab_actions_are_forwarded() {
-        assert!(is_tab_action(NEW_TAB));
-        assert!(is_tab_action(CLOSE_TAB));
-        assert!(is_tab_action(NEXT_TAB));
-        assert!(is_tab_action(PREV_TAB));
-        assert!(is_tab_action(NEXT_WAITING));
-        assert!(is_tab_action(FIND));
-        assert!(is_tab_action("select-tab-1"));
-        assert!(is_tab_action("select-tab-9"));
+    fn renderer_actions_are_forwarded() {
+        assert!(is_renderer_action(NEW_TAB));
+        assert!(is_renderer_action(CLOSE_TAB));
+        assert!(is_renderer_action(NEXT_TAB));
+        assert!(is_renderer_action(PREV_TAB));
+        assert!(is_renderer_action(NEXT_WAITING));
+        assert!(is_renderer_action(FIND));
+        assert!(is_renderer_action(ZOOM_IN));
+        assert!(is_renderer_action(ZOOM_OUT));
+        assert!(is_renderer_action(ZOOM_RESET));
+        assert!(is_renderer_action("select-tab-1"));
+        assert!(is_renderer_action("select-tab-9"));
     }
 
     #[test]
-    fn non_tab_items_are_left_to_the_platform() {
+    fn non_renderer_items_are_left_to_the_platform() {
         // Quit is handled in lib.rs (confirmation), never forwarded.
-        assert!(!is_tab_action(QUIT));
-        assert!(!is_tab_action("tauri::copy"));
-        assert!(!is_tab_action("tauri::minimize"));
+        assert!(!is_renderer_action(QUIT));
+        assert!(!is_renderer_action("tauri::copy"));
+        assert!(!is_renderer_action("tauri::minimize"));
         // Guard against a prefix that is not one of our numbered ids.
-        assert!(!is_tab_action(SELECT_TAB));
-        assert!(!is_tab_action("select-tab"));
+        assert!(!is_renderer_action(SELECT_TAB));
+        assert!(!is_renderer_action("select-tab"));
     }
 }

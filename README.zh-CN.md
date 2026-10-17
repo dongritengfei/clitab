@@ -23,6 +23,7 @@
 - **关注闪烁与分诊** —— 标签闪烁、Dock 角标、⌘J 与 macOS 通知,指向等你输入的会话。
 - **标签仪表盘与会话时间线** —— 实时工具计时、回合耗时与你发送内容的记录,由可选的 agent hooks 提供。
 - **从 Finder 打开** —— 服务 → "New clitab Tab Here"。
+- **可调布局与字号** —— 拖拽三栏之间的分割线调整宽度(双击复位);⌘= / ⌘- / ⌘0 缩放终端文字。
 - **终端搜索、桌面级快捷键、5000 行回滚缓冲。**
 
 各项用法见[使用手册](https://github.com/dongritengfei/clitab/wiki/%E6%89%8B%E5%86%8C)。
@@ -43,7 +44,7 @@ Claude Code 配置提示词;两份配置(Claude Code 与 Qoder CLI)及协议细�
 
 ## 快捷键
 
-⌘T / W / Tab / ⌘J / ⌘1–9 / ⌘F / ⌘C / V / A —— 完整表格及其无需
+⌘T / W / Tab / ⌘J / ⌘1–9 / ⌘F / ⌘= / − / 0 / ⌘C / V / A —— 完整表格及其无需
 终端焦点即可生效的原因,见[使用手册](https://github.com/dongritengfei/clitab/wiki/%E6%89%8B%E5%86%8C#11-%E9%94%AE%E7%9B%98%E5%BF%AB%E6%8D%B7%E9%94%AE)。
 
 ## 开发

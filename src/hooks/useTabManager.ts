@@ -18,6 +18,7 @@ import {
   type TabWaitingPayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
+import { loadNumber, saveNumber } from '../lib/prefs';
 import { getTerm } from '../lib/termRegistry';
 import {
   MAX_TIMELINE_EVENTS,
@@ -45,6 +46,13 @@ const FENCE = new Uint8Array(0);
 const HIGHLIGHT_MS = 1200;
 /** Same color as xterm's selectionBackground (Catppuccin surface2, translucent). */
 const HIGHLIGHT_COLOR = '#585b7066';
+
+/** Terminal font size preference (View ▸ Zoom In / Zoom Out / Actual Size),
+ * shared by every terminal and persisted across restarts. */
+const FONT_SIZE_KEY = 'clitab.terminalFontSize';
+const FONT_SIZE_DEFAULT = 14;
+const FONT_SIZE_MIN = 10;
+const FONT_SIZE_MAX = 24;
 
 function toTab(response: TabResponse): Tab {
   return { ...response, flashing: false };
@@ -78,6 +86,8 @@ export interface TabManagerState {
    * like the timeline. */
   searchNonce: number;
   closeSearch: () => void;
+  /** xterm font size shared by every terminal (View ▸ Zoom, persisted). */
+  terminalFontSize: number;
   /** Per-tab timeline of key hook-protocol events (renderer-only history). */
   timelines: Record<string, TimelineEvent[]>;
   /** Keys `${tabId}:${eventId}` whose terminal line left the scrollback. */
@@ -99,6 +109,9 @@ export function useTabManager(): TabManagerState {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchNonce, setSearchNonce] = useState(0);
+  const [terminalFontSize, setTerminalFontSize] = useState(() =>
+    loadNumber(FONT_SIZE_KEY, FONT_SIZE_MIN, FONT_SIZE_MAX, FONT_SIZE_DEFAULT)
+  );
   const [timelines, setTimelines] = useState<Record<string, TimelineEvent[]>>({});
   const [staleEvents, setStaleEvents] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -332,6 +345,26 @@ export function useTabManager(): TabManagerState {
   const openSearch = useCallback(() => setSearchNonce((n) => n + 1), []);
   const closeSearch = useCallback(() => setSearchNonce(0), []);
 
+  // ⌘=/⌘−/⌘0 (View menu): the zoom applies to every mounted terminal at
+  // once. Computed from a ref mirror, not the state updater, so consecutive
+  // zooms inside one render batch (key repeat outpaces re-renders) each move
+  // one step; persisted on every accepted change.
+  const fontSizeRef = useRef(terminalFontSize);
+  fontSizeRef.current = terminalFontSize;
+  const zoomTerminalFont = useCallback((delta: number) => {
+    const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, fontSizeRef.current + delta));
+    if (next === fontSizeRef.current) return;
+    fontSizeRef.current = next;
+    setTerminalFontSize(next);
+    saveNumber(FONT_SIZE_KEY, next);
+  }, []);
+  const resetTerminalFont = useCallback(() => {
+    if (fontSizeRef.current === FONT_SIZE_DEFAULT) return;
+    fontSizeRef.current = FONT_SIZE_DEFAULT;
+    setTerminalFontSize(FONT_SIZE_DEFAULT);
+    saveNumber(FONT_SIZE_KEY, FONT_SIZE_DEFAULT);
+  }, []);
+
   const attachTab = useCallback(
     async (tabId: string, handler: OutputHandler) => {
       // Anything arriving while we catch up is queued, so the replay is always
@@ -502,6 +535,8 @@ export function useTabManager(): TabManagerState {
     switchTab,
     jumpToNextWaiting,
     openSearch,
+    zoomTerminalFont,
+    resetTerminalFont,
   };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
@@ -761,6 +796,15 @@ export function useTabManager(): TabManagerState {
             // nothing to search and no caret to hand focus back to.
             if (activeTabRef.current) actions.openSearch();
             break;
+          case 'zoom-in':
+            actions.zoomTerminalFont(1);
+            break;
+          case 'zoom-out':
+            actions.zoomTerminalFont(-1);
+            break;
+          case 'zoom-reset':
+            actions.resetTerminalFont();
+            break;
         }
       }),
       // A tab the backend created itself: the delayed startup tab, or the
@@ -807,6 +851,7 @@ export function useTabManager(): TabManagerState {
     resizePty,
     searchNonce,
     closeSearch,
+    terminalFontSize,
     timelines,
     staleEvents,
     navigateToEvent,

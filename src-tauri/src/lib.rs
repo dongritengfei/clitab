@@ -90,6 +90,17 @@ fn close_tab(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
     state.tab_manager.close_tab(&tab_id).map_err(ipc_error)
 }
 
+/// The renderer dropped a dragged tab at `to_index` (remove-then-insert,
+/// matching its own local array move): persist the order so a webview reload
+/// restores the user's arrangement instead of the creation order.
+#[tauri::command]
+fn reorder_tab(state: State<'_, AppState>, tab_id: String, to_index: usize) -> Result<(), String> {
+    state
+        .tab_manager
+        .reorder_tab(&tab_id, to_index)
+        .map_err(ipc_error)
+}
+
 #[tauri::command]
 fn list_tabs(state: State<'_, AppState>) -> Result<Vec<TabResponse>, String> {
     Ok(state
@@ -271,6 +282,7 @@ pub fn run() {
             create_tab,
             close_tab,
             list_tabs,
+            reorder_tab,
             pty_input,
             resize_pty,
             attach_stream,

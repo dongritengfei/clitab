@@ -90,6 +90,17 @@ fn close_tab(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
     state.tab_manager.close_tab(&tab_id).map_err(ipc_error)
 }
 
+/// The renderer dropped a dragged tab at `to_index` (remove-then-insert,
+/// matching its own local array move): persist the order so a webview reload
+/// restores the user's arrangement instead of the creation order.
+#[tauri::command]
+fn reorder_tab(state: State<'_, AppState>, tab_id: String, to_index: usize) -> Result<(), String> {
+    state
+        .tab_manager
+        .reorder_tab(&tab_id, to_index)
+        .map_err(ipc_error)
+}
+
 #[tauri::command]
 fn list_tabs(state: State<'_, AppState>) -> Result<Vec<TabResponse>, String> {
     Ok(state
@@ -179,6 +190,34 @@ fn confirm_quit(app: &AppHandle, quit_confirmed: Arc<AtomicBool>) {
         });
 }
 
+/// Stretch the main window to the full height of its screen's work area:
+/// the menu bar and Dock insets are per-user settings, so no static
+/// `height` in tauri.conf.json can fill the screen. The configured size is
+/// applied first and stays the fallback for when the work area cannot be
+/// queried; the width keeps its configured value (clamped to the work area)
+/// and re-centers horizontally, while the top edge lands flush under the
+/// menu bar.
+fn fill_work_area(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let Ok(inner) = window.inner_size() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let work = monitor.work_area();
+    let work_width = work.size.width as f64 / scale;
+    let width = (inner.width as f64 / scale).min(work_width);
+    let x = work.position.x as f64 / scale + (work_width - width) / 2.0;
+    let y = work.position.y as f64 / scale;
+    let height = work.size.height as f64 / scale;
+    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let quit_confirmed = Arc::new(AtomicBool::new(false));
@@ -213,6 +252,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            fill_work_area(app);
             let tab_manager = Arc::new(TabManager::new(app.handle().clone()));
             app.manage(AppState {
                 tab_manager: tab_manager.clone(),
@@ -271,6 +311,7 @@ pub fn run() {
             create_tab,
             close_tab,
             list_tabs,
+            reorder_tab,
             pty_input,
             resize_pty,
             attach_stream,

@@ -22,11 +22,14 @@ the middle; the timeline panel (right) logs what you sent.
 
 - **Real PTY tabs** named after their working directory — or after the
   agent session (Claude Code, Qoder CLI) running in them.
+- **Drag to reorder tabs** — the `⌘1–9` shortcuts follow the new arrangement.
 - **Attention flash and triage** — flashing tabs, a Dock badge, `⌘J` and
   macOS notifications pointing you at the sessions waiting on you.
 - **Tab dashboard and session timeline** — live tool timer, turn duration
   and a log of what you sent, via the optional agent hooks.
 - **Open from Finder** — Services → "New clitab Tab Here".
+- **Resizable layout and font zoom** — drag the dividers between the three
+  columns (double-click to reset); `⌘=` / `⌘-` / `⌘0` zoom the terminal text.
 - **Terminal search, desktop-grade shortcuts, 5000-line scrollback.**
 
 How each of these works is covered in the
@@ -56,8 +59,9 @@ CLI) plus the protocol details.
 
 ## Shortcuts
 
-`⌘T` / `⌘W` / `⌃Tab` / `⌘J` / `⌘1–9` / `⌘F` / `⌘C` / `⌘V` / `⌘A` — the
-full table, and why they work even without terminal focus, is in the
+`⌘T` / `⌘W` / `⌃Tab` / `⌘J` / `⌘1–9` / `⌘F` / `⌘=` / `⌘-` / `⌘0` / `⌘C` /
+`⌘V` / `⌘A` — the full table, and why they work even without terminal focus,
+is in the
 [User Manual](https://github.com/dongritengfei/clitab/wiki/Manual#11-keyboard-shortcuts).
 
 ## Development

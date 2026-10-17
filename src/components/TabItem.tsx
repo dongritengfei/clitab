@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Tab } from '../types';
 
 interface TabItemProps {
@@ -8,14 +8,16 @@ interface TabItemProps {
   /** Total number of tabs; with index decides the ⌘<number> badge. */
   count: number;
   isActive: boolean;
+  /** Being dragged to a new position (see TabList's press→drag gesture). */
+  isDragging?: boolean;
   onClick: () => void;
   onClose: () => void;
 }
 
 /** Approximate advance width of one character at the tab title's font size. */
-const CHAR_WIDTH = 7.2;
+const CHAR_WIDTH = 7.7;
 /** Same, at the smaller cwd line's font size. */
-const CWD_CHAR_WIDTH = 6.1;
+const CWD_CHAR_WIDTH = 6.6;
 /** Space reserved for the non-text parts of a row: 3px border-left +
  *  16px/4px padding + 16px badge + 2×4px gaps + 20px close button. */
 const CHROME_WIDTH = 67;
@@ -79,6 +81,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   index,
   count,
   isActive,
+  isDragging = false,
   onClick,
   onClose,
 }) => {
@@ -97,7 +100,10 @@ export const TabItem: React.FC<TabItemProps> = ({
   // budget keeps the title ellipsis accurate either way.
   const chromeWidth = CHROME_WIDTH + (tab.waiting ? WAITING_DOT_WIDTH : 0);
 
-  useLayoutEffect(() => {
+  // The ellipsis budget is *measured*, so two unrelated things invalidate it:
+  // the props below, and the row's width changing under the sidebar splitter
+  // drag (no prop reflects that — hence the ResizeObserver).
+  const recomputeTruncation = useCallback(() => {
     const container = containerRef.current;
     const available = container
       ? Math.floor((container.offsetWidth - chromeWidth) / CHAR_WIDTH)
@@ -109,6 +115,16 @@ export const TabItem: React.FC<TabItemProps> = ({
       : 0;
     setDisplayCwd(container ? shortenPath(tab.cwd, cwdAvailable) : tab.cwd);
   }, [tab.title, tab.cwd, isPath, chromeWidth]);
+
+  useLayoutEffect(recomputeTruncation, [recomputeTruncation]);
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver(recomputeTruncation);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [recomputeTruncation]);
 
   // Live elapsed timer: only mounted while a turn is actually ticking, so
   // idle tabs cost nothing.
@@ -154,7 +170,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   return (
     <div
       ref={containerRef}
-      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''} ${tab.waiting ? 'waiting' : ''}`}
+      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''} ${tab.waiting ? 'waiting' : ''} ${isDragging ? 'dragging' : ''}`}
       // Tabs are switched with the keyboard too, so make them reachable.
       role="tab"
       id={`tab-${tab.id}`}

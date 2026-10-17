@@ -18,6 +18,7 @@ import {
   type TabWaitingPayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
+import { loadNumber, saveNumber } from '../lib/prefs';
 import { getTerm } from '../lib/termRegistry';
 import {
   MAX_TIMELINE_EVENTS,
@@ -46,12 +47,22 @@ const HIGHLIGHT_MS = 1200;
 /** Same color as xterm's selectionBackground (Catppuccin surface2, translucent). */
 const HIGHLIGHT_COLOR = '#585b7066';
 
+/** Terminal font size preference (View ▸ Zoom In / Zoom Out / Actual Size),
+ * shared by every terminal and persisted across restarts. */
+const FONT_SIZE_KEY = 'clitab.terminalFontSize';
+const FONT_SIZE_DEFAULT = 14;
+const FONT_SIZE_MIN = 10;
+const FONT_SIZE_MAX = 24;
+
 function toTab(response: TabResponse): Tab {
   return { ...response, flashing: false };
 }
 
 export interface TabManagerState {
   tabs: Tab[];
+  /** The same tabs in pane mount order. Terminal panes render from this list
+   * so a sidebar reorder never moves their DOM — see `paneIds`. */
+  panes: Tab[];
   activeTabId: string | null;
   error: string | null;
   dismissError: () => void;
@@ -61,6 +72,10 @@ export interface TabManagerState {
   switchTab: (tabId: string) => void;
   selectTabByIndex: (index: number) => void;
   cycleTab: (direction: 1 | -1) => void;
+  /** Move a tab to `toIndex` (remove-then-insert). Local order updates
+   * immediately; `persist` also writes the arrangement to the registry, so a
+   * webview reload restores the user's order. */
+  reorderTab: (tabId: string, toIndex: number, persist?: boolean) => void;
   /** Subscribe `handler` to a tab's output, after replaying what it missed. */
   attachTab: (tabId: string, handler: OutputHandler) => Promise<void>;
   detachTab: (tabId: string) => void;
@@ -71,6 +86,8 @@ export interface TabManagerState {
    * like the timeline. */
   searchNonce: number;
   closeSearch: () => void;
+  /** xterm font size shared by every terminal (View ▸ Zoom, persisted). */
+  terminalFontSize: number;
   /** Per-tab timeline of key hook-protocol events (renderer-only history). */
   timelines: Record<string, TimelineEvent[]>;
   /** Keys `${tabId}:${eventId}` whose terminal line left the scrollback. */
@@ -81,9 +98,20 @@ export interface TabManagerState {
 
 export function useTabManager(): TabManagerState {
   const [tabs, setTabs] = useState<Tab[]>([]);
+  // Tab ids in pane mount order — appended/removed alongside `tabs`, but
+  // NEVER reordered. React moves keyed DOM nodes when a list's order changes,
+  // and detaching a scrolled `.xterm-viewport` resets its scrollTop: a sidebar
+  // drag would silently rewind every moved terminal to the top on its next
+  // wheel scroll (xterm's wheel handler works off scrollTop). Panes are an
+  // absolute-positioned stack where DOM order is invisible, so they render in
+  // this stable order while `tabs` alone carries the user's arrangement.
+  const [paneIds, setPaneIds] = useState<string[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchNonce, setSearchNonce] = useState(0);
+  const [terminalFontSize, setTerminalFontSize] = useState(() =>
+    loadNumber(FONT_SIZE_KEY, FONT_SIZE_MIN, FONT_SIZE_MAX, FONT_SIZE_DEFAULT)
+  );
   const [timelines, setTimelines] = useState<Record<string, TimelineEvent[]>>({});
   const [staleEvents, setStaleEvents] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -122,6 +150,17 @@ export function useTabManager(): TabManagerState {
   tabsRef.current = tabs;
   activeTabRef.current = safeActiveTabId;
 
+  // The pane list rebuilt from the mount-order ids: its *order* comes from
+  // paneIds alone, which is what keeps reorder out of the pane DOM.
+  const panes = useMemo(
+    () =>
+      paneIds.flatMap((id) => {
+        const tab = tabs.find((candidate) => candidate.id === id);
+        return tab ? [tab] : [];
+      }),
+    [paneIds, tabs]
+  );
+
   // Resolves once the `pty-output` listener is live: a tab may only ask for its
   // replay after that, or the replay and the live stream would interleave.
   const outputReady = useMemo(() => {
@@ -150,6 +189,7 @@ export function useTabManager(): TabManagerState {
       }
       return next ?? prev;
     });
+    setPaneIds((prev) => prev.filter((id) => id !== tabId));
     // All tab-list math happens inside the setTabs updater: two tab-exit
     // events landing in one React batch would each read the same stale
     // tabsRef snapshot, and the second setTabs would resurrect the first
@@ -184,6 +224,8 @@ export function useTabManager(): TabManagerState {
           ? prev.map((tab) => (tab.id === created.id ? created : tab))
           : [...prev, created]
       );
+      // Same id-dedup as tabs.
+      setPaneIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
       setActiveTabId(created.id);
       setError(null);
     } catch (err) {
@@ -257,6 +299,32 @@ export function useTabManager(): TabManagerState {
     [switchTab]
   );
 
+  // Drag-reorder: called per hover change during the drag (local move only)
+  // and once on drop with persist. The move mirrors the backend's
+  // Registry::reorder — remove-then-insert at the clamped index — so both
+  // sides converge on one order, and the registry's order wins on reload.
+  const reorderTab = useCallback((tabId: string, toIndex: number, persist = false) => {
+    setTabs((prev) => {
+      const moved = prev.find((tab) => tab.id === tabId);
+      if (!moved) return prev;
+      const from = prev.indexOf(moved);
+      const target = Math.max(0, Math.min(toIndex, prev.length - 1));
+      // Unchanged: keep the array identity so a hover move that crosses no
+      // midpoint does not re-render the list.
+      if (target === from) return prev;
+      const next = prev.filter((tab) => tab.id !== tabId);
+      next.splice(target, 0, moved);
+      return next;
+    });
+    // Outside the updater: StrictMode invokes updaters twice, and an IPC side
+    // effect must not ride along. The backend clamps toIndex to its own list.
+    if (persist) {
+      void invoke('reorder_tab', { tabId, toIndex }).catch(() => {
+        /* the tab may have exited mid-drag; its registry move is moot */
+      });
+    }
+  }, []);
+
   // ⌘J: triage. Round-robin from the tab *after* the active one; the active
   // tab is never a target (you are already looking at it). An empty queue
   // does nothing at all — no focus change, no toast.
@@ -276,6 +344,26 @@ export function useTabManager(): TabManagerState {
   // and, when it is already open, tells SearchBar to reset and refocus.
   const openSearch = useCallback(() => setSearchNonce((n) => n + 1), []);
   const closeSearch = useCallback(() => setSearchNonce(0), []);
+
+  // ⌘=/⌘−/⌘0 (View menu): the zoom applies to every mounted terminal at
+  // once. Computed from a ref mirror, not the state updater, so consecutive
+  // zooms inside one render batch (key repeat outpaces re-renders) each move
+  // one step; persisted on every accepted change.
+  const fontSizeRef = useRef(terminalFontSize);
+  fontSizeRef.current = terminalFontSize;
+  const zoomTerminalFont = useCallback((delta: number) => {
+    const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, fontSizeRef.current + delta));
+    if (next === fontSizeRef.current) return;
+    fontSizeRef.current = next;
+    setTerminalFontSize(next);
+    saveNumber(FONT_SIZE_KEY, next);
+  }, []);
+  const resetTerminalFont = useCallback(() => {
+    if (fontSizeRef.current === FONT_SIZE_DEFAULT) return;
+    fontSizeRef.current = FONT_SIZE_DEFAULT;
+    setTerminalFontSize(FONT_SIZE_DEFAULT);
+    saveNumber(FONT_SIZE_KEY, FONT_SIZE_DEFAULT);
+  }, []);
 
   const attachTab = useCallback(
     async (tabId: string, handler: OutputHandler) => {
@@ -447,6 +535,8 @@ export function useTabManager(): TabManagerState {
     switchTab,
     jumpToNextWaiting,
     openSearch,
+    zoomTerminalFont,
+    resetTerminalFont,
   };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
@@ -467,6 +557,7 @@ export function useTabManager(): TabManagerState {
           // just because the backend computed its answer beforehand.
           ...prev.filter((tab) => !known.has(tab.id)),
         ]);
+        setPaneIds((prev) => [...snapshot.map((tab) => tab.id), ...prev.filter((id) => !known.has(id))]);
         setActiveTabId((current) => current ?? snapshot[0]?.id ?? null);
       })
       .catch((err) => report(setError, 'Could not load existing tabs', err));
@@ -705,6 +796,15 @@ export function useTabManager(): TabManagerState {
             // nothing to search and no caret to hand focus back to.
             if (activeTabRef.current) actions.openSearch();
             break;
+          case 'zoom-in':
+            actions.zoomTerminalFont(1);
+            break;
+          case 'zoom-out':
+            actions.zoomTerminalFont(-1);
+            break;
+          case 'zoom-reset':
+            actions.resetTerminalFont();
+            break;
         }
       }),
       // A tab the backend created itself: the delayed startup tab, or the
@@ -717,6 +817,8 @@ export function useTabManager(): TabManagerState {
             ? prev.map((tab) => (tab.id === created.id ? created : tab))
             : [...prev, created]
         );
+        // Same id-dedup as tabs.
+        setPaneIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
         setActiveTabId(created.id);
       })
     );
@@ -732,6 +834,7 @@ export function useTabManager(): TabManagerState {
 
   return {
     tabs,
+    panes,
     activeTabId: safeActiveTabId,
     error,
     dismissError,
@@ -741,12 +844,14 @@ export function useTabManager(): TabManagerState {
     switchTab,
     selectTabByIndex,
     cycleTab,
+    reorderTab,
     attachTab,
     detachTab,
     writeInput,
     resizePty,
     searchNonce,
     closeSearch,
+    terminalFontSize,
     timelines,
     staleEvents,
     navigateToEvent,

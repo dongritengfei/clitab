@@ -41,10 +41,10 @@ body {
   width: 100vw;
 }
 
-/* Tab List */
+/* Tab List — the width is an inline style: the splitter next to it drags the
+   column (see .splitter), clamped and persisted by App.tsx. */
 .tab-list {
-  width: 240px;
-  min-width: 240px;
+  flex-shrink: 0;
   background: #181825;
   border-right: 1px solid #313244;
   display: flex;
@@ -53,7 +53,7 @@ body {
 
 .tab-list-header {
   padding: 12px 16px;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   text-transform: uppercase;
   color: #6c7086;
@@ -114,6 +114,24 @@ button:focus-visible {
   }
 }
 
+/* Drag-reorder: the grabbed row follows the pointer via an inline transform
+   and floats above its neighbors; text selection stays off for the gesture. */
+.tab-list-items.dragging {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.tab-item.dragging {
+  position: relative;
+  z-index: 1;
+  background: #45475a;
+  box-shadow: 0 4px 12px rgb(17 17 27 / 0.5);
+  cursor: grabbing;
+  /* The base `all` transition would animate every per-move transform update
+     and make the row lag behind the pointer. */
+  transition: none;
+}
+
 /* Steady amber dot: the tab is in the waiting-for-input triage queue. The
    flash animation means "just rang"; the dot survives switching away and
    only goes out when the user types into that tab. */
@@ -133,8 +151,8 @@ button:focus-visible {
   flex-shrink: 0;
   align-self: flex-start;
   width: 16px;
-  font-size: 11px;
-  line-height: 16px; /* matches the title's line box, so the two align */
+  font-size: 12px;
+  line-height: 17px; /* matches the title's line box, so the two align */
   text-align: center;
   color: #6c7086;
   font-variant-numeric: tabular-nums;
@@ -153,7 +171,7 @@ button:focus-visible {
 }
 
 .tab-title {
-  font-size: 13px;
+  font-size: 14px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -163,7 +181,7 @@ button:focus-visible {
 /* Second line: the working directory, deliberately quiet — the title names
    the tab, the path only locates it. */
 .tab-cwd {
-  font-size: 11px;
+  font-size: 12px;
   color: #6c7086;
   white-space: nowrap;
   overflow: hidden;
@@ -175,9 +193,9 @@ button:focus-visible {
    only once a tab reports protocol state; fixed height, so the done line's
    fade-out never shifts the rows below it. */
 .tab-status {
-  font-size: 11px;
-  line-height: 14px;
-  min-height: 14px;
+  font-size: 12px;
+  line-height: 16px;
+  min-height: 16px;
   color: #a6adc8;
   white-space: nowrap;
   overflow: hidden;
@@ -226,13 +244,44 @@ button:focus-visible {
   border: none;
   border-radius: 6px;
   color: #cdd6f4;
-  font-size: 13px;
+  font-size: 14px;
   cursor: pointer;
   transition: background 0.15s ease;
 }
 
 .new-tab-button:hover {
   background: #45475a;
+}
+
+/* Splitter — drag handle between the three columns. The transparent band
+   straddles the neighbouring panel's 1px border (negative margins) so the
+   seam stays thin while the hit area is grabbable; hover and drag tint it
+   with the accent color. Double-click resets the panel to its default width
+   (VS Code convention). */
+.splitter {
+  flex-shrink: 0;
+  width: 5px;
+  margin: 0 -2px;
+  position: relative;
+  z-index: 5;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.splitter:hover,
+.splitter.dragging {
+  background: rgba(137, 180, 250, 0.3);
+}
+
+/* While a splitter drag is in flight: text selection stays off everywhere and
+   the resize cursor wins over the terminal's own (pointer capture routes the
+   events, but cursor styling still follows the hit-tested element). */
+body.splitting,
+body.splitting * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: col-resize !important;
 }
 
 /* Terminal Area */
@@ -411,10 +460,10 @@ button:focus-visible {
 }
 
 /* Timeline Panel — right-hand session history for the active tab. Mirrors the
-   tab list's chrome (same width family, header style, scrollbar). */
+   tab list's chrome (same width family, header style, scrollbar); its width
+   is an inline style dragged via the splitter, like the tab list's. */
 .timeline-panel {
-  width: 280px;
-  min-width: 280px;
+  flex-shrink: 0;
   background: #181825;
   border-left: 1px solid #313244;
   display: flex;
@@ -423,7 +472,7 @@ button:focus-visible {
 
 .timeline-header {
   padding: 12px 16px;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   text-transform: uppercase;
   color: #6c7086;
@@ -448,7 +497,7 @@ button:focus-visible {
   cursor: pointer;
   text-align: left;
   font-family: inherit;
-  font-size: 12px;
+  font-size: 13px;
   color: #cdd6f4;
 }
 
@@ -475,7 +524,7 @@ button:focus-visible {
 
 .timeline-time {
   margin-right: 6px;
-  font-size: 11px;
+  font-size: 12px;
   color: #6c7086;
   font-variant-numeric: tabular-nums;
 }
@@ -488,7 +537,7 @@ button:focus-visible {
   padding: 0 5px;
   border: 1px solid #45475a;
   border-radius: 8px;
-  font-size: 10px;
+  font-size: 11px;
   line-height: 14px;
   color: #a6adc8;
   vertical-align: middle;
@@ -511,11 +560,11 @@ button:focus-visible {
 .timeline-empty {
   padding: 16px;
   color: #6c7086;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .timeline-empty-hint {
   margin-top: 8px;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }

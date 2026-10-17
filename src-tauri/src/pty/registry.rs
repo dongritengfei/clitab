@@ -106,6 +106,21 @@ impl Registry {
         tabs.len() != before
     }
 
+    /// Move a tab to `to_index` (remove-then-insert, index clamped to the
+    /// list); false when the tab is unknown. The renderer performs the same
+    /// array move locally while dragging, so both sides converge on one order
+    /// and a webview reload restores it via `list`.
+    pub fn reorder(&self, id: &str, to_index: usize) -> bool {
+        let mut tabs = lock(&self.tabs);
+        let Some(from) = tabs.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        let record = tabs.remove(from);
+        let target = to_index.min(tabs.len());
+        tabs.insert(target, record);
+        true
+    }
+
     /// Current metadata for `id`, as the reader threads last left it.
     pub fn get(&self, id: &str) -> Option<TabRecord> {
         lock(&self.tabs).iter().find(|t| t.id == id).cloned()
@@ -469,6 +484,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    fn ids(registry: &Registry) -> Vec<String> {
+        registry.list().into_iter().map(|t| t.id).collect()
+    }
+
+    fn abc() -> Registry {
+        let registry = Registry::new();
+        registry.insert("a".into(), "/a".into());
+        registry.insert("b".into(), "/b".into());
+        registry.insert("c".into(), "/c".into());
+        registry
+    }
+
+    #[test]
+    fn reorder_moves_a_tab_to_a_later_position() {
+        let registry = abc();
+        assert!(registry.reorder("a", 2));
+        assert_eq!(ids(&registry), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn reorder_moves_a_tab_to_an_earlier_position() {
+        let registry = abc();
+        assert!(registry.reorder("c", 0));
+        assert_eq!(ids(&registry), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn reorder_clamps_an_out_of_range_index() {
+        let registry = abc();
+        assert!(registry.reorder("a", 99));
+        assert_eq!(ids(&registry), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn reorder_of_an_unknown_tab_returns_false() {
+        let registry = abc();
+        assert!(!registry.reorder("nope", 0));
+        assert_eq!(ids(&registry), ["a", "b", "c"]);
     }
 
     use crate::status::{Answer, Notice, TabStatus};

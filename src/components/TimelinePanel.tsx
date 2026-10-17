@@ -2,6 +2,8 @@ import React, { useEffect, useRef } from 'react';
 import { displayOrder, type TimelineEvent } from '../lib/timeline';
 
 interface TimelinePanelProps {
+  /** Column width in px, dragged via the splitter beside the panel (App.tsx). */
+  width: number;
   /** The active tab, or null when no tab is open. */
   tabId: string | null;
   /** The active tab's events, oldest first. */
@@ -33,6 +35,7 @@ function labelOf(ev: TimelineEvent): string {
 }
 
 export const TimelinePanel: React.FC<TimelinePanelProps> = ({
+  width,
   tabId,
   events,
   isStale,
@@ -64,7 +67,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
   const ordered = displayOrder(events);
 
   return (
-    <aside className="timeline-panel" aria-label="Session timeline">
+    <aside className="timeline-panel" aria-label="Session timeline" style={{ width }}>
       <div className="timeline-header">Timeline</div>
       <div className="timeline-items" ref={listRef} onScroll={onScroll}>
         {ordered.length === 0 ? (

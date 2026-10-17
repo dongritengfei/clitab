@@ -22,6 +22,7 @@ the middle; the timeline panel (right) logs what you sent.
 
 - **Real PTY tabs** named after their working directory — or after the
   agent session (Claude Code, Qoder CLI) running in them.
+- **Drag to reorder tabs** — the `⌘1–9` shortcuts follow the new arrangement.
 - **Attention flash and triage** — flashing tabs, a Dock badge, `⌘J` and
   macOS notifications pointing you at the sessions waiting on you.
 - **Tab dashboard and session timeline** — live tool timer, turn duration

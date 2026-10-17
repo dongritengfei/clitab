@@ -13,12 +13,14 @@ const NO_EVENTS: TimelineEvent[] = [];
 function App() {
   const {
     tabs,
+    panes,
     activeTabId,
     error,
     dismissError,
     createTab,
     closeTab,
     switchTab,
+    reorderTab,
     attachTab,
     detachTab,
     writeInput,
@@ -55,6 +57,7 @@ function App() {
         onTabClick={switchTab}
         onTabActivate={activateTab}
         onTabClose={closeTab}
+        onReorder={reorderTab}
         onNewTab={createTab}
       />
       <div className="terminal-area">
@@ -69,13 +72,16 @@ function App() {
         {searchNonce > 0 && activeTabId && (
           <SearchBar tabId={activeTabId} nonce={searchNonce} onClose={closeSearch} />
         )}
-        {tabs.length === 0 ? (
+        {/* Panes render in mount order (`panes`), never in sidebar order:
+            reordering their DOM would reset each xterm viewport's scrollTop
+            (see useTabManager's paneIds). They are an invisible-order stack. */}
+        {panes.length === 0 ? (
           <div className="empty-state">
             <p>No tabs open</p>
             <button onClick={createTab}>Create a new tab</button>
           </div>
         ) : (
-          tabs.map((tab) => (
+          panes.map((tab) => (
             <div
               key={tab.id}
               id={`panel-${tab.id}`}

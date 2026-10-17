@@ -160,6 +160,15 @@ impl TabManager {
     pub fn list_tabs(&self) -> Vec<TabRecord> {
         self.registry.list()
     }
+
+    /// Drag-reorder: move a tab to a new position in the registry's order.
+    pub fn reorder_tab(&self, tab_id: &str, to_index: usize) -> Result<(), ManagerError> {
+        if self.registry.reorder(tab_id, to_index) {
+            Ok(())
+        } else {
+            Err(ManagerError::NotFound(tab_id.to_string()))
+        }
+    }
 }
 
 /// Where a new tab starts: the requested directory if it still exists (the

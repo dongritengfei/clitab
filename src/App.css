@@ -114,6 +114,24 @@ button:focus-visible {
   }
 }
 
+/* Drag-reorder: the grabbed row follows the pointer via an inline transform
+   and floats above its neighbors; text selection stays off for the gesture. */
+.tab-list-items.dragging {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.tab-item.dragging {
+  position: relative;
+  z-index: 1;
+  background: #45475a;
+  box-shadow: 0 4px 12px rgb(17 17 27 / 0.5);
+  cursor: grabbing;
+  /* The base `all` transition would animate every per-move transform update
+     and make the row lag behind the pointer. */
+  transition: none;
+}
+
 /* Steady amber dot: the tab is in the waiting-for-input triage queue. The
    flash animation means "just rang"; the dot survives switching away and
    only goes out when the user types into that tab. */

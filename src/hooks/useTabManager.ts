@@ -52,6 +52,9 @@ function toTab(response: TabResponse): Tab {
 
 export interface TabManagerState {
   tabs: Tab[];
+  /** The same tabs in pane mount order. Terminal panes render from this list
+   * so a sidebar reorder never moves their DOM — see `paneIds`. */
+  panes: Tab[];
   activeTabId: string | null;
   error: string | null;
   dismissError: () => void;
@@ -61,6 +64,10 @@ export interface TabManagerState {
   switchTab: (tabId: string) => void;
   selectTabByIndex: (index: number) => void;
   cycleTab: (direction: 1 | -1) => void;
+  /** Move a tab to `toIndex` (remove-then-insert). Local order updates
+   * immediately; `persist` also writes the arrangement to the registry, so a
+   * webview reload restores the user's order. */
+  reorderTab: (tabId: string, toIndex: number, persist?: boolean) => void;
   /** Subscribe `handler` to a tab's output, after replaying what it missed. */
   attachTab: (tabId: string, handler: OutputHandler) => Promise<void>;
   detachTab: (tabId: string) => void;
@@ -81,6 +88,14 @@ export interface TabManagerState {
 
 export function useTabManager(): TabManagerState {
   const [tabs, setTabs] = useState<Tab[]>([]);
+  // Tab ids in pane mount order — appended/removed alongside `tabs`, but
+  // NEVER reordered. React moves keyed DOM nodes when a list's order changes,
+  // and detaching a scrolled `.xterm-viewport` resets its scrollTop: a sidebar
+  // drag would silently rewind every moved terminal to the top on its next
+  // wheel scroll (xterm's wheel handler works off scrollTop). Panes are an
+  // absolute-positioned stack where DOM order is invisible, so they render in
+  // this stable order while `tabs` alone carries the user's arrangement.
+  const [paneIds, setPaneIds] = useState<string[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchNonce, setSearchNonce] = useState(0);
@@ -122,6 +137,17 @@ export function useTabManager(): TabManagerState {
   tabsRef.current = tabs;
   activeTabRef.current = safeActiveTabId;
 
+  // The pane list rebuilt from the mount-order ids: its *order* comes from
+  // paneIds alone, which is what keeps reorder out of the pane DOM.
+  const panes = useMemo(
+    () =>
+      paneIds.flatMap((id) => {
+        const tab = tabs.find((candidate) => candidate.id === id);
+        return tab ? [tab] : [];
+      }),
+    [paneIds, tabs]
+  );
+
   // Resolves once the `pty-output` listener is live: a tab may only ask for its
   // replay after that, or the replay and the live stream would interleave.
   const outputReady = useMemo(() => {
@@ -150,6 +176,7 @@ export function useTabManager(): TabManagerState {
       }
       return next ?? prev;
     });
+    setPaneIds((prev) => prev.filter((id) => id !== tabId));
     // All tab-list math happens inside the setTabs updater: two tab-exit
     // events landing in one React batch would each read the same stale
     // tabsRef snapshot, and the second setTabs would resurrect the first
@@ -184,6 +211,8 @@ export function useTabManager(): TabManagerState {
           ? prev.map((tab) => (tab.id === created.id ? created : tab))
           : [...prev, created]
       );
+      // Same id-dedup as tabs.
+      setPaneIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
       setActiveTabId(created.id);
       setError(null);
     } catch (err) {
@@ -256,6 +285,32 @@ export function useTabManager(): TabManagerState {
     },
     [switchTab]
   );
+
+  // Drag-reorder: called per hover change during the drag (local move only)
+  // and once on drop with persist. The move mirrors the backend's
+  // Registry::reorder — remove-then-insert at the clamped index — so both
+  // sides converge on one order, and the registry's order wins on reload.
+  const reorderTab = useCallback((tabId: string, toIndex: number, persist = false) => {
+    setTabs((prev) => {
+      const moved = prev.find((tab) => tab.id === tabId);
+      if (!moved) return prev;
+      const from = prev.indexOf(moved);
+      const target = Math.max(0, Math.min(toIndex, prev.length - 1));
+      // Unchanged: keep the array identity so a hover move that crosses no
+      // midpoint does not re-render the list.
+      if (target === from) return prev;
+      const next = prev.filter((tab) => tab.id !== tabId);
+      next.splice(target, 0, moved);
+      return next;
+    });
+    // Outside the updater: StrictMode invokes updaters twice, and an IPC side
+    // effect must not ride along. The backend clamps toIndex to its own list.
+    if (persist) {
+      void invoke('reorder_tab', { tabId, toIndex }).catch(() => {
+        /* the tab may have exited mid-drag; its registry move is moot */
+      });
+    }
+  }, []);
 
   // ⌘J: triage. Round-robin from the tab *after* the active one; the active
   // tab is never a target (you are already looking at it). An empty queue
@@ -467,6 +522,7 @@ export function useTabManager(): TabManagerState {
           // just because the backend computed its answer beforehand.
           ...prev.filter((tab) => !known.has(tab.id)),
         ]);
+        setPaneIds((prev) => [...snapshot.map((tab) => tab.id), ...prev.filter((id) => !known.has(id))]);
         setActiveTabId((current) => current ?? snapshot[0]?.id ?? null);
       })
       .catch((err) => report(setError, 'Could not load existing tabs', err));
@@ -717,6 +773,8 @@ export function useTabManager(): TabManagerState {
             ? prev.map((tab) => (tab.id === created.id ? created : tab))
             : [...prev, created]
         );
+        // Same id-dedup as tabs.
+        setPaneIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
         setActiveTabId(created.id);
       })
     );
@@ -732,6 +790,7 @@ export function useTabManager(): TabManagerState {
 
   return {
     tabs,
+    panes,
     activeTabId: safeActiveTabId,
     error,
     dismissError,
@@ -741,6 +800,7 @@ export function useTabManager(): TabManagerState {
     switchTab,
     selectTabByIndex,
     cycleTab,
+    reorderTab,
     attachTab,
     detachTab,
     writeInput,

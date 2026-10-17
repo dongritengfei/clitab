@@ -8,6 +8,8 @@ interface TabItemProps {
   /** Total number of tabs; with index decides the ⌘<number> badge. */
   count: number;
   isActive: boolean;
+  /** Being dragged to a new position (see TabList's press→drag gesture). */
+  isDragging?: boolean;
   onClick: () => void;
   onClose: () => void;
 }
@@ -79,6 +81,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   index,
   count,
   isActive,
+  isDragging = false,
   onClick,
   onClose,
 }) => {
@@ -154,7 +157,7 @@ export const TabItem: React.FC<TabItemProps> = ({
   return (
     <div
       ref={containerRef}
-      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''} ${tab.waiting ? 'waiting' : ''}`}
+      className={`tab-item ${isActive ? 'active' : ''} ${tab.flashing ? 'flashing' : ''} ${tab.waiting ? 'waiting' : ''} ${isDragging ? 'dragging' : ''}`}
       // Tabs are switched with the keyboard too, so make them reachable.
       role="tab"
       id={`tab-${tab.id}`}

@@ -5,6 +5,7 @@ import {
   TAB_GONE,
   type AttachStreamResponse,
   type FocusTabPayload,
+  type HistoryPrompt,
   type MenuShortcutPayload,
   type PromptReadyPayload,
   type PtyOutputPayload,
@@ -21,6 +22,7 @@ import { base64ToBytes, bytesToBase64 } from '../lib/base64';
 import { loadNumber, saveNumber } from '../lib/prefs';
 import { getTerm } from '../lib/termRegistry';
 import {
+  historyEvents,
   MAX_TIMELINE_EVENTS,
   stampQueuedStarts,
   startQueuedTurn,
@@ -120,6 +122,10 @@ export function useTabManager(): TabManagerState {
   // ref (tabId → eventId → marker), never in state.
   const trackers = useRef(new Map<string, TimelineTracker>());
   const markers = useRef(new Map<string, Map<number, IMarker>>());
+  // Restored tabs whose lazy resume/history load has already been triggered:
+  // first focus fires it exactly once per app run (and guards the double
+  // invoke of dev-mode StrictMode).
+  const resumedTabs = useRef(new Set<string>());
   // Mirror of the timelines state so navigateToEvent can look up sibling
   // events without joining the callback's dependency list.
   const timelinesRef = useRef(timelines);
@@ -171,6 +177,53 @@ export function useTabManager(): TabManagerState {
     return { promise, resolve };
   }, []);
 
+  // Prepend the resumed session's transcript prompts as display-only history
+  // rows. They share the live timeline's array and cap; historical rows have
+  // negative ids and no markers, so cap-trimming them needs no marker
+  // cleanup, and live rows (always newer) are never the ones dropped here.
+  const loadSessionHistory = useCallback(async (tabId: string) => {
+    let prompts: HistoryPrompt[];
+    try {
+      prompts = await invoke<HistoryPrompt[]>('session_history', { tabId });
+    } catch (err) {
+      // TAB_GONE (the tab closed mid-load) or any backend failure: history
+      // is best-effort and must never surface an error banner.
+      console.debug('session_history failed:', messageOf(err));
+      return;
+    }
+    if (prompts.length === 0) return;
+    const historical = historyEvents(prompts);
+    setTimelines((prev) => {
+      // Idempotence guard: a StrictMode double-invoke or a list_tabs /
+      // tab-created race must not prepend the same history twice.
+      if (prev[tabId]?.some((e) => e.historical)) return prev;
+      const merged = [...historical, ...(prev[tabId] ?? [])];
+      if (merged.length <= MAX_TIMELINE_EVENTS) return { ...prev, [tabId]: merged };
+      return { ...prev, [tabId]: merged.slice(-MAX_TIMELINE_EVENTS) };
+    });
+  }, []);
+
+  // First focus of a restored tab (spec Q4's lazy path): issue its pending
+  // resume, then load the transcript history. The startup-restored active
+  // tab was already resumed by the backend — its payload arrives with
+  // pendingResume false and restoredSession true, so only the history load
+  // remains. Non-restored tabs are a no-op.
+  const maybeResume = useCallback(
+    (tab: Tab) => {
+      if (!tab.pendingResume && !tab.restoredSession) return;
+      if (resumedTabs.current.has(tab.id)) return;
+      resumedTabs.current.add(tab.id);
+      if (tab.pendingResume) {
+        invoke('resume_tab', { tabId: tab.id })
+          .then(() => loadSessionHistory(tab.id))
+          .catch((err) => console.debug('resume_tab failed:', messageOf(err)));
+      } else {
+        void loadSessionHistory(tab.id);
+      }
+    },
+    [loadSessionHistory]
+  );
+
   const abandonTab = useCallback((tabId: string) => {
     handlers.current.delete(tabId);
     trackers.current.delete(tabId);
@@ -178,6 +231,7 @@ export function useTabManager(): TabManagerState {
     // first also disarms their onDispose guards (see the tab-status
     // listener), so a closing tab never re-adds stale keys.
     markers.current.delete(tabId);
+    resumedTabs.current.delete(tabId);
     setTimelines((prev) => {
       const { [tabId]: _dropped, ...rest } = prev;
       return rest;
@@ -278,7 +332,15 @@ export function useTabManager(): TabManagerState {
     setTabs((prev) =>
       prev.map((tab) => (tab.id === tabId ? { ...tab, flashing: false, notice: null } : tab))
     );
-  }, []);
+    // Report the new active tab to the backend — the snapshot's active index
+    // decides which tab auto-resumes at the next launch.
+    void invoke('set_active_tab', { tabId }).catch(() => {
+      /* the tab may already be gone */
+    });
+    // First activation of a restored tab: lazy resume + history load.
+    const switched = tabsRef.current.find((tab) => tab.id === tabId);
+    if (switched) maybeResume(switched);
+  }, [maybeResume]);
 
   const selectTabByIndex = useCallback(
     (index: number) => {
@@ -558,7 +620,13 @@ export function useTabManager(): TabManagerState {
           ...prev.filter((tab) => !known.has(tab.id)),
         ]);
         setPaneIds((prev) => [...snapshot.map((tab) => tab.id), ...prev.filter((id) => !known.has(id))]);
-        setActiveTabId((current) => current ?? snapshot[0]?.id ?? null);
+        // Restore: the backend marks the previously-active tab isActive (the
+        // first tab is not necessarily it after a reorder). This also covers
+        // a webview reload mid-run: renderer state (timelines, resumedTabs)
+        // died with the old document, so the history legitimately reloads.
+        const preferred = snapshot.find((tab) => tab.isActive) ?? snapshot[0];
+        setActiveTabId((current) => current ?? preferred?.id ?? null);
+        if (preferred) maybeResume(preferred);
       })
       .catch((err) => report(setError, 'Could not load existing tabs', err));
 
@@ -819,7 +887,14 @@ export function useTabManager(): TabManagerState {
         );
         // Same id-dedup as tabs.
         setPaneIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
-        setActiveTabId(created.id);
+        // Only the tab the backend marked active takes focus: startup restore
+        // announces EVERY restored tab through this event, and exactly one of
+        // them was the user's (services::open_tab's tabs — startup fallback,
+        // Finder service — always arrive isActive, keeping today's behavior).
+        if (payload.isActive) {
+          setActiveTabId(created.id);
+          maybeResume(created);
+        }
       })
     );
 
@@ -830,7 +905,7 @@ export function useTabManager(): TabManagerState {
       // cleanup so the listener is removed as soon as it exists.
       listeners.forEach((promise) => promise.then((fn) => fn()));
     };
-  }, [abandonTab, outputReady]);
+  }, [abandonTab, maybeResume, outputReady]);
 
   return {
     tabs,

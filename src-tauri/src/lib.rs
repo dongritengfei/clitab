@@ -1,4 +1,5 @@
 mod attention;
+mod history;
 mod last_cwd;
 mod menu;
 mod osc;

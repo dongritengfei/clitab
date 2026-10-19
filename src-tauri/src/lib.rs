@@ -9,6 +9,7 @@ mod services;
 mod status;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use history::HistoryPrompt;
 use pty::manager::{ManagerError, TabManager};
 use pty::registry::TabRecord;
 use serde::{Deserialize, Serialize};
@@ -48,10 +49,20 @@ pub struct TabResponse {
     /// Notification awaiting the user; null once acknowledged.
     pub notice: Option<Notice>,
     pub waiting: bool,
+    /// The tab the user was looking at when this snapshot was taken.
+    pub is_active: bool,
+    /// Restored tab whose `--resume` has not been issued yet: the renderer
+    /// triggers it on first activation.
+    pub pending_resume: bool,
+    /// Restored tab with a live resume path: the renderer loads the session
+    /// transcript's history the first time it focuses the tab.
+    pub restored_session: bool,
 }
 
-impl From<TabRecord> for TabResponse {
-    fn from(tab: TabRecord) -> Self {
+impl TabResponse {
+    /// `is_active` is a property of the response, not of the record (the
+    /// registry tracks the active id separately), so callers pass it in.
+    pub fn from_record(tab: TabRecord, is_active: bool) -> Self {
         Self {
             id: tab.id,
             title: tab.title,
@@ -59,10 +70,13 @@ impl From<TabRecord> for TabResponse {
             has_claude_title: tab.has_program_title,
             status: tab.status,
             notice: tab.notice,
-            // `turn_start`, `prompt_queue`, `last_stop_ms` and `answer` are
-            // deliberately not exposed: backend-internal, and timeline-only
-            // (arrives via `tab-status`).
+            // `turn_start`, `prompt_queue`, `last_stop_ms`, `answer`,
+            // `session` and `agent_running` are deliberately not exposed:
+            // backend-internal, and timeline-only (arrives via `tab-status`).
             waiting: tab.waiting,
+            is_active,
+            pending_resume: tab.resume_pending,
+            restored_session: tab.restored_session,
         }
     }
 }
@@ -83,7 +97,7 @@ fn create_tab(state: State<'_, AppState>, cwd: Option<String>) -> Result<TabResp
     state
         .tab_manager
         .create_tab(cwd)
-        .map(TabResponse::from)
+        .map(|record| TabResponse::from_record(record, true))
         .map_err(|e| e.to_string())
 }
 
@@ -105,11 +119,15 @@ fn reorder_tab(state: State<'_, AppState>, tab_id: String, to_index: usize) -> R
 
 #[tauri::command]
 fn list_tabs(state: State<'_, AppState>) -> Result<Vec<TabResponse>, String> {
+    let active = state.tab_manager.active_id();
     Ok(state
         .tab_manager
         .list_tabs()
         .into_iter()
-        .map(TabResponse::from)
+        .map(|tab| {
+            let is_active = active.as_deref() == Some(tab.id.as_str());
+            TabResponse::from_record(tab, is_active)
+        })
         .collect())
 }
 
@@ -171,6 +189,44 @@ fn has_active_process(state: State<'_, AppState>, tab_id: String) -> Result<bool
 fn ack_tab_notice(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
     state.tab_manager.ack_notice(&tab_id);
     Ok(())
+}
+
+/// The renderer switched tabs. Never errors on an unknown tab: a stale
+/// report is harmless (same contract as `ack_tab_notice`).
+#[tauri::command]
+fn set_active_tab(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
+    state.tab_manager.set_active(&tab_id);
+    Ok(())
+}
+
+/// First activation of a restored tab: issue its pending `--resume`. Degrades
+/// silently to a plain shell when the transcript is gone (see
+/// `TabManager::resume_tab`); only a vanished tab is an error, and it carries
+/// the `TAB_GONE` marker so the renderer can ignore it.
+#[tauri::command]
+fn resume_tab(state: State<'_, AppState>, tab_id: String) -> Result<(), String> {
+    state.tab_manager.resume_tab(&tab_id).map_err(ipc_error)
+}
+
+/// The restored session's historical user prompts, oldest first, capped at
+/// `HISTORY_CAP`. Empty (not an error) when the tab has no binding, the
+/// transcript is gone, or hooks were never installed.
+#[tauri::command]
+fn session_history(
+    state: State<'_, AppState>,
+    tab_id: String,
+) -> Result<Vec<HistoryPrompt>, String> {
+    let record = state
+        .tab_manager
+        .record(&tab_id)
+        .ok_or_else(|| format!("{TAB_GONE}{tab_id}"))?;
+    let Some(binding) = record.session else {
+        return Ok(Vec::new());
+    };
+    let Some(path) = history::transcript_for(&binding, &record.cwd) else {
+        return Ok(Vec::new());
+    };
+    Ok(history::user_prompts(&path, history::HISTORY_CAP))
 }
 
 /// Ask the user to confirm quitting, then exit if they do. Shared by both
@@ -292,15 +348,35 @@ pub fn run() {
                     services::STARTUP_GRACE_MS,
                 ));
                 let pending = pty::lock(&service_state).settle();
+                // Borrow through the state guard: `handle.state::<AppState>()`
+                // hands out a reference that must outlive `manager`.
+                let state = handle.state::<AppState>();
+                let manager = &state.tab_manager;
                 // A tab already exists only if the user beat the grace
                 // (e.g. ⌘T while the webview was loading); don't stack.
-                if !handle.state::<AppState>().tab_manager.list_tabs().is_empty() {
+                if !manager.list_tabs().is_empty() {
                     return;
                 }
-                // The Finder service request wins; a normal launch restores
-                // the last-used working directory (no file, or a directory
-                // that has since vanished → `resolve_cwd` applies the
-                // default fallback).
+                // Restore wins over both other startup paths (spec Q3): the
+                // previous run's sidebar comes back as-is, active tab's agent
+                // session already resuming. A Finder request during the grace
+                // becomes an EXTRA focused tab on top of the restore (spec
+                // D5) — it never replaces a restored tab.
+                if manager.restore_snapshot().is_some() {
+                    if let Some(path) = pending {
+                        services::open_tab(
+                            &handle,
+                            Some(path.to_string_lossy().into_owned()),
+                            true,
+                        );
+                    }
+                    return;
+                }
+                // No snapshot (first launch, or corrupt/old file): today's
+                // behavior. The Finder service request wins; a normal launch
+                // restores the last-used working directory (no file, or a
+                // directory that has since vanished → `resolve_cwd` applies
+                // the default fallback).
                 let cwd = pending
                     .map(|p| p.to_string_lossy().into_owned())
                     .or_else(|| last_cwd::dir(&handle).and_then(|dir| last_cwd::load(&dir)));
@@ -319,7 +395,10 @@ pub fn run() {
             attach_stream,
             detach_tab,
             has_active_process,
-            ack_tab_notice
+            ack_tab_notice,
+            set_active_tab,
+            resume_tab,
+            session_history
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -393,7 +472,7 @@ mod tests {
             resume_pending: false,
             restored_session: false,
         };
-        let json = serde_json::to_value(TabResponse::from(record)).unwrap();
+        let json = serde_json::to_value(TabResponse::from_record(record, true)).unwrap();
         assert_eq!(
             json["status"],
             serde_json::json!({"kind": "tool", "name": "Bash", "since": 1700000000000u64})
@@ -401,6 +480,9 @@ mod tests {
         assert_eq!(json["notice"], serde_json::Value::Null);
         assert_eq!(json["waiting"], serde_json::json!(false));
         assert!(json.get("turnStart").is_none());
+        assert_eq!(json["isActive"], serde_json::json!(true));
+        assert_eq!(json["pendingResume"], serde_json::json!(false));
+        assert_eq!(json["restoredSession"], serde_json::json!(false));
 
         let idle = TabRecord {
             id: "t2".into(),
@@ -422,11 +504,41 @@ mod tests {
             resume_pending: false,
             restored_session: false,
         };
-        let json = serde_json::to_value(TabResponse::from(idle)).unwrap();
+        let json = serde_json::to_value(TabResponse::from_record(idle, true)).unwrap();
         assert_eq!(json["status"], serde_json::Value::Null);
         assert_eq!(
             json["notice"],
             serde_json::json!({"msg": "needs permission", "at": 5})
         );
+    }
+
+    /// The restore flags must reach the renderer inside `tab-created` /
+    /// `list_tabs` payloads — lazy resume and history loading key off them.
+    /// `session` and `agent_running` stay backend-internal.
+    #[test]
+    fn restore_flags_travel_in_the_response() {
+        let record = TabRecord {
+            id: "t3".into(),
+            title: "Fix build".into(),
+            cwd: "/proj".into(),
+            has_program_title: true,
+            waiting: false,
+            status: None,
+            notice: None,
+            answer: None,
+            turn_start: None,
+            prompt_queue: Default::default(),
+            last_stop_ms: None,
+            session: None,
+            agent_running: false,
+            resume_pending: true,
+            restored_session: true,
+        };
+        let json = serde_json::to_value(TabResponse::from_record(record, false)).unwrap();
+        assert_eq!(json["isActive"], serde_json::json!(false));
+        assert_eq!(json["pendingResume"], serde_json::json!(true));
+        assert_eq!(json["restoredSession"], serde_json::json!(true));
+        assert!(json.get("session").is_none());
+        assert!(json.get("agentRunning").is_none());
     }
 }

@@ -80,7 +80,9 @@ pub fn open_tab(app: &tauri::AppHandle, cwd: Option<String>, focus: bool) {
     let manager = &app.state::<crate::AppState>().tab_manager;
     match manager.create_tab(cwd) {
         Ok(record) => {
-            let _ = app.emit("tab-created", crate::TabResponse::from(record));
+            // Backend-created tabs (startup fallback, Finder service) are
+            // always the focused one.
+            let _ = app.emit("tab-created", crate::TabResponse::from_record(record, true));
             if focus {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.unminimize();

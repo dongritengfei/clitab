@@ -26,9 +26,16 @@ pub struct TabManager {
 
 impl TabManager {
     pub fn new(app: AppHandle) -> Self {
+        // The registry persists the tab snapshot next to `last-cwd` (same
+        // config dir). Without one, snapshots silently skip and restore
+        // degrades to today's last-cwd startup.
+        let registry = match crate::last_cwd::dir(&app) {
+            Some(dir) => Registry::with_persist_dir(dir),
+            None => Registry::new(),
+        };
         Self {
             sessions: Mutex::new(HashMap::new()),
-            registry: Arc::new(Registry::new()),
+            registry: Arc::new(registry),
             app,
         }
     }
@@ -60,6 +67,8 @@ impl TabManager {
         };
 
         lock(&self.sessions).insert(tab_id.clone(), session);
+        // A new tab is by definition the one the user is about to look at.
+        self.registry.set_active(&tab_id);
 
         // Opening the tab counts as using its directory: a Finder-service tab
         // becomes the last cwd even if the user never cds, and re-saving the
@@ -168,6 +177,166 @@ impl TabManager {
         } else {
             Err(ManagerError::NotFound(tab_id.to_string()))
         }
+    }
+
+    /// The renderer switched tabs: remember which one the user is looking at
+    /// (the snapshot's active index). Unknown tabs are ignored — a stale
+    /// report is harmless, same contract as `ack_notice`.
+    pub fn set_active(&self, tab_id: &str) {
+        if self.registry.get(tab_id).is_some() {
+            self.registry.set_active(tab_id);
+        }
+    }
+
+    pub fn active_id(&self) -> Option<String> {
+        self.registry.active_id()
+    }
+
+    pub fn record(&self, tab_id: &str) -> Option<TabRecord> {
+        self.registry.get(tab_id)
+    }
+
+    /// Recreate the previous run's sidebar (spec Q3/Q6): same tabs, same
+    /// order, same titles. The previously-active tab's agent session resumes
+    /// right away (spec Q4 hybrid: active auto, the rest lazy on first
+    /// activation). Returns the id of the tab to focus, or `None` when there
+    /// is nothing to restore (no snapshot / empty / every spawn failed) —
+    /// the caller then falls back to the last-cwd startup.
+    pub fn restore_snapshot(&self) -> Option<String> {
+        let dir = crate::last_cwd::dir(&self.app)?;
+        let snapshot = crate::restore::load(&dir)?;
+        if snapshot.tabs.is_empty() {
+            return None;
+        }
+
+        let mut created: Vec<TabRecord> = Vec::with_capacity(snapshot.tabs.len());
+        for tab in snapshot.tabs {
+            match self.restore_tab(tab) {
+                Ok(record) => created.push(record),
+                // One unspawnable tab must not sink the whole restore.
+                Err(e) => eprintln!("clitab: could not restore a tab: {e}"),
+            }
+        }
+        if created.is_empty() {
+            return None;
+        }
+
+        // If some spawns failed, indices shifted — clamping is the best
+        // available guess at "the tab they were looking at".
+        let active_index = snapshot.active.unwrap_or(0).min(created.len() - 1);
+        let active_id = created[active_index].id.clone();
+        self.registry.set_active(&active_id);
+        // Resume BEFORE announcing: the `tab-created` payload must carry the
+        // post-resume flags (`pendingResume` already false), so the renderer
+        // does not try to resume the active tab a second time.
+        if let Err(e) = self.resume_tab(&active_id) {
+            eprintln!("clitab: could not resume the active tab's session: {e}");
+        }
+
+        {
+            use tauri::Emitter;
+            for (index, record) in created.iter().enumerate() {
+                // Re-read each record: the resume and any early shell
+                // integration output are already reflected in the payload.
+                let current = self.registry.get(&record.id).unwrap_or_else(|| record.clone());
+                let _ = self.app.emit(
+                    "tab-created",
+                    crate::TabResponse::from_record(current, index == active_index),
+                );
+            }
+        }
+        Some(active_id)
+    }
+
+    /// One restored tab: a fresh UUID and PTY, metadata from the snapshot.
+    /// A resumable tab keeps its program title until the resume proves
+    /// impossible (`cancel_resume` reverts it); a tab whose agent had already
+    /// exited comes back as the plain shell it is, with its cwd title.
+    fn restore_tab(
+        &self,
+        snapshot: crate::restore::SnapshotTab,
+    ) -> Result<TabRecord, ManagerError> {
+        let tab_id = uuid::Uuid::new_v4().to_string();
+        let cwd = resolve_cwd(Some(snapshot.cwd)).to_string_lossy().to_string();
+        let resumable = snapshot.agent_running && snapshot.session.is_some();
+        let keep_program_title = snapshot.has_program_title && resumable;
+        let title = if keep_program_title { snapshot.title } else { cwd.clone() };
+
+        let record = TabRecord {
+            id: tab_id.clone(),
+            title,
+            cwd: cwd.clone(),
+            has_program_title: keep_program_title,
+            waiting: false,
+            status: None,
+            notice: None,
+            answer: None,
+            turn_start: None,
+            prompt_queue: Default::default(),
+            last_stop_ms: None,
+            session: snapshot.session,
+            // Restore does not claim the agent is running — it is not, yet.
+            // The resume injection (`begin_resume`) sets the flag.
+            agent_running: false,
+            resume_pending: resumable,
+            restored_session: resumable,
+        };
+        let record = self.registry.insert_record(record);
+
+        let session = match PtySession::new(
+            tab_id.clone(),
+            cwd,
+            self.app.clone(),
+            Arc::clone(&self.registry),
+        ) {
+            Ok(session) => Arc::new(session),
+            Err(e) => {
+                self.registry.remove(&tab_id);
+                return Err(e.into());
+            }
+        };
+        lock(&self.sessions).insert(tab_id.clone(), session);
+        // Deliberately NO last_cwd save here: restored tabs re-open the
+        // previous run's directories, they are not a fresh user choice —
+        // the last-cwd file already reflects the last real one.
+        Ok(record)
+    }
+
+    /// Issue the tab's pending resume: inject `<agent> --resume <sid>` into
+    /// its shell as ordinary input (spec D1 — keeps OSC 7 cwd reporting,
+    /// title revert and the preexec machinery working; no `--fork-session`,
+    /// so the transcript keeps growing under the same id). The sid's charset
+    /// was validated at decode time (`decode_session`), so interpolating it
+    /// into the command line is safe. Degrades silently to a plain shell
+    /// (spec D4) when no resume is pending, the binding is gone, or the
+    /// transcript file no longer exists; only a vanished TAB is NotFound.
+    pub fn resume_tab(&self, tab_id: &str) -> Result<(), ManagerError> {
+        let record = self
+            .registry
+            .get(tab_id)
+            .ok_or_else(|| ManagerError::NotFound(tab_id.to_string()))?;
+        if !record.resume_pending {
+            return Ok(());
+        }
+        let Some(binding) = record.session.clone() else {
+            self.registry.cancel_resume(tab_id);
+            return Ok(());
+        };
+        let has_transcript = crate::history::transcript_for(&binding, &record.cwd)
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        if !has_transcript {
+            // Deleted between quit and relaunch: plain shell, title reverts,
+            // no error the user could act on (Review Focus 5).
+            self.registry.cancel_resume(tab_id);
+            return Ok(());
+        }
+        let line = format!("{} --resume {}\n", binding.agent.cmd(), binding.sid);
+        self.session(tab_id)?.write(line.as_bytes())?;
+        // `--resume` fires no hook: the registry must learn "agent alive"
+        // from here, or an immediate quit would break the restore chain.
+        self.registry.begin_resume(tab_id);
+        Ok(())
     }
 }
 

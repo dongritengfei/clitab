@@ -572,7 +572,11 @@ impl Registry {
                     title: t.title,
                     has_program_title: t.has_program_title,
                     session: t.session,
-                    agent_running: t.agent_running,
+                    // A pending lazy resume must survive repeated restarts:
+                    // a tab the user never activated before quitting still
+                    // owes its `--resume`, and `restore_tab`'s resumable
+                    // gate reads this field.
+                    agent_running: t.agent_running || t.resume_pending,
                 })
                 .collect(),
             active_index,
@@ -1309,5 +1313,47 @@ mod tests {
         // the in-memory turn state exists but never reached the file
         assert!(registry.get("a").unwrap().status.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lazy restored tab (resume owed, agent not yet running) must look
+    /// agent-alive in the snapshot, or a second restart before the user
+    /// activates the tab would compute `resumable=false` in `restore_tab`
+    /// and silently lose the resume forever.
+    #[test]
+    fn snapshot_keeps_lazy_resume_alive_across_restarts() {
+        // A plain tab with a session but no owed resume: snapshot is honest.
+        let baseline = Registry::new();
+        let mut plain = restored_record("plain");
+        plain.agent_running = false;
+        plain.resume_pending = false;
+        plain.restored_session = false;
+        baseline.insert_record(plain);
+        assert!(
+            !baseline.snapshot().tabs[0].agent_running,
+            "no owed resume → snapshot is honest"
+        );
+
+        // A lazy restored tab (restore_tab's shape for a non-active tab):
+        // session bound, resume owed, agent not yet running.
+        let registry = Registry::new();
+        let mut lazy = restored_record("lazy");
+        lazy.agent_running = false;
+        registry.insert_record(lazy);
+
+        // Load-bearing: resume_pending alone must make the snapshot report true.
+        // Without the fix, `SnapshotTab.agent_running` reads only `t.agent_running`
+        // and a second restart before activation would lose the resume.
+        assert!(
+            registry.snapshot().tabs[0].agent_running,
+            "resume_pending alone must make the snapshot report agent_alive"
+        );
+
+        // begin_resume clears resume_pending and sets agent_running; snapshot
+        // stays true via the explicit flag.
+        registry.begin_resume("lazy");
+        assert!(
+            registry.snapshot().tabs[0].agent_running,
+            "begin_resume keeps the snapshot true via agent_running"
+        );
     }
 }

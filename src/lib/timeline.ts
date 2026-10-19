@@ -1,4 +1,4 @@
-import type { TabAnswer, TabNotice, TabStatus } from '../types';
+import type { HistoryPrompt, TabAnswer, TabNotice, TabStatus } from '../types';
 
 /** The events the timeline tracks: a log of the *user's* own inputs — the
  *  prompts they submitted and the answers they picked. Everything Claude
@@ -28,6 +28,10 @@ export interface TimelineEvent {
    *  `stampQueuedStarts` when the Done payload arrives (the stop's time,
    *  keeps `queued`). Display prefers this over `at` (the queue time). */
   startedAt?: number | null;
+  /** Loaded from a resumed session's transcript after a restore: predates
+   *  this app run and is display-only — there is no terminal line to jump
+   *  to. Historical rows carry negative `id`s (see `historyEvents`). */
+  historical?: boolean;
 }
 
 /** A tab's full protocol state as carried by one `tab-status` payload. */
@@ -150,4 +154,20 @@ export function startQueuedTurn(events: TimelineEvent[], since: number): Timelin
  */
 export function displayOrder(events: TimelineEvent[]): TimelineEvent[] {
   return [...events].sort((a, b) => (a.startedAt ?? a.at) - (b.startedAt ?? b.at));
+}
+
+/**
+ * Transcript prompts as display-only timeline rows. Ids are negative so they
+ * can never collide with the tracker's positive ids in the same per-tab array
+ * (markers, stale keys and click-navigation all key on positive ids). Arrival
+ * order puts history first; `displayOrder` sorts by timestamp anyway.
+ */
+export function historyEvents(prompts: HistoryPrompt[]): TimelineEvent[] {
+  return prompts.map((prompt, index) => ({
+    id: -(index + 1),
+    kind: 'turn-start',
+    at: prompt.at,
+    msg: prompt.msg,
+    historical: true,
+  }));
 }

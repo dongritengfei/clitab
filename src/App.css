@@ -501,7 +501,7 @@ body.splitting * {
   color: #cdd6f4;
 }
 
-.timeline-event:hover:not(.stale) {
+.timeline-event:hover:not(.stale):not(.historical) {
   background: #1e1e2e;
 }
 
@@ -554,6 +554,13 @@ body.splitting * {
    there is nothing to jump to anymore. */
 .timeline-event.stale {
   opacity: 0.4;
+  cursor: default;
+}
+
+/* Restored-session history: visible for reading, but the terminal line it
+   belonged to died with the previous run — nothing to jump to. */
+.timeline-event.historical {
+  opacity: 0.55;
   cursor: default;
 }
 

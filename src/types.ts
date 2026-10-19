@@ -27,6 +27,14 @@ export interface TabAnswer {
   at: number;
 }
 
+/** A historical user prompt from a resumed session's transcript. Mirrors
+ *  `HistoryPrompt` in `src-tauri/src/history.rs`. */
+export interface HistoryPrompt {
+  /** Epoch ms from the transcript's own record timestamp. */
+  at: number;
+  msg: string;
+}
+
 export interface Tab {
   id: string;
   title: string;
@@ -42,6 +50,15 @@ export interface Tab {
   /** Backend-owned: the tab is waiting for input (triage queue). Cleared
    *  only by typing into it, never by switching. */
   waiting: boolean;
+  /** Backend-owned: this tab was the looked-at one when the payload was
+   *  built (restore focuses it; backend-created tabs always set it). */
+  isActive: boolean;
+  /** Restored tab whose `--resume` has not been issued yet: the renderer
+   *  triggers it on first activation. */
+  pendingResume: boolean;
+  /** Restored tab with a live resume path: its session transcript's history
+   *  loads on first focus. */
+  restoredSession: boolean;
 }
 
 /** Shape returned by the `create_tab` / `list_tabs` commands. */
@@ -55,6 +72,15 @@ export interface TabResponse {
   /** Notification awaiting the user; null once acknowledged. */
   notice: TabNotice | null;
   waiting: boolean;
+  /** Backend-owned: this tab was the looked-at one when the payload was
+   *  built (restore focuses it; backend-created tabs always set it). */
+  isActive: boolean;
+  /** Restored tab whose `--resume` has not been issued yet: the renderer
+   *  triggers it on first activation. */
+  pendingResume: boolean;
+  /** Restored tab with a live resume path: its session transcript's history
+   *  loads on first focus. */
+  restoredSession: boolean;
 }
 
 export interface PtyOutputPayload {

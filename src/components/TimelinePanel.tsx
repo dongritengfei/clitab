@@ -80,21 +80,35 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
         ) : (
           ordered.map((ev) => {
             const stale = isStale(ev.id);
+            // A history row predates this app run: the terminal scrollback it
+            // belonged to is gone, so it displays but never navigates.
+            const historical = ev.historical === true;
             return (
               <button
                 key={ev.id}
-                className={`timeline-event kind-${ev.kind}${stale ? ' stale' : ''}`}
-                disabled={stale}
+                className={`timeline-event kind-${ev.kind}${stale ? ' stale' : ''}${
+                  historical ? ' historical' : ''
+                }`}
+                disabled={stale || historical}
                 onClick={() => onNavigate(ev.id)}
                 title={
-                  stale
-                    ? 'This point has scrolled out of the terminal history'
-                    : 'Jump to this point in the terminal'
+                  historical
+                    ? "From the resumed session's transcript — predates this app run"
+                    : stale
+                      ? 'This point has scrolled out of the terminal history'
+                      : 'Jump to this point in the terminal'
                 }
               >
                 <span className="timeline-dot" aria-hidden="true" />
                 <span className="timeline-time">{formatTime(ev.startedAt ?? ev.at)}</span>
-                {ev.queued ? (
+                {historical ? (
+                  <span
+                    className="timeline-tag"
+                    title="Loaded from the session transcript after a restore"
+                  >
+                    History
+                  </span>
+                ) : ev.queued ? (
                   <span
                     className="timeline-tag"
                     title="Submitted while the previous turn was still running; it executes when that turn finishes"

@@ -7,7 +7,7 @@ every tab is a real PTY running your shell, named after its working directory
 — or after the session, once the agent gives it a title. Tabs flash when a
 session needs your attention, so a row of parallel agents stays glanceable.
 
-![clitab overview: the tab list, a live Claude Code session with its dashboard, and the session timeline panel](docs/screenshots/overview.jpg)
+![clitab demo: parallel Claude Code sessions at a glance, a new session lighting up, jumping to it, and switching between tabs](docs/screenshots/demo.gif)
 
 Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 [xterm.js](https://xtermjs.org).

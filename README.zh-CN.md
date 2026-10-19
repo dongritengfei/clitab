@@ -6,7 +6,7 @@
 一个运行你 shell 的真实 PTY,以工作目录命名 —— 当 agent 为会话设置标题后,
 则显示会话名。会话需要你关注时标签会闪烁,一排并行 agent 的状态一目了然。
 
-![clitab 整体界面:左侧标签列表、中间运行中的 Claude Code 会话及其仪表盘、右侧会话时间线面板](docs/screenshots/overview.jpg)
+![clitab 演示:多会话全景、新会话亮起、跳转与标签切换](docs/screenshots/demo.gif)
 
 基于 [Tauri 2](https://tauri.app)(Rust + portable-pty)与
 [xterm.js](https://xtermjs.org) 构建。

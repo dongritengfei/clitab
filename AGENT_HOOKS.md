@@ -35,19 +35,54 @@ When a hook command changes, update the wiki's `Agent-Setup.md` and
 - That tty *is* the clitab tab, so events reach the right tab without any
   tab id — and if the agent runs detached (no tty), the guard clause makes the
   hook a silent no-op.
-- Events: `{"e":"prompt","msg":"…"}` turn start, with the submitted prompt for
-  the timeline (msg omitted without jq) · `{"e":"tool","tool":"Bash"}` running
+- Events: `{"e":"prompt","msg":"…","sid":"…","tp":"…","a":"claude"}` turn
+  start, with the submitted prompt for the timeline (msg omitted without jq)
+  and the session binding session restore runs on (`sid` = session id,
+  `tp` = transcript path, `a` = agent kind, `"claude"` or `"qoder"`; all three
+  are omitted without jq or with an old hook install — restore then degrades
+  to plain-shell tabs) · `{"e":"tool","tool":"Bash"}` running
   a tool · `{"e":"answer","msg":"…"}` the user's choice in an AskUserQuestion
   dialog (PostToolUse, other tools emit nothing) · `{"e":"stop"}` turn end
   (clitab computes the duration) · `{"e":"notify","msg":"…"}` needs attention —
   flashes the tab and shows the message until you switch to it or type into
   it (answering the dialog is typing — no hook fires at that moment).
 - [jq](https://jqlang.github.io/jq/) powers tool names, notification text,
-  submitted-prompt text and recorded answers. Without jq everything degrades
+  submitted-prompt text, recorded answers and the session binding
+  (`sid`/`tp`/`a`) that session restore needs. Without jq everything degrades
   gracefully — turn start/stop and flashing still work, only the detail text
-  is missing.
+  is missing and restored tabs come back as plain shells.
 - Every command ends in `; true`: a failing hook must never block the agent.
   Missing jq produces an empty payload, which clitab ignores.
+
+## Session restore
+
+clitab snapshots its tab list (`tab-snapshot.json` in the app config dir,
+written on every snapshot-relevant change — a crash loses nothing) and
+recreates it at the next launch: same tabs, order, titles and working
+directories. A tab whose agent CLI was still running when the snapshot was
+taken comes back with its session resumed — `<agent> --resume <sid>` is
+injected into the tab's ordinary shell, which keeps shell integration (cwd
+reporting, title revert) working and appends to the same transcript (no
+`--fork-session`).
+
+- The binding (`sid`/`tp`/`a`) rides the UserPromptSubmit payload and
+  refreshes on every prompt; only the *latest* session per tab is recorded.
+  Agent liveness comes from existing signals: any hook event ⇒ running,
+  shell-integration `claude-done` (OSC 9) ⇒ exited. `--resume` itself fires
+  no hook, so clitab marks a resumed tab alive on injection.
+- Only the previously-active tab resumes at startup; the others resume on
+  first activation.
+- After a resume, the timeline prepends the session's historical user prompts,
+  parsed from the transcript JSONL (strict rule: plain-string
+  `message.content`, non-sidechain `type:"user"` records, injected wrappers
+  like `<task-notification>` excluded). These **History** rows are
+  display-only — the scrollback they belonged to is gone, so there is nothing
+  to jump to.
+- Degradation is silent at every step: hooks not (re)installed or missing jq
+  ⇒ no binding ⇒ tabs restore as plain shells; deleted transcript ⇒ the
+  resume is cancelled and a kept program title reverts to the cwd. The `sid`
+  is charset-checked (`[A-Za-z0-9-]`) at decode time because it is
+  interpolated into a shell command line.
 
 ## Qoder CLI notes
 

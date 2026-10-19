@@ -27,6 +27,11 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 - **Session timeline** — a clickable log of every prompt you submitted and
   every answer you picked; clicking an entry scrolls the terminal back to
   that point. It even spans agent sessions within a tab.
+- **Session restore** — relaunch to the tabs you left behind: same order,
+  same names, and the agent session you were in resumes where it stopped
+  (the active tab automatically, the others on first click). Restored
+  sessions show their earlier prompts as display-only **History** rows in
+  the timeline.
 - **Open from Finder** — Services → "New clitab Tab Here".
 - **Resizable layout and font zoom** — drag the dividers between the three
   columns (double-click to reset); `⌘=` / `⌘-` / `⌘0` zoom the terminal text.

@@ -4,6 +4,7 @@ mod last_cwd;
 mod menu;
 mod osc;
 mod pty;
+mod restore;
 mod services;
 mod status;
 

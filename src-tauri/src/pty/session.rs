@@ -353,6 +353,12 @@ impl PtySession {
                 // The assistant's turn ended and the prompt came back.
                 program_active.store(false, Ordering::Relaxed);
                 registry.clear_program_title(tab_id);
+                // The shell-integration turn-end flag fires when the agent CLI
+                // hands the terminal back to the shell prompt: the agent has
+                // exited (spec D3). The session binding deliberately survives —
+                // history still refers to it, and the next prompt hook revives
+                // the flag.
+                registry.set_agent_running(tab_id, false);
                 *lock(last_activity) = Instant::now();
                 // After clear_program_title: the notification then carries the
                 // same title the tab bar shows (the cwd it reverted to).
@@ -364,7 +370,18 @@ impl PtySession {
                 // Unknown kinds and malformed payloads decode to None and are
                 // dropped: a hook emitting something newer than this build
                 // must be a no-op, never an error.
+                // The session binding rides the prompt payload (the only hook
+                // whose stdin carries session_id/transcript_path). Old hook
+                // installs omit sid/tp/a and decode_session returns None —
+                // the previous binding is kept, restore degrades silently
+                // (Review Focus 4).
+                if let Some(binding) = status::decode_session(&json) {
+                    registry.set_session(tab_id, binding);
+                }
                 if let Some(event) = status::decode(&json) {
+                    // Any understood hook event proves the agent CLI is alive
+                    // right now (spec D3).
+                    registry.set_agent_running(tab_id, true);
                     Self::handle_status(tab_id, app, registry, flashed, idle_gap_ms, event);
                 }
             }

@@ -1,7 +1,7 @@
 [package]
 name = "clitab"
-version = "0.3.0"
-description = "A terminal tab manager with Claude Code integration"
+version = "0.4.0"
+description = "A tabbed terminal for agent CLI sessions (Claude Code, Qoder CLI)"
 authors = ["you"]
 edition = "2021"
 

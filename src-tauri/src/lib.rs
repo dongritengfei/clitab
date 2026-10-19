@@ -388,6 +388,10 @@ mod tests {
             turn_start: Some(1700000000000),
             prompt_queue: Default::default(),
             last_stop_ms: None,
+            session: None,
+            agent_running: false,
+            resume_pending: false,
+            restored_session: false,
         };
         let json = serde_json::to_value(TabResponse::from(record)).unwrap();
         assert_eq!(
@@ -413,6 +417,10 @@ mod tests {
             turn_start: None,
             prompt_queue: Default::default(),
             last_stop_ms: None,
+            session: None,
+            agent_running: false,
+            resume_pending: false,
+            restored_session: false,
         };
         let json = serde_json::to_value(TabResponse::from(idle)).unwrap();
         assert_eq!(json["status"], serde_json::Value::Null);

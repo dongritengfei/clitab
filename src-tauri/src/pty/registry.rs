@@ -7,8 +7,10 @@
 //! and means `list_tabs` survives a webview reload with the right titles.
 
 use super::lock;
-use crate::status::{is_injected_prompt, Answer, Notice, TabStatus};
+use crate::restore::{Snapshot, SnapshotTab};
+use crate::status::{is_injected_prompt, Answer, Notice, SessionBinding, TabStatus};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// PTY silence that marks a "running" turn as stale. An Esc interrupt fires no
@@ -56,11 +58,35 @@ pub struct TabRecord {
     /// Epoch ms of the last accepted `end_turn`; anchors the duplicate-stop
     /// burst guard.
     pub last_stop_ms: Option<u64>,
+    /// The agent session this tab last talked to. Every prompt hook carrying
+    /// a binding refreshes it; only the *latest* session per tab is recorded
+    /// (spec D7).
+    pub session: Option<SessionBinding>,
+    /// True while the agent CLI is believed to be running: any hook event
+    /// sets it, shell-integration `claude-done` (PromptReady) clears it
+    /// (spec D3). Snapshotted — it decides whether restore offers a resume.
+    pub agent_running: bool,
+    /// Restored tab whose resume has not been issued yet. Set at restore for
+    /// resumable tabs; cleared by `begin_resume` / `cancel_resume`.
+    pub resume_pending: bool,
+    /// This tab exists because of a restore AND its resume path is live:
+    /// drives the renderer's lazy history load. Stays true through
+    /// `begin_resume` (the startup auto-resume clears only `resume_pending`,
+    /// and the renderer still owes the history load); cleared by
+    /// `cancel_resume`.
+    pub restored_session: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct Registry {
     tabs: Mutex<Vec<TabRecord>>,
+    /// The tab the user is looking at; `None` until the first activation.
+    /// Snapshotted so the next launch focuses the same tab.
+    active: Mutex<Option<String>>,
+    /// Directory holding `tab-snapshot.json` (the app config dir). `None` in
+    /// unit tests and when the config dir is unavailable — persistence then
+    /// silently no-ops, exactly like `last_cwd.rs`.
+    persist_dir: Option<PathBuf>,
 }
 
 /// What a Stop hook means for the caller (session.rs): `Idle` is the cue to
@@ -80,6 +106,13 @@ impl Registry {
         Self::default()
     }
 
+    /// A registry that persists the tab snapshot to `dir` on every
+    /// snapshot-relevant change (spec Q6: continuously, not only at quit —
+    /// a crash must leave the same state a graceful quit would).
+    pub fn with_persist_dir(dir: PathBuf) -> Self {
+        Self { persist_dir: Some(dir), ..Self::default() }
+    }
+
     /// Register a fresh tab whose title starts out as its working directory.
     pub fn insert(&self, id: String, cwd: String) -> TabRecord {
         let record = TabRecord {
@@ -94,16 +127,45 @@ impl Registry {
             turn_start: None,
             prompt_queue: VecDeque::new(),
             last_stop_ms: None,
+            session: None,
+            agent_running: false,
+            resume_pending: false,
+            restored_session: false,
         };
         lock(&self.tabs).push(record.clone());
+        self.persist();
+        record
+    }
+
+    /// Register a pre-built record (restore path: title and flags come from
+    /// the snapshot, not from the cwd defaults).
+    pub fn insert_record(&self, record: TabRecord) -> TabRecord {
+        lock(&self.tabs).push(record.clone());
+        self.persist();
         record
     }
 
     pub fn remove(&self, id: &str) -> bool {
-        let mut tabs = lock(&self.tabs);
-        let before = tabs.len();
-        tabs.retain(|t| t.id != id);
-        tabs.len() != before
+        // Successor rule matches the renderer's `abandonTab`: the neighbor at
+        // the closed index takes over (next tab slides into place; at the end
+        // of the list, the new last one). Computed in its own scope — the
+        // tabs lock is released before `active` is touched (lock rule).
+        let successor = {
+            let mut tabs = lock(&self.tabs);
+            let Some(index) = tabs.iter().position(|t| t.id == id) else {
+                return false;
+            };
+            tabs.remove(index);
+            tabs.get(index.min(tabs.len().saturating_sub(1))).map(|t| t.id.clone())
+        };
+        {
+            let mut active = lock(&self.active);
+            if active.as_deref() == Some(id) {
+                *active = successor;
+            }
+        }
+        self.persist();
+        true
     }
 
     /// Move a tab to `to_index` (remove-then-insert, index clamped to the
@@ -118,6 +180,8 @@ impl Registry {
         let record = tabs.remove(from);
         let target = to_index.min(tabs.len());
         tabs.insert(target, record);
+        drop(tabs); // persist() re-locks tabs — release first (lock rule)
+        self.persist();
         true
     }
 
@@ -127,11 +191,23 @@ impl Registry {
     }
 
     /// A program (shell prompt, TUI, `echo -e`) set the terminal title.
+    /// Change-gated: a repaint storm must not become a write storm.
     pub fn set_title(&self, id: &str, title: &str, is_program_title: bool) {
-        let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.title = title.to_string();
-            tab.has_program_title = is_program_title;
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab)
+                    if tab.title != title || tab.has_program_title != is_program_title =>
+                {
+                    tab.title = title.to_string();
+                    tab.has_program_title = is_program_title;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.persist();
         }
     }
 
@@ -139,26 +215,138 @@ impl Registry {
     /// value actually changed: the hook fires on every prompt, and only a
     /// real change is worth persisting (see the CwdChanged handler).
     pub fn set_cwd(&self, id: &str, cwd: &str) -> bool {
-        let mut tabs = lock(&self.tabs);
-        match tabs.iter_mut().find(|t| t.id == id) {
-            Some(tab) if tab.cwd != cwd => {
-                tab.cwd = cwd.to_string();
-                if !tab.has_program_title {
-                    tab.title = cwd.to_string();
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if tab.cwd != cwd => {
+                    tab.cwd = cwd.to_string();
+                    if !tab.has_program_title {
+                        tab.title = cwd.to_string();
+                    }
+                    true
                 }
-                true
+                _ => false,
             }
-            _ => false,
+        };
+        if changed {
+            self.persist();
         }
+        changed
     }
 
     /// Forget a program title and fall back to the working directory.
+    /// Change-gated: fires on every turn end.
     pub fn clear_program_title(&self, id: &str) {
-        let mut tabs = lock(&self.tabs);
-        if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-            tab.has_program_title = false;
-            tab.title = tab.cwd.clone();
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if tab.has_program_title => {
+                    tab.has_program_title = false;
+                    tab.title = tab.cwd.clone();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.persist();
         }
+    }
+
+    /// The user is looking at this tab (the renderer reports every switch).
+    /// Change-gated: tab clicks are frequent, disk writes must not be.
+    pub fn set_active(&self, id: &str) {
+        let changed = {
+            let mut active = lock(&self.active);
+            if active.as_deref() == Some(id) {
+                false
+            } else {
+                *active = Some(id.to_string());
+                true
+            }
+        };
+        if changed {
+            self.persist();
+        }
+    }
+
+    pub fn active_id(&self) -> Option<String> {
+        lock(&self.active).clone()
+    }
+
+    /// A prompt hook carried a session binding: record it. Change-gated —
+    /// the same binding re-arrives on every prompt of a session, and only
+    /// the first (or a genuinely new session) is worth a write.
+    pub fn set_session(&self, id: &str, binding: SessionBinding) {
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if tab.session.as_ref() != Some(&binding) => {
+                    tab.session = Some(binding);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// Agent liveness (spec D3): any hook event ⇒ `true`; shell-integration
+    /// `claude-done` (PromptReady) ⇒ `false`. Change-gated: hook events are
+    /// dense, transitions are rare.
+    pub fn set_agent_running(&self, id: &str, running: bool) {
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if tab.agent_running != running => {
+                    tab.agent_running = running;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// The `<agent> --resume <sid>` line was injected into the tab's shell.
+    /// `claude --resume` fires NO hook at startup, so `agent_running` must be
+    /// set HERE: quitting right after a restore must still snapshot the tab
+    /// as alive, or the next launch would not offer the resume again and the
+    /// restore chain would silently break (spec D3). `restored_session`
+    /// stays true — the renderer still owes this tab its history load.
+    pub fn begin_resume(&self, id: &str) {
+        {
+            let mut tabs = lock(&self.tabs);
+            if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+                tab.resume_pending = false;
+                tab.agent_running = true;
+            }
+        }
+        self.persist();
+    }
+
+    /// Resume is impossible (transcript deleted, binding lost): the tab stays
+    /// a plain shell (spec D4). A program title kept from the snapshot is
+    /// reverted — the agent it belonged to is not running. The binding is
+    /// deliberately KEPT: `session_history` can still serve the transcript
+    /// if it reappears, and a later prompt hook revives the tab normally.
+    pub fn cancel_resume(&self, id: &str) {
+        {
+            let mut tabs = lock(&self.tabs);
+            if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
+                tab.resume_pending = false;
+                tab.restored_session = false;
+                if tab.has_program_title {
+                    tab.has_program_title = false;
+                    tab.title = tab.cwd.clone();
+                }
+            }
+        }
+        self.persist();
     }
 
     /// Mark a tab as waiting for input. Returns true only on the
@@ -365,6 +553,49 @@ impl Registry {
 
     pub fn list(&self) -> Vec<TabRecord> {
         lock(&self.tabs).clone()
+    }
+
+    /// Everything the next launch needs to recreate this moment, in sidebar
+    /// order. Clone-and-release per the lock rule: `tabs` and `active` are
+    /// locked one after the other, never at the same time — `persist()` is
+    /// called from mutators that have just released their own guards.
+    pub fn snapshot(&self) -> Snapshot {
+        let tabs = lock(&self.tabs).clone();
+        let active = lock(&self.active).clone();
+        let active_index = active
+            .as_deref()
+            .and_then(|id| tabs.iter().position(|t| t.id == id));
+        Snapshot::current(
+            tabs.into_iter()
+                .map(|t| SnapshotTab {
+                    cwd: t.cwd,
+                    title: t.title,
+                    has_program_title: t.has_program_title,
+                    session: t.session,
+                    agent_running: t.agent_running,
+                })
+                .collect(),
+            active_index,
+        )
+    }
+
+    // Persistence map (spec Q6). Snapshot-relevant mutators write the file:
+    //   insert, insert_record, remove, reorder, set_title, set_cwd,
+    //   clear_program_title, set_active, set_session, set_agent_running,
+    //   begin_resume, cancel_resume
+    // Turn-protocol mutators deliberately do NOT (turn state is not part of
+    // the snapshot; a restored tab starts protocol-fresh):
+    //   set_waiting, clear_waiting, begin_turn, begin_auto_turn, set_tool,
+    //   end_turn, reconcile_idle_turn, set_notice, set_answer, clear_notice
+
+    /// Write `tab-snapshot.json`. MUST NOT be called while any registry lock
+    /// is held (it re-locks via `snapshot()`). Best-effort like everything
+    /// else in this file's persistence story.
+    fn persist(&self) {
+        let Some(dir) = &self.persist_dir else {
+            return;
+        };
+        crate::restore::save(dir, &self.snapshot());
     }
 }
 
@@ -928,5 +1159,155 @@ mod tests {
         assert_eq!(tab.status, None);
         assert_eq!(tab.notice, None);
         assert_eq!(tab.turn_start, None);
+    }
+
+    use crate::status::AgentKind;
+
+    fn binding(sid: &str) -> SessionBinding {
+        SessionBinding { agent: AgentKind::Claude, sid: sid.into(), transcript: None }
+    }
+
+    fn persist_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("clitab-registry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A tab as the restore path builds it: snapshot said an agent session
+    /// was alive, resume not yet issued.
+    fn restored_record(id: &str) -> TabRecord {
+        TabRecord {
+            id: id.into(),
+            title: "Fix build".into(),
+            cwd: "/proj".into(),
+            has_program_title: true,
+            waiting: false,
+            status: None,
+            notice: None,
+            answer: None,
+            turn_start: None,
+            prompt_queue: VecDeque::new(),
+            last_stop_ms: None,
+            session: Some(binding("s-1")),
+            agent_running: true,
+            resume_pending: true,
+            restored_session: true,
+        }
+    }
+
+    #[test]
+    fn session_and_agent_running_track_the_hook_signals() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        assert_eq!(registry.get("t1").unwrap().session, None);
+        registry.set_session("t1", binding("s-1"));
+        registry.set_agent_running("t1", true);
+        let tab = registry.get("t1").unwrap();
+        assert_eq!(tab.session.as_ref().unwrap().sid, "s-1");
+        assert!(tab.agent_running);
+        // shell integration's claude-done (PromptReady): the agent exited
+        registry.set_agent_running("t1", false);
+        assert!(!registry.get("t1").unwrap().agent_running);
+        // the binding survives the exit — history still knows which session
+        // the tab belongs to
+        assert_eq!(registry.get("t1").unwrap().session.unwrap().sid, "s-1");
+    }
+
+    #[test]
+    fn resume_flags_transition() {
+        let registry = Registry::new();
+        registry.insert_record(restored_record("t1"));
+        let tab = registry.get("t1").unwrap();
+        assert!(tab.resume_pending);
+        assert!(tab.restored_session);
+        assert!(tab.agent_running, "snapshot said the agent was alive");
+
+        registry.begin_resume("t1");
+        let tab = registry.get("t1").unwrap();
+        assert!(!tab.resume_pending, "resume issued");
+        assert!(tab.agent_running, "--resume fires no hook; the flag must be set here");
+        assert!(tab.restored_session, "history still belongs to the restored session");
+    }
+
+    /// Review Focus 5 (deleted transcript): cancel keeps the tab a usable
+    /// plain shell — title reverts to the cwd, but the session binding stays
+    /// so the transcript's history can still be served.
+    #[test]
+    fn cancel_resume_reverts_to_a_plain_shell_tab() {
+        let registry = Registry::new();
+        registry.insert_record(restored_record("t1"));
+        registry.cancel_resume("t1");
+        let tab = registry.get("t1").unwrap();
+        assert!(!tab.resume_pending);
+        assert!(!tab.restored_session);
+        assert!(!tab.has_program_title);
+        assert_eq!(tab.title, "/proj");
+        assert_eq!(tab.session.unwrap().sid, "s-1", "binding is kept for history");
+    }
+
+    #[test]
+    fn active_defaults_to_the_closed_tabs_neighbor() {
+        let registry = abc();
+        registry.set_active("b");
+        assert_eq!(registry.active_id().unwrap(), "b");
+        registry.remove("b");
+        assert_eq!(registry.active_id().unwrap(), "c", "next tab slides into place");
+        registry.remove("c");
+        assert_eq!(registry.active_id().unwrap(), "a", "clamped to the new last");
+        registry.remove("a");
+        assert_eq!(registry.active_id(), None, "no tabs, no active tab");
+    }
+
+    #[test]
+    fn removing_a_background_tab_keeps_the_active_one() {
+        let registry = abc();
+        registry.set_active("a");
+        registry.remove("b");
+        assert_eq!(registry.active_id().unwrap(), "a");
+    }
+
+    #[test]
+    fn snapshot_captures_tabs_order_session_and_active_index() {
+        let dir = persist_dir();
+        let registry = Registry::with_persist_dir(dir.clone());
+        registry.insert("a".into(), "/a".into());
+        registry.insert("b".into(), "/b".into());
+        registry.set_session("b", binding("s-1"));
+        registry.set_agent_running("b", true);
+        registry.set_title("b", "Fix build", true);
+        registry.reorder("a", 1);
+        registry.set_active("a");
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(snapshot.tabs[0].cwd, "/b");
+        assert_eq!(snapshot.tabs[0].title, "Fix build");
+        assert!(snapshot.tabs[0].has_program_title);
+        assert_eq!(snapshot.tabs[0].session.as_ref().unwrap().sid, "s-1");
+        assert!(snapshot.tabs[0].agent_running);
+        assert_eq!(snapshot.tabs[1].cwd, "/a");
+        assert_eq!(snapshot.active, Some(1), "a is second after the reorder");
+        // every change above persisted: the file matches the in-memory state
+        assert_eq!(crate::restore::load(&dir).unwrap(), snapshot);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Turn-protocol state is deliberately NOT part of the snapshot: a
+    /// restored tab starts protocol-fresh (see `SnapshotTab`'s doc).
+    #[test]
+    fn turn_protocol_mutators_do_not_persist() {
+        let dir = persist_dir();
+        let registry = Registry::with_persist_dir(dir.clone());
+        registry.insert("a".into(), "/a".into());
+        registry.begin_turn("a", 1000, Some("hi".into()), 99_999);
+        registry.set_notice("a", Some("permission?".into()), 1100);
+        registry.set_waiting("a");
+        let on_disk = crate::restore::load(&dir).unwrap();
+        assert_eq!(on_disk.tabs.len(), 1);
+        assert!(!on_disk.tabs[0].agent_running);
+        // the in-memory turn state exists but never reached the file
+        assert!(registry.get("a").unwrap().status.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -68,5 +68,6 @@ Mutexes are locked via `pty::lock()`, which recovers from poisoning rather than 
 
 ## Docs
 
-- `README.md` / `README.zh-CN.md` — user-facing, kept in sync with each other; update both when features/shortcuts/install steps change.
-- `AGENT_HOOKS.md` — the one-time agent hook setup (Claude Code + Qoder CLI, OSC 7777 protocol) that powers the attention flash and the tab dashboard. The Qoder block differs from the Claude one only in the `Notification` matcher (filters out Qoder's non-attention notification types).
+- `README.md` / `README.zh-CN.md` — user-facing landing pages, kept in sync with each other; update both when features/shortcuts/install steps change. Link to wiki *pages*, never to in-page anchors.
+- GitHub wiki (`https://github.com/dongritengfei/clitab.wiki.git`, a separate repo — clone it to edit) — the user manual: `Getting-Started` / `Everyday-Use` / `Agent-Setup` / `Agent-Features` / `Shortcuts` / `Troubleshooting`, each with a `.zh` counterpart page, plus `Home` and `_Sidebar`. The `Agent-Setup` pages hold the canonical copy-paste hook-install prompts (Claude Code + Qoder CLI; the Qoder JSON differs only in the `Notification` matcher) — when hook commands change, update `Agent-Setup.md` and `Agent-Setup.zh.md` there and keep the JSON byte-identical.
+- `AGENT_HOOKS.md` — developer-facing OSC 7777 protocol reference (event payloads, tty transport, Qoder CLI limitations, legacy notes). Setup instructions live on the wiki, not here.

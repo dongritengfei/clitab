@@ -64,6 +64,70 @@ pub fn decode(json: &str) -> Option<StatusEvent> {
     }
 }
 
+/// Which agent CLI a tab's session belongs to; `cmd` is the binary name the
+/// resume injection types into the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    Claude,
+    Qoder,
+}
+
+impl AgentKind {
+    pub fn cmd(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Qoder => "qoder",
+        }
+    }
+}
+
+/// The agent session a tab is currently talking to, learned from the prompt
+/// hook's `sid`/`tp`/`a` fields. Persisted into the tab snapshot so the next
+/// launch can `--resume` it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBinding {
+    pub agent: AgentKind,
+    pub sid: String,
+    /// Hook-supplied transcript path; `None` when the hook could not provide
+    /// it (history then derives the conventional projects-dir path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+}
+
+/// Decode the session-binding side of a payload (in practice only
+/// UserPromptSubmit carries it). `None` when the hook did not send a usable
+/// binding — old install, missing jq, unknown agent — and callers keep the
+/// previous binding then. The sid charset guard is load-bearing: the id is
+/// interpolated into a shell command line at resume time.
+pub fn decode_session(json: &str) -> Option<SessionBinding> {
+    #[derive(Deserialize)]
+    struct SessionWire {
+        #[serde(default)]
+        sid: Option<String>,
+        #[serde(default)]
+        tp: Option<String>,
+        #[serde(default)]
+        a: Option<String>,
+    }
+    let wire: SessionWire = serde_json::from_str(json).ok()?;
+    let agent = match wire.a?.as_str() {
+        "claude" => AgentKind::Claude,
+        "qoder" => AgentKind::Qoder,
+        _ => return None,
+    };
+    let sid = wire.sid?;
+    if sid.is_empty() || !sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(SessionBinding {
+        agent,
+        sid,
+        transcript: wire.tp.filter(|tp| !tp.is_empty()),
+    })
+}
+
 /// Classifies a prompt hook's text: Claude Code injects background-task
 /// completion notices (`<task-notification>` XML) through the user prompt
 /// pipeline — the UserPromptSubmit hook fires with the XML as the prompt.
@@ -236,5 +300,76 @@ mod tests {
         assert_eq!(json, serde_json::json!({"msg": "hi", "at": 7}));
         let json = serde_json::to_value(Answer { msg: "A".into(), at: 9 }).unwrap();
         assert_eq!(json, serde_json::json!({"msg": "A", "at": 9}));
+    }
+
+    #[test]
+    fn session_binding_decodes_from_the_prompt_payload() {
+        let b = decode_session(
+            r#"{"e":"prompt","msg":"hi","sid":"6f9a1b2c-0d3e","tp":"/Users/x/.claude/projects/-Users-x/6f9a1b2c.jsonl","a":"claude"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.agent, AgentKind::Claude);
+        assert_eq!(b.agent.cmd(), "claude");
+        assert_eq!(b.sid, "6f9a1b2c-0d3e");
+        assert_eq!(
+            b.transcript.as_deref(),
+            Some("/Users/x/.claude/projects/-Users-x/6f9a1b2c.jsonl")
+        );
+        // The status event itself is unchanged by the extra fields.
+        assert_eq!(
+            decode(r#"{"e":"prompt","msg":"hi","sid":"6f9a1b2c-0d3e","a":"claude"}"#),
+            Some(StatusEvent::Prompt { msg: Some("hi".into()) })
+        );
+    }
+
+    #[test]
+    fn qoder_binding_decodes_with_its_own_command() {
+        let b = decode_session(r#"{"e":"prompt","sid":"abc123","a":"qoder"}"#).unwrap();
+        assert_eq!(b.agent, AgentKind::Qoder);
+        assert_eq!(b.agent.cmd(), "qoder");
+        assert_eq!(b.transcript, None, "tp is optional; history derives a path");
+    }
+
+    /// The sid is interpolated into a shell command line at resume time, so the
+    /// decoder is the injection guard: anything outside [A-Za-z0-9-] is rejected.
+    #[test]
+    fn session_binding_rejects_unusable_fields() {
+        assert_eq!(decode_session(r#"{"e":"prompt","sid":"abc"}"#), None, "no agent kind");
+        assert_eq!(decode_session(r#"{"e":"prompt","a":"claude"}"#), None, "no sid");
+        assert_eq!(decode_session(r#"{"e":"prompt","a":"claude","sid":""}"#), None);
+        assert_eq!(decode_session(r#"{"e":"prompt","a":"claude","sid":"a; rm -rf /"}"#), None);
+        assert_eq!(decode_session(r#"{"e":"prompt","a":"claude","sid":"$(whoami)"}"#), None);
+        assert_eq!(decode_session(r#"{"e":"prompt","a":"cursor","sid":"abc"}"#), None, "unknown agent");
+        assert_eq!(decode_session("not json"), None);
+    }
+
+    #[test]
+    fn empty_transcript_path_is_normalized_to_none() {
+        let b = decode_session(r#"{"e":"prompt","a":"claude","sid":"abc","tp":""}"#).unwrap();
+        assert_eq!(b.transcript, None);
+    }
+
+    /// Payloads from old hook installs (no sid/tp/a) keep decoding as before —
+    /// session restore degrades to plain-shell tabs, never to an error.
+    #[test]
+    fn legacy_payloads_have_no_binding_but_keep_working() {
+        assert_eq!(decode_session(r#"{"e":"prompt","msg":"hi"}"#), None);
+        assert_eq!(
+            decode(r#"{"e":"prompt","msg":"hi"}"#),
+            Some(StatusEvent::Prompt { msg: Some("hi".into()) })
+        );
+    }
+
+    /// The snapshot file round-trips bindings through serde.
+    #[test]
+    fn session_binding_round_trips_through_json() {
+        let b = SessionBinding {
+            agent: AgentKind::Qoder,
+            sid: "s-1".into(),
+            transcript: Some("/tp.jsonl".into()),
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        assert_eq!(serde_json::from_str::<SessionBinding>(&json).unwrap(), b);
+        assert!(json.contains(r#""agent":"qoder""#), "{json}");
     }
 }

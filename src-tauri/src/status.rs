@@ -125,7 +125,7 @@ impl<'de> Deserialize<'de> for SessionBinding {
         struct Raw {
             agent: AgentKind,
             sid: String,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[serde(default)]
             transcript: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;

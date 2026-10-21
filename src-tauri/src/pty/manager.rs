@@ -332,14 +332,18 @@ impl TabManager {
             Self::emit_cancelled_title(&self.app, self.registry.as_ref(), tab_id);
             return Ok(());
         }
-        let line = format!("{} --resume {}\n", binding.agent.cmd(), binding.sid);
-        self.session(tab_id)?.write(line.as_bytes())?;
         // `--resume` fires no hook: the registry must learn "agent alive"
         // from here, or an immediate quit would break the restore chain.
-        // Test-and-set (Fix 3): only the caller that actually won the flip
-        // injected the command; the loser's stdin must not receive a second
-        // copy of the line as a submitted prompt.
-        self.registry.begin_resume(tab_id);
+        // The flip is the single serialization point for the injection:
+        // the PTY write happens only when this caller won it, so the
+        // startup-race second caller cannot land a second `<agent>
+        // --resume <sid>` in the just-launched agent's stdin as a
+        // submitted prompt.
+        if !self.registry.begin_resume(tab_id) {
+            return Ok(());
+        }
+        let line = format!("{} --resume {}\n", binding.agent.cmd(), binding.sid);
+        self.session(tab_id)?.write(line.as_bytes())?;
         Ok(())
     }
 

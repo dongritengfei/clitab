@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
@@ -234,7 +234,6 @@ impl TabManager {
         }
 
         {
-            use tauri::Emitter;
             for (index, record) in created.iter().enumerate() {
                 // Re-read each record: the resume and any early shell
                 // integration output are already reflected in the payload.
@@ -320,6 +319,7 @@ impl TabManager {
         }
         let Some(binding) = record.session.clone() else {
             self.registry.cancel_resume(tab_id);
+            Self::emit_cancelled_title(&self.app, self.registry.as_ref(), tab_id);
             return Ok(());
         };
         let has_transcript = crate::history::transcript_for(&binding, &record.cwd)
@@ -329,14 +329,36 @@ impl TabManager {
             // Deleted between quit and relaunch: plain shell, title reverts,
             // no error the user could act on (Review Focus 5).
             self.registry.cancel_resume(tab_id);
+            Self::emit_cancelled_title(&self.app, self.registry.as_ref(), tab_id);
             return Ok(());
         }
         let line = format!("{} --resume {}\n", binding.agent.cmd(), binding.sid);
         self.session(tab_id)?.write(line.as_bytes())?;
         // `--resume` fires no hook: the registry must learn "agent alive"
         // from here, or an immediate quit would break the restore chain.
+        // Test-and-set (Fix 3): only the caller that actually won the flip
+        // injected the command; the loser's stdin must not receive a second
+        // copy of the line as a submitted prompt.
         self.registry.begin_resume(tab_id);
         Ok(())
+    }
+
+    /// Emit a `tab-title` event for a tab whose resume was cancelled, so the
+    /// renderer replaces the dead session's program title with the reverted
+    /// cwd title. Mirrors the exact payload shape of the in-session.rs
+    /// emitter — the renderer has a single shape to pattern-match.
+    fn emit_cancelled_title(app: &AppHandle, registry: &Registry, tab_id: &str) {
+        let Some(record) = registry.get(tab_id) else {
+            return;
+        };
+        let _ = app.emit(
+            "tab-title",
+            serde_json::json!({
+                "tab_id": tab_id,
+                "title": record.title,
+                "program_title": record.has_program_title,
+            }),
+        );
     }
 }
 

@@ -318,15 +318,31 @@ impl Registry {
     /// as alive, or the next launch would not offer the resume again and the
     /// restore chain would silently break (spec D3). `restored_session`
     /// stays true — the renderer still owes this tab its history load.
-    pub fn begin_resume(&self, id: &str) {
-        {
+    ///
+    /// Test-and-set: flips `resume_pending` true→false and sets
+    /// `agent_running` only when it won the flip. Returns true only when this
+    /// caller actually issued the resume — the startup race (webview-mount
+    /// slow path fires `resume_tab` while the startup thread's own
+    /// `resume_tab` is in flight) would otherwise inject the command twice,
+    /// and the second write lands in the just-launched agent's stdin as a
+    /// submitted prompt. Persists only on a win, matching the change-gated
+    /// style of every other mutator.
+    pub fn begin_resume(&self, id: &str) -> bool {
+        let won = {
             let mut tabs = lock(&self.tabs);
-            if let Some(tab) = tabs.iter_mut().find(|t| t.id == id) {
-                tab.resume_pending = false;
-                tab.agent_running = true;
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if tab.resume_pending => {
+                    tab.resume_pending = false;
+                    tab.agent_running = true;
+                    true
+                }
+                _ => false,
             }
+        };
+        if won {
+            self.persist();
         }
-        self.persist();
+        won
     }
 
     /// Resume is impossible (transcript deleted, binding lost): the tab stays
@@ -1227,11 +1243,36 @@ mod tests {
         assert!(tab.restored_session);
         assert!(tab.agent_running, "snapshot said the agent was alive");
 
-        registry.begin_resume("t1");
+        assert!(registry.begin_resume("t1"), "first caller wins the flip");
         let tab = registry.get("t1").unwrap();
         assert!(!tab.resume_pending, "resume issued");
         assert!(tab.agent_running, "--resume fires no hook; the flag must be set here");
         assert!(tab.restored_session, "history still belongs to the restored session");
+    }
+
+    /// Test-and-set gate (Fix 3): the second caller must NOT re-inject the
+    /// resume command — the second write would land in the just-launched
+    /// agent's stdin as a submitted prompt. State must be unchanged after
+    /// the losing call.
+    #[test]
+    fn begin_resume_is_test_and_set() {
+        let registry = Registry::new();
+        registry.insert_record(restored_record("t1"));
+        // First caller wins, flips resume_pending→false, sets agent_running.
+        assert!(registry.begin_resume("t1"));
+        let after_first = registry.get("t1").unwrap();
+        // Second caller loses — state unchanged, returns false.
+        assert!(!registry.begin_resume("t1"));
+        let after_second = registry.get("t1").unwrap();
+        assert_eq!(after_second.resume_pending, after_first.resume_pending);
+        assert_eq!(after_second.agent_running, after_first.agent_running);
+        assert_eq!(after_second.restored_session, after_first.restored_session);
+        // Unknown tab also returns false (no panic, no state change).
+        assert!(!registry.begin_resume("nope"));
+        // Non-pending known tab returns false too.
+        let registry2 = Registry::new();
+        registry2.insert("fresh".into(), "/tmp".into());
+        assert!(!registry2.begin_resume("fresh"));
     }
 
     /// Review Focus 5 (deleted transcript): cancel keeps the tab a usable

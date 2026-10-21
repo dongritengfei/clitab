@@ -85,7 +85,13 @@ impl AgentKind {
 /// The agent session a tab is currently talking to, learned from the prompt
 /// hook's `sid`/`tp`/`a` fields. Persisted into the tab snapshot so the next
 /// launch can `--resume` it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The `sid` is interpolated into a shell command line at resume time
+/// (`TabManager::resume_tab`) and into a transcript path at history load, so
+/// it is validated on *every* serde ingress — not just the hook path — via
+/// the custom `Deserialize` below. A hostile snapshot (tampered or corrupt)
+/// degrades to "no binding", never to injected shell input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionBinding {
     pub agent: AgentKind,
@@ -94,6 +100,46 @@ pub struct SessionBinding {
     /// it (history then derives the conventional projects-dir path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+}
+
+/// The sid charset guard: `[A-Za-z0-9-]`, non-empty. The sid is interpolated
+/// into a shell command line at resume time and into a transcript path at
+/// history load, so this predicate is the single injection guard shared by
+/// the hook decoder and the snapshot's serde ingress. Factored out so the
+/// two call sites cannot drift.
+pub fn is_valid_sid(sid: &str) -> bool {
+    !sid.is_empty() && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+impl<'de> Deserialize<'de> for SessionBinding {
+    /// Custom deserialize: rejects unsafe sids with a serde error so the
+    /// snapshot loader's `ok()?` turns a hostile binding into `session: None`
+    /// while the rest of the tab (cwd, title, flags) survives — matches the
+    /// file's existing "corrupt → nothing to restore" tolerance.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            agent: AgentKind,
+            sid: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            transcript: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if !is_valid_sid(&raw.sid) {
+            return Err(serde::de::Error::custom(
+                "session binding sid contains unsafe characters",
+            ));
+        }
+        Ok(SessionBinding {
+            agent: raw.agent,
+            sid: raw.sid,
+            transcript: raw.transcript,
+        })
+    }
 }
 
 /// Decode the session-binding side of a payload (in practice only
@@ -118,7 +164,7 @@ pub fn decode_session(json: &str) -> Option<SessionBinding> {
         _ => return None,
     };
     let sid = wire.sid?;
-    if sid.is_empty() || !sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if !is_valid_sid(&sid) {
         return None;
     }
     Some(SessionBinding {
@@ -371,5 +417,22 @@ mod tests {
         let json = serde_json::to_string(&b).unwrap();
         assert_eq!(serde_json::from_str::<SessionBinding>(&json).unwrap(), b);
         assert!(json.contains(r#""agent":"qoder""#), "{json}");
+    }
+
+    /// The custom `Deserialize` is the snapshot-side injection guard: a
+    /// hostile sid must fail serde so `restore::load`'s `ok()?` drops the
+    /// binding while the rest of the tab survives.
+    #[test]
+    fn session_binding_deserialize_rejects_unsafe_sids() {
+        let ok = r#"{"agent":"claude","sid":"6f9a1b2c-0d3e"}"#;
+        assert!(serde_json::from_str::<SessionBinding>(ok).is_ok());
+        let hostile_shell = r#"{"agent":"claude","sid":"a; rm -rf /"}"#;
+        assert!(serde_json::from_str::<SessionBinding>(hostile_shell).is_err());
+        let hostile_newline = r#"{"agent":"claude","sid":"a\nrm -rf /"}"#;
+        assert!(serde_json::from_str::<SessionBinding>(hostile_newline).is_err());
+        let hostile_subshell = r#"{"agent":"claude","sid":"$(whoami)"}"#;
+        assert!(serde_json::from_str::<SessionBinding>(hostile_subshell).is_err());
+        let empty = r#"{"agent":"claude","sid":""}"#;
+        assert!(serde_json::from_str::<SessionBinding>(empty).is_err());
     }
 }

@@ -158,6 +158,14 @@ fn detach_tab(state: State<'_, AppState>, tab_id: String) -> Result<(), String> 
     Ok(())
 }
 
+/// Keep the View ▸ "Pinned Input Strip" checkbox in sync with the renderer's
+/// persisted preference (reported at startup and on every toggle). The pref
+/// lives in the renderer, so the native item cannot know it on its own.
+#[tauri::command]
+fn set_input_strip_checked(enabled: bool) {
+    menu::set_input_strip_checked(enabled);
+}
+
 #[tauri::command]
 fn has_active_process(state: State<'_, AppState>, tab_id: String) -> Result<bool, String> {
     Ok(state.tab_manager.has_active_process(&tab_id))
@@ -317,7 +325,8 @@ pub fn run() {
             attach_stream,
             detach_tab,
             has_active_process,
-            ack_tab_notice
+            ack_tab_notice,
+            set_input_strip_checked
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

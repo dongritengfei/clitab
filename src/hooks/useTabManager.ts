@@ -18,7 +18,7 @@ import {
   type TabWaitingPayload,
 } from '../types';
 import { base64ToBytes, bytesToBase64 } from '../lib/base64';
-import { loadNumber, saveNumber } from '../lib/prefs';
+import { loadBool, loadNumber, saveBool, saveNumber } from '../lib/prefs';
 import { getTerm } from '../lib/termRegistry';
 import {
   MAX_TIMELINE_EVENTS,
@@ -54,6 +54,10 @@ const FONT_SIZE_DEFAULT = 14;
 const FONT_SIZE_MIN = 10;
 const FONT_SIZE_MAX = 24;
 
+/** Pinned input strip master switch (View ▸ Pinned Input Strip), persisted
+ * across restarts. The native menu checkbox mirrors this value. */
+const INPUT_STRIP_KEY = 'clitab.inputStripEnabled';
+
 function toTab(response: TabResponse): Tab {
   return { ...response, flashing: false };
 }
@@ -88,6 +92,11 @@ export interface TabManagerState {
   closeSearch: () => void;
   /** xterm font size shared by every terminal (View ▸ Zoom, persisted). */
   terminalFontSize: number;
+  /** Pinned input strip master switch (View ▸ Pinned Input Strip, persisted). */
+  inputStripEnabled: boolean;
+  /** ⌘⇧B focus request for the active tab's strip; each increment is a
+   * fresh pin-and-focus request. Renderer-only, like searchNonce. */
+  inputStripFocusNonce: number;
   /** Per-tab timeline of key hook-protocol events (renderer-only history). */
   timelines: Record<string, TimelineEvent[]>;
   /** Keys `${tabId}:${eventId}` whose terminal line left the scrollback. */
@@ -114,6 +123,12 @@ export function useTabManager(): TabManagerState {
   );
   const [timelines, setTimelines] = useState<Record<string, TimelineEvent[]>>({});
   const [staleEvents, setStaleEvents] = useState<ReadonlySet<string>>(() => new Set());
+  const [inputStripEnabled, setInputStripEnabled] = useState(() =>
+    loadBool(INPUT_STRIP_KEY, true)
+  );
+  const [inputStripFocusNonce, setInputStripFocusNonce] = useState(0);
+  const inputStripEnabledRef = useRef(inputStripEnabled);
+  inputStripEnabledRef.current = inputStripEnabled;
 
   // Timeline transition detection is per-tab stateful. Markers bind an event
   // to its terminal line; they are mutable xterm objects, so they live in a
@@ -365,6 +380,51 @@ export function useTabManager(): TabManagerState {
     saveNumber(FONT_SIZE_KEY, FONT_SIZE_DEFAULT);
   }, []);
 
+  // The caret target when focus must leave the strip: the active tab's main
+  // terminal. Class-scoped so the strip's own mirror textarea (also inside
+  // the panel) can never match — the terminal container is the panel's first
+  // child, the strip its last.
+  const focusActiveTerminal = useCallback(() => {
+    const tabId = activeTabRef.current;
+    if (!tabId) return;
+    document
+      .getElementById(`panel-${tabId}`)
+      ?.querySelector<HTMLElement>('.terminal-container .xterm-helper-textarea')
+      ?.focus();
+  }, []);
+
+  const applyInputStripEnabled = useCallback((enabled: boolean) => {
+    inputStripEnabledRef.current = enabled;
+    setInputStripEnabled(enabled);
+    saveBool(INPUT_STRIP_KEY, enabled);
+    // The native checkbox cannot read the renderer's persisted pref; sync it
+    // on every change (and at startup), which also heals the auto-toggle
+    // macOS applies when a checkbox item is clicked.
+    void invoke('set_input_strip_checked', { enabled }).catch(() => {});
+  }, []);
+
+  // View ▸ Pinned Input Strip: the pure on/off switch.
+  const toggleInputStrip = useCallback(() => {
+    const next = !inputStripEnabledRef.current;
+    applyInputStripEnabled(next);
+    // Never leave the caret inside a strip that is going away.
+    if (!next) focusActiveTerminal();
+  }, [applyInputStripEnabled, focusActiveTerminal]);
+
+  // ⌘⇧B (View ▸ Focus Input Strip): the context-dependent cycle — disabled →
+  // enable and focus; focus already in the strip → hand it back to the
+  // terminal; otherwise → focus the strip (pinned visible even at the
+  // bottom, where the overlay pixel-matches the screen underneath).
+  const cycleInputStripFocus = useCallback(() => {
+    if (!inputStripEnabledRef.current) applyInputStripEnabled(true);
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active.closest('.input-strip')) {
+      focusActiveTerminal();
+      return;
+    }
+    setInputStripFocusNonce((n) => n + 1);
+  }, [applyInputStripEnabled, focusActiveTerminal]);
+
   const attachTab = useCallback(
     async (tabId: string, handler: OutputHandler) => {
       // Anything arriving while we catch up is queued, so the replay is always
@@ -537,6 +597,8 @@ export function useTabManager(): TabManagerState {
     openSearch,
     zoomTerminalFont,
     resetTerminalFont,
+    toggleInputStrip,
+    cycleInputStripFocus,
   };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
@@ -545,6 +607,12 @@ export function useTabManager(): TabManagerState {
     let disposed = false;
     let unlistenOutput: UnlistenFn | undefined;
     const listeners: Promise<UnlistenFn>[] = [];
+
+    // The native checkbox is built checked (the default); the persisted pref
+    // is the renderer's, so report it once the webview is up.
+    void invoke('set_input_strip_checked', { enabled: inputStripEnabledRef.current }).catch(
+      () => {}
+    );
 
     invoke<TabResponse[]>('list_tabs')
       .then((loaded) => {
@@ -805,6 +873,13 @@ export function useTabManager(): TabManagerState {
           case 'zoom-reset':
             actions.resetTerminalFont();
             break;
+          case 'input-strip':
+            actions.toggleInputStrip();
+            break;
+          case 'input-strip-focus':
+            // With no tab open there is no caret to move and no strip to pin.
+            if (activeTabRef.current) actions.cycleInputStripFocus();
+            break;
         }
       }),
       // A tab the backend created itself: the delayed startup tab, or the
@@ -852,6 +927,8 @@ export function useTabManager(): TabManagerState {
     searchNonce,
     closeSearch,
     terminalFontSize,
+    inputStripEnabled,
+    inputStripFocusNonce,
     timelines,
     staleEvents,
     navigateToEvent,

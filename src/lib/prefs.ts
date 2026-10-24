@@ -1,5 +1,5 @@
 /** Best-effort persistence for renderer-side UI preferences (panel widths,
- * terminal font size). localStorage lives in WKWebView's persistent data
+ * terminal font size, feature switches). localStorage lives in WKWebView's persistent data
  * store, so values survive app restarts; a missing, corrupt or out-of-range
  * read falls back to the caller's default, and a failed write degrades to
  * session-only. */
@@ -17,6 +17,25 @@ export function loadNumber(key: string, min: number, max: number, fallback: numb
 }
 
 export function saveNumber(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // preferences are best-effort; nothing to recover from
+  }
+}
+
+export function loadBool(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function saveBool(key: string, value: boolean): void {
   try {
     localStorage.setItem(key, String(value));
   } catch {

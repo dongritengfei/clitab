@@ -411,6 +411,35 @@ body.splitting * {
   overflow-y: auto !important;
 }
 
+/* Pinned Input Strip — live mirror of the terminal's bottom rows, overlaid
+   on the active pane. Deliberately NOT part of the layout: the PTY size must
+   not change when it appears or grows. Height is content-driven and quantized
+   to the terminal's row grid by InputStrip.tsx; the inner element holds the
+   mirror's full grid, anchored (inline style) so mirror rows sit exactly over
+   primary rows and the clip edge lands on a row boundary. */
+.input-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
+  background: #1e1e2e;
+  border-top: 1px solid #45475a;
+  overflow: hidden;
+}
+
+.input-strip-inner {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+}
+
+/* The mirror is a pure screen view that never scrolls; its viewport
+   scrollbar would be decoration only. */
+.input-strip .xterm-viewport {
+  overflow-y: hidden !important;
+}
+
 /* Empty State */
 .empty-state {
   display: flex;

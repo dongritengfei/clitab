@@ -27,6 +27,10 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 - **Session timeline** — a clickable log of every prompt you submitted and
   every answer you picked; clicking an entry scrolls the terminal back to
   that point. It even spans agent sessions within a tab.
+- **Pinned input strip** — scroll up to read and the terminal's bottom rows
+  stay on screen as a live, typeable mirror: answer long agent questions
+  without losing your place. `⌘⇧B` moves the caret in and out; Tab
+  completion, multi-line input (`Shift+Enter`) and IME work as usual.
 - **Open from Finder** — Services → "New clitab Tab Here".
 - **Resizable layout and font zoom** — drag the dividers between the three
   columns (double-click to reset); `⌘=` / `⌘-` / `⌘0` zoom the terminal text.

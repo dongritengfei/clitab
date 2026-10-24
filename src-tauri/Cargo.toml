@@ -1,6 +1,6 @@
 [package]
 name = "clitab"
-version = "0.4.1"
+version = "0.5.0"
 description = "A tabbed terminal for agent CLI sessions (Claude Code, Qoder CLI)"
 authors = ["you"]
 edition = "2021"

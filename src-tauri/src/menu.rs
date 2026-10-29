@@ -12,37 +12,54 @@
 //! Menu clicks are forwarded to the renderer as a `menu-shortcut` event: the
 //! renderer owns tab state, so it decides what "close-tab" actually means.
 
-use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
+use std::sync::OnceLock;
+use tauri::menu::{
+    CheckMenuItem, CheckMenuItemBuilder, Menu, MenuBuilder, MenuItem, MenuItemBuilder,
+    SubmenuBuilder,
+};
 use tauri::{AppHandle, Emitter, Runtime};
 
 pub const QUIT: &str = "quit";
 pub const NEW_TAB: &str = "new-tab";
 pub const CLOSE_TAB: &str = "close-tab";
-pub const NEXT_TAB: &str = "next-tab";
-pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
 pub const NEXT_WAITING: &str = "next-waiting";
 pub const FIND: &str = "find";
 pub const ZOOM_IN: &str = "zoom-in";
 pub const ZOOM_OUT: &str = "zoom-out";
 pub const ZOOM_RESET: &str = "zoom-reset";
+pub const INPUT_STRIP: &str = "input-strip";
+pub const INPUT_STRIP_FOCUS: &str = "input-strip-focus";
+
+/// Runtime handle to the "Pinned Input Strip" checkbox. The enabled pref
+/// lives in the renderer (localStorage), so the renderer reports it — at
+/// startup and on every toggle — through `set_input_strip_checked`. The
+/// type-erased setter keeps `build` generic over the runtime.
+static INPUT_STRIP_CHECK: OnceLock<Box<dyn Fn(bool) + Send + Sync>> = OnceLock::new();
+
+pub fn set_input_strip_checked(checked: bool) {
+    if let Some(set) = INPUT_STRIP_CHECK.get() {
+        set(checked);
+    }
+}
 
 /// Menu ids we forward to the renderer (`FIND` opens its terminal search
-/// bar; the zoom items adjust the renderer's terminal font size). Everything
-/// else is handled natively: `QUIT` in `lib.rs` (quit confirmation),
+/// bar; the zoom items adjust the renderer's terminal font size; the
+/// input-strip items control the pinned input strip). Everything else is
+/// handled natively: `QUIT` in `lib.rs` (quit confirmation),
 /// copy/paste/minimize/... by predefined menu items.
 fn is_renderer_action(id: &str) -> bool {
     matches!(
         id,
         NEW_TAB
             | CLOSE_TAB
-            | NEXT_TAB
-            | PREV_TAB
             | NEXT_WAITING
             | FIND
             | ZOOM_IN
             | ZOOM_OUT
             | ZOOM_RESET
+            | INPUT_STRIP
+            | INPUT_STRIP_FOCUS
     ) || (id.starts_with(SELECT_TAB) && id[SELECT_TAB.len()..].starts_with('-'))
 }
 
@@ -72,8 +89,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     let new_tab = item(app, NEW_TAB, "New Tab", "CmdOrCtrl+T")?;
     let close_tab = item(app, CLOSE_TAB, "Close Tab", "CmdOrCtrl+W")?;
-    let next_tab = item(app, NEXT_TAB, "Next Tab", "Control+Tab")?;
-    let prev_tab = item(app, PREV_TAB, "Previous Tab", "Control+Shift+Tab")?;
     let next_waiting = item(app, NEXT_WAITING, "Next Waiting Tab", "CmdOrCtrl+J")?;
 
     // ⌘1 … ⌘9 jump straight to a tab.
@@ -91,8 +106,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&new_tab)
         .item(&close_tab)
         .separator()
-        .item(&next_tab)
-        .item(&prev_tab)
         .item(&next_waiting)
         .separator();
     for tab in &indexed {
@@ -126,10 +139,33 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let zoom_in = item(app, ZOOM_IN, "Zoom In", "CmdOrCtrl+Equal")?;
     let zoom_out = item(app, ZOOM_OUT, "Zoom Out", "CmdOrCtrl+Minus")?;
     let zoom_reset = item(app, ZOOM_RESET, "Actual Size", "CmdOrCtrl+Digit0")?;
+
+    // The pinned input strip gets two entries because click and accelerator
+    // are indistinguishable in one menu item, and they mean different things:
+    // the checkbox is the pure on/off switch (no accelerator), while ⌘⇧B is
+    // the context-dependent focus cycle (enable-and-focus / focus the strip /
+    // return focus to the terminal) — interpreted by the renderer, like every
+    // other shortcut's meaning. Built checked: the feature defaults on, and
+    // the renderer reports its persisted pref at startup.
+    let input_strip = CheckMenuItemBuilder::with_id(INPUT_STRIP, "Pinned Input Strip")
+        .checked(true)
+        .build(app)?;
+    {
+        let handle: CheckMenuItem<R> = input_strip.clone();
+        let _ = INPUT_STRIP_CHECK.set(Box::new(move |checked: bool| {
+            let _ = handle.set_checked(checked);
+        }));
+    }
+    let input_strip_focus =
+        item(app, INPUT_STRIP_FOCUS, "Focus Input Strip", "CmdOrCtrl+Shift+B")?;
+
     let view = SubmenuBuilder::new(app, "View")
         .item(&zoom_in)
         .item(&zoom_out)
         .item(&zoom_reset)
+        .separator()
+        .item(&input_strip)
+        .item(&input_strip_focus)
         .build()?;
     menu = menu.item(&view);
 
@@ -173,13 +209,13 @@ mod tests {
     fn renderer_actions_are_forwarded() {
         assert!(is_renderer_action(NEW_TAB));
         assert!(is_renderer_action(CLOSE_TAB));
-        assert!(is_renderer_action(NEXT_TAB));
-        assert!(is_renderer_action(PREV_TAB));
         assert!(is_renderer_action(NEXT_WAITING));
         assert!(is_renderer_action(FIND));
         assert!(is_renderer_action(ZOOM_IN));
         assert!(is_renderer_action(ZOOM_OUT));
         assert!(is_renderer_action(ZOOM_RESET));
+        assert!(is_renderer_action(INPUT_STRIP));
+        assert!(is_renderer_action(INPUT_STRIP_FOCUS));
         assert!(is_renderer_action("select-tab-1"));
         assert!(is_renderer_action("select-tab-9"));
     }

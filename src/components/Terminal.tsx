@@ -1,8 +1,16 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { registerTerm, unregisterTerm } from '../lib/termRegistry';
+import {
+  attachImeRecovery,
+  attachKeyEncoding,
+  attachTrackpadFilter,
+  TERM_FONT_FAMILY,
+  TERM_THEME,
+} from '../lib/termInput';
+import { InputStrip, type InputStripHandle } from './InputStrip';
 
 interface TerminalProps {
   tabId: string;
@@ -10,6 +18,14 @@ interface TerminalProps {
   /** xterm font size, shared by every terminal (View ▸ Zoom, persisted by
    * useTabManager). Changes apply live via `options.fontSize` + refit. */
   fontSize: number;
+  /** View ▸ Pinned Input Strip: master switch for the bottom mirror strip.
+   * While on, typing never snaps a scrolled-up viewport to the bottom (the
+   * live input line is readable in the strip); while off, xterm's native
+   * scroll-on-input is restored. */
+  stripEnabled: boolean;
+  /** Each increment (⌘⇧B, from useTabManager) is a fresh request to pin the
+   * strip visible and move the caret into it. */
+  stripFocusNonce: number;
   /** Subscribe to this tab's output; resolves once the live stream is flowing.
    * `done` (fence writes only) fires once xterm has parsed that write and
    * everything queued before it. */
@@ -26,33 +42,6 @@ interface TerminalProps {
 const MIN_SIZE = 10;
 /** Debounce so dragging the window does not spam the PTY with resize ioctls. */
 const RESIZE_DEBOUNCE_MS = 60;
-
-/* macOS "tap to click" reaches WKWebView as fully synthesized mouse events,
-   and the tap-to-drag gesture ("tap, then tap again and swipe") produces an
-   accidental text selection in xterm. Measured on a real Force Touch trackpad,
-   the gestures are separable by per-event physical state — no timing windows:
-
-     - A deliberate tap / double-tap: the synthesized click's mousedown
-       carries buttons=1 (the system committed a real click).
-     - A real press-drag: mousedown buttons=1, every mousemove buttons=1, and
-       webkitmouseforcechanged fires continuously as finger pressure ramps.
-     - Tap-to-drag: a stream of buttons=0 mousemoves (the swipe, delivered
-       with no button held at all) bracketed by synthesized clicks whose
-       mousedown also carries buttons=0 — no physical press exists at any
-       point. When the two taps land close together, macOS scores such a
-       click as detail>=2, and xterm turns that double-click into a word
-       selection: this is the accidental highlight. (The swipe's moves are
-       inert: xterm's drag window is the 7ms between the synthesized
-       down/up, and the moves never fall inside it.)
-
-   So multi-click selection semantics are only honored when the click carries
-   physical button state; a buttonless multi-click is stopped before xterm's
-   selection service. WebKit also varies where the swipe sits: the moves can
-   follow the synthesized 7ms click (inert — xterm's drag window is closed),
-   or the down/up can bracket the entire swipe (dangerous — xterm extends the
-   selection on every move inside its own drag without checking buttons), so
-   moves inside a buttonless gesture are held back too. Single clicks always
-   pass (cursor placement), and a real press-drag is untouched end to end. */
 
 /** Cursor-ups in a replay above which the producer is a repaint-style TUI.
     Plain shell output emits essentially none; ink/Claude Code emits one per
@@ -114,6 +103,8 @@ export const Terminal: React.FC<TerminalProps> = ({
   tabId,
   isActive,
   fontSize,
+  stripEnabled,
+  stripFocusNonce,
   attach,
   detach,
   onInput,
@@ -132,6 +123,82 @@ export const Terminal: React.FC<TerminalProps> = ({
   const fontSizeRef = useRef(fontSize);
   fontSizeRef.current = fontSize;
 
+  /* Pinned input strip. Visibility is derived, never commanded: the strip
+     shows while the active tab's viewport is away from the bottom (reading
+     history — the agent's live input line would otherwise be off-screen) or
+     while the mirror holds the caret (⌘⇧B pins it even at the bottom, where
+     the overlay pixel-matches the screen underneath). Alt-screen apps are
+     exempt: their bottom rows are their own UI. Every re-derivation point
+     (scroll, parsed write, resize, enable toggle, activation) funnels into
+     evaluateStrip. */
+  const stripEnabledRef = useRef(stripEnabled);
+  stripEnabledRef.current = stripEnabled;
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
+  const [stripVisible, setStripVisible] = useState(false);
+  const stripVisibleRef = useRef(false);
+  // The mirror has keyboard focus; pins the strip visible.
+  const stripPinnedRef = useRef(false);
+  // Mirror handle, plus the buffer catching live chunks between the
+  // visibility decision and the mirror handshake. The buffer is *dropped* at
+  // the handshake, not fed: those chunks were written to the primary before
+  // InputStrip's snapshot fence, so the snapshot already contains them.
+  const stripHandleRef = useRef<InputStripHandle | null>(null);
+  const stripPendingRef = useRef<Uint8Array[] | null>(null);
+  // A ⌘⇧B focus request that arrived before the mirror existed.
+  const stripFocusPendingRef = useRef(false);
+
+  const evaluateStrip = useCallback(() => {
+    const term = termRef.current;
+    let visible = false;
+    if (term && stripEnabledRef.current && isActiveRef.current) {
+      const buffer = term.buffer.active;
+      const altScreen = buffer.type === 'alternate';
+      const awayFromBottom = buffer.viewportY + term.rows < buffer.length;
+      visible = !altScreen && (awayFromBottom || stripPinnedRef.current);
+    }
+    if (visible === stripVisibleRef.current) {
+      // Visibility unchanged, but the viewport may have crossed the
+      // scroll-bottom boundary — the strip's crop/pixel-match height-mode
+      // switch — without any chunk arriving to re-run its scan.
+      if (visible) stripHandleRef.current?.remeasure();
+      return;
+    }
+    stripVisibleRef.current = visible;
+    // Start buffering synchronously with the decision, so no chunk arriving
+    // before React mounts InputStrip is lost.
+    stripPendingRef.current = visible ? (stripPendingRef.current ?? []) : null;
+    setStripVisible(visible);
+  }, []);
+  const evaluateStripRef = useRef(evaluateStrip);
+  evaluateStripRef.current = evaluateStrip;
+
+  const onStripReady = useCallback((handle: InputStripHandle | null) => {
+    stripHandleRef.current = handle;
+    if (handle) {
+      stripPendingRef.current = null; // covered by the snapshot — see above
+      if (stripFocusPendingRef.current) {
+        stripFocusPendingRef.current = false;
+        handle.focus();
+      }
+    } else {
+      // The mirror is gone (hidden, tab switch, StrictMode remount): its focus
+      // went with it. Resume buffering if the strip is about to come back.
+      stripPinnedRef.current = false;
+      if (stripVisibleRef.current) stripPendingRef.current = [];
+    }
+  }, []);
+
+  const onStripPinnedChange = useCallback((pinned: boolean) => {
+    stripPinnedRef.current = pinned;
+    evaluateStripRef.current();
+  }, []);
+
+  const sendToPty = useCallback(
+    (data: Uint8Array) => callbacks.current.onInput(tabId, data),
+    [tabId]
+  );
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -145,18 +212,16 @@ export const Terminal: React.FC<TerminalProps> = ({
       allowProposedApi: true,
       cursorBlink: true,
       fontSize: fontSizeRef.current,
-      // JetBrains Mono and the Nerd-patched fallback are bundled with the app
-      // (see main.tsx / App.css), so the stack resolves the same everywhere —
-      // Ghostty-like metrics, and powerline/devicon PUA glyphs always render
-      // inside a single cell.
-      fontFamily: '"JetBrains Mono", "JetBrainsMono Nerd Font Mono", Menlo, monospace',
+      // Shared with the input strip's mirror (lib/termInput.ts): identical
+      // cell metrics are what make the overlay pixel-align with this screen.
+      fontFamily: TERM_FONT_FAMILY,
       scrollback: 5000,
-      theme: {
-        background: '#1e1e2e',
-        foreground: '#cdd6f4',
-        cursor: '#f5e0dc',
-        selectionBackground: '#585b7066',
-      },
+      // With the pinned input strip enabled, typing while scrolled up must
+      // not snap the viewport to the bottom — the live input line is readable
+      // (and typeable) in the strip, and the whole point is staying where you
+      // are reading. The [stripEnabled] effect keeps this in sync live.
+      scrollOnUserInput: !stripEnabledRef.current,
+      theme: TERM_THEME,
     });
 
     const fitAddon = new FitAddon();
@@ -176,122 +241,33 @@ export const Terminal: React.FC<TerminalProps> = ({
     // object`. The DOM renderer has no context budget and nothing to swap; reach
     // for @xterm/addon-canvas (2D canvas, no GL context) if output ever gets slow.
 
+    // Byte path shared by every input patch below (and by the strip mirror).
+    const send = (data: Uint8Array) => callbacks.current.onInput(tabId, data);
+
     term.onData((data) => {
-      callbacks.current.onInput(tabId, new TextEncoder().encode(data));
+      send(new TextEncoder().encode(data));
     });
 
-    /* WKWebView delivers IME-committed punctuation ( “ 《 『 …) as a plain
-       `input` event *before* the keystroke's own keydown (WebKit #25119), while
-       xterm.js gates its input-event fallback on "no keydown seen yet"
-       (`!e.composed || !this._keyDownSeen` in CompositionHelper._inputEvent) —
-       the still-held Shift's keydown already set that flag, so the commit is
-       dropped (the "type twice to see it" symptom, xterm.js #6144/#5887).
-       Recover exactly those dropped commits, and nothing else:
-
-       - Mirror xterm's `_keyDownSeen` (true on any keydown, false on any
-         keyup). When it is false at an `input`, xterm's gate passed and it
-         already sent `ev.data` — stay out.
-       - Send `ev.data` alone, never the textarea's value: xterm never clears
-         the hidden textarea after a composition commit, so its content is
-         stale residue (earlier pinyin commits) and forwarding it wholesale
-         duplicates already-delivered text.
-       - An `input` whose data equals the preceding keydown's key is normal
-         ordered typing (ABC): xterm's keydown/keypress path owns it. */
-    let lastKeyDownKey: string | undefined;
-    let keyDownSeen = false;
-    let composing = false;
-
-    const onKeyDownSeen = (ev: Event) => {
-      keyDownSeen = true;
-      lastKeyDownKey = (ev as KeyboardEvent).key;
-    };
-    const onKeyUpSeen = () => {
-      keyDownSeen = false;
-    };
-    const onCompositionStart = () => {
-      composing = true;
-    };
-    const onCompositionEnd = () => {
-      composing = false;
-    };
-    /* xterm keeps committed text in the hidden textarea (it only clears it on
-       Enter / Ctrl+C / blur / paste) and derives the next commit as
-       value.substring(value.length at compositionstart) — i.e. it assumes the
-       caret stays parked at the end of that residue. An unhandled key
-       (Cmd+Left) lets WebKit move the caret to offset 0, so the next
-       composition inserts its preedit *before* the residue and the commit
-       re-sends the stale character instead of the new one. Restoring xterm's
-       own "empty while not composing" invariant after every commit makes any
-       caret-moving key harmless. Queued from the bubble phase so this timeout
-       runs after xterm's own setTimeout(0) textarea read, which its
-       target-phase compositionend listener queues first. */
-    const onCompositionEndCleanup = () => {
-      setTimeout(() => {
-        if (composing) return; // a new composition already began
-        const ta = container.querySelector('textarea');
-        if (ta) ta.value = '';
-      }, 0);
-    };
-    const onInputAfterXterm = (ev: Event) => {
-      const ie = ev as InputEvent;
-      if (ie.inputType !== 'insertText' || ie.isComposing || composing || !ie.data) return;
-      if (!keyDownSeen) return; // xterm's gate passed: it sent ev.data itself
-      if (lastKeyDownKey === ie.data) return; // keydown path already sent it
-      callbacks.current.onInput(tabId, new TextEncoder().encode(ie.data));
-      const ta = container.querySelector('textarea');
-      if (ta) ta.value = ''; // hygiene only: nothing reads the textarea again
-    };
-    container.addEventListener('keydown', onKeyDownSeen, true);
-    container.addEventListener('keyup', onKeyUpSeen, true);
-    container.addEventListener('compositionstart', onCompositionStart, true);
-    container.addEventListener('compositionend', onCompositionEnd, true);
-    container.addEventListener('compositionend', onCompositionEndCleanup);
-    // Bubble phase on the container: runs after xterm's own textarea listener,
-    // so the mirror state observed here matches what xterm's gate saw.
-    container.addEventListener('input', onInputAfterXterm);
-
-    // xterm.js implements neither modifyOtherKeys nor the kitty keyboard
-    // protocol, so Shift+Enter would reach the shell as a plain CR — Claude
-    // Code (which enables the kitty keyboard protocol at startup) would
-    // submit the prompt instead of inserting a newline. Send the kitty CSI-u
-    // encoding of Shift+Enter ourselves, exactly what a kitty-protocol
-    // terminal would deliver.
-    term.attachCustomKeyEventHandler((event) => {
-      if (
-        event.key === 'Enter' &&
-        event.shiftKey &&
-        !event.altKey &&
-        !event.ctrlKey &&
-        !event.metaKey
-      ) {
-        if (event.type === 'keydown' && !event.repeat) {
-          callbacks.current.onInput(tabId, new TextEncoder().encode('\x1b[13;2u'));
-        }
-        return false;
-      }
-      /* With a CJK input source active, WebKit reports Cmd presses as
-         keyCode-229 "Process" keydowns — the IME marked the key handled, even
-         when nothing is composing (xterm.js #5887 documents exactly this).
-         xterm's composition path treats *every* 229 keydown as user input and,
-         via scrollOnUserInput, snaps a scrolled-up viewport to the bottom — so
-         ⌘C while reading history threw away the scroll position. A Cmd combo
-         never sends data to the terminal, so dropping it before xterm's
-         handler is safe: real composition keys (229 without Cmd) still take
-         the normal path, and native copy/paste runs through the Edit menu
-         (menu.rs), not through this handler. */
-      if (event.type === 'keydown' && event.metaKey && event.keyCode === 229) {
-        return false;
-      }
-      return true;
-    });
+    // WKWebView IME recovery, Shift+Enter's kitty encoding + the Cmd-229
+    // drop, and trackpad tap-to-drag filtering — shared with the input
+    // strip's mirror, rationale in lib/termInput.ts.
+    const detachIme = attachImeRecovery(container, send);
+    attachKeyEncoding(term, send);
+    const detachTrackpad = attachTrackpadFilter(container);
 
     term.onResize(({ cols, rows }) => {
       if (cols < 1 || rows < 1) return;
+      // The mirror follows the grid immediately (both screens must stay
+      // line-for-line equal); only the PTY ioctl is debounced.
+      stripHandleRef.current?.resize(cols, rows);
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
         if (!disposed) callbacks.current.onResize(tabId, rows, cols);
       }, RESIZE_DEBOUNCE_MS);
     });
+
+    // Scroll position is the strip's primary visibility input.
+    term.onScroll(() => evaluateStripRef.current());
 
     const fit = () => {
       // A hidden container reports 0x0; fitting it would shrink the PTY and
@@ -310,6 +286,16 @@ export const Terminal: React.FC<TerminalProps> = ({
     observer.observe(container);
     fit();
 
+    // Live chunks feed the strip mirror too (when one exists or is being
+    // created); replay chunks never do — a mirror snapshots the primary's
+    // *parsed* screen behind a fence, which already includes every replay
+    // byte written before it.
+    const feedStrip = (chunk: Uint8Array) => {
+      const handle = stripHandleRef.current;
+      if (handle) handle.feed(chunk);
+      else stripPendingRef.current?.push(chunk);
+    };
+
     // Replay whatever the PTY produced before we were listening, then stream.
     // How the replay is used depends on what it contains (see classifyReplay):
     // plain output reconstructs the screen as-is; a repaint-style TUI ring is
@@ -323,9 +309,15 @@ export const Terminal: React.FC<TerminalProps> = ({
       .attach(tabId, (chunk, isReplay, done) => {
         if (disposed) return;
         if (!isReplay) {
-          // Live chunks and fences; xterm runs `done` after this write and
-          // everything queued before it has been parsed.
-          term.write(chunk, done);
+          // Live chunks and fences; xterm runs the callback after this write
+          // and everything queued before it has been parsed. The strip
+          // re-evaluation piggybacks on the same ordering guarantee: buffer
+          // transitions (alt-screen entry/exit) are settled when it runs.
+          term.write(chunk, () => {
+            done?.();
+            evaluateStripRef.current();
+          });
+          feedStrip(chunk);
           return;
         }
         switch (classifyReplay(chunk)) {
@@ -335,69 +327,20 @@ export const Terminal: React.FC<TerminalProps> = ({
             term.write(chunk);
             // Home + ED2: clear the visible screen, keep the replayed
             // history in the scrollback.
-            term.write('\x1b[H\x1b[2J');
+            term.write('\x1b[H\x1b[2J', () => evaluateStripRef.current());
             return;
           case 'plain':
-            term.write(chunk);
+            term.write(chunk, () => evaluateStripRef.current());
             return;
         }
       });
-
-    // Synthesized-gesture filtering (see the block comment above for the
-    // measured-data rationale). Every event macOS synthesizes for a tap or
-    // tap-to-drag carries buttons=0 — no physical press exists — while a real
-    // press-drag carries buttons=1 on its mousedown and every mousemove.
-    // Two state-based filters, no timing windows:
-    //   1. A buttonless multi-click is tap machinery, not a deliberate
-    //      double-click: it never reaches xterm's selection service.
-    //   2. While a buttonless gesture is down, its moves never reach xterm's
-    //      document-level drag listener either — WebKit sometimes brackets
-    //      the whole swipe between the synthesized down/up, and xterm
-    //      extends the selection on any move inside its own drag without
-    //      checking buttons. A detail=1 buttonless down still passes (tap to
-    //      place the cursor); with its moves held back, the gesture ends as
-    //      the plain click it physically was.
-    let synthesizedGesture = false;
-
-    const onMouseDown = (event: MouseEvent) => {
-      if (event.button !== 0) return;
-      synthesizedGesture = event.buttons === 0;
-      if (synthesizedGesture && event.detail >= 2) {
-        event.stopPropagation();
-      }
-    };
-
-    const onMouseUp = (event: MouseEvent) => {
-      if (event.button === 0) synthesizedGesture = false;
-    };
-
-    const onMouseMove = (event: MouseEvent) => {
-      if (event.buttons !== 0) {
-        // Physical button state: a real drag, never suppress (and heal a
-        // gesture window left open by a missed mouseup).
-        synthesizedGesture = false;
-        return;
-      }
-      if (synthesizedGesture) event.stopPropagation();
-    };
-
-    container.addEventListener('mousedown', onMouseDown, true);
-    window.addEventListener('mousemove', onMouseMove, true);
-    window.addEventListener('mouseup', onMouseUp, true);
 
     return () => {
       disposed = true;
       window.clearTimeout(resizeTimer);
       observer.disconnect();
-      container.removeEventListener('mousedown', onMouseDown, true);
-      window.removeEventListener('mousemove', onMouseMove, true);
-      window.removeEventListener('mouseup', onMouseUp, true);
-      container.removeEventListener('keydown', onKeyDownSeen, true);
-      container.removeEventListener('keyup', onKeyUpSeen, true);
-      container.removeEventListener('compositionstart', onCompositionStart, true);
-      container.removeEventListener('compositionend', onCompositionEnd, true);
-      container.removeEventListener('compositionend', onCompositionEndCleanup);
-      container.removeEventListener('input', onInputAfterXterm);
+      detachTrackpad();
+      detachIme();
       callbacks.current.detach(tabId);
       if (fitRef.current === fitAddon) fitRef.current = null;
       if (termRef.current === term) termRef.current = null;
@@ -434,5 +377,53 @@ export const Terminal: React.FC<TerminalProps> = ({
     termRef.current?.focus();
   }, [isActive]);
 
-  return <div ref={containerRef} className="terminal-container" />;
+  // Strip master switch (View ▸ Pinned Input Strip): rebind xterm's
+  // scroll-on-input and re-derive visibility. With the strip off, native
+  // snapping must come back — typed text would otherwise be invisible while
+  // scrolled up, with no strip to read it in.
+  useEffect(() => {
+    const term = termRef.current;
+    if (term) term.options.scrollOnUserInput = !stripEnabled;
+    evaluateStripRef.current();
+  }, [stripEnabled]);
+
+  // The strip only exists for the active tab; a switch tears it down (its
+  // mirror disposes) and the next scroll-away on the new tab recreates it.
+  useEffect(() => {
+    evaluateStripRef.current();
+  }, [isActive]);
+
+  // ⌘⇧B (View ▸ Focus Input Strip; useTabManager owns the cycle semantics):
+  // a nonce bump means "the strip should have the caret now". Pin it visible
+  // — even at the bottom, where the bottom-anchored overlay pixel-matches the
+  // screen underneath — and focus it, deferring through the handshake when
+  // the mirror must be created first.
+  useEffect(() => {
+    if (stripFocusNonce === 0) return;
+    // The nonce is app-wide; every mounted pane sees the bump. Only the
+    // active one may act on it — pinning a hidden pane's strip would surface
+    // a stuck-visible strip the next time that tab is activated. (The
+    // manager enables the feature in the same batch when it was off, so
+    // stripEnabledRef is already true here when the cycle means "focus".)
+    if (!isActiveRef.current || !stripEnabledRef.current) return;
+    stripPinnedRef.current = true;
+    evaluateStripRef.current();
+    if (stripHandleRef.current) stripHandleRef.current.focus();
+    else stripFocusPendingRef.current = true;
+  }, [stripFocusNonce]);
+
+  return (
+    <>
+      <div ref={containerRef} className="terminal-container" />
+      {stripVisible && termRef.current && (
+        <InputStrip
+          primary={termRef.current}
+          fontSize={fontSize}
+          send={sendToPty}
+          onReady={onStripReady}
+          onPinnedChange={onStripPinnedChange}
+        />
+      )}
+    </>
+  );
 };

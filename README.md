@@ -7,7 +7,7 @@ every tab is a real PTY running your shell, named after its working directory
 — or after the session, once the agent gives it a title. Tabs flash when a
 session needs your attention, so a row of parallel agents stays glanceable.
 
-![clitab overview: the tab list, a live Claude Code session with its dashboard, and the session timeline panel](docs/screenshots/overview.jpg)
+![clitab demo: parallel Claude Code sessions at a glance, a new session lighting up, jumping to it, and switching between tabs](docs/screenshots/demo.gif)
 
 Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
 [xterm.js](https://xtermjs.org).
@@ -21,7 +21,7 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
   working: each tab carries a live turn timer while its agent runs.
 - **Jump to what needs you** — `⌘J` (next tab waiting for input); flashing
   tabs, a Dock badge and macOS notifications point the way.
-- **Fast switching** — `⌃Tab` cycles, `⌘1–9` go straight to a tab.
+- **Fast switching** — `⌘1–9` go straight to a tab.
 - **Tab dashboard** — live tool timer, last turn's duration and waiting
   notices, via the optional agent hooks.
 - **Session timeline** — a clickable log of every prompt you submitted and
@@ -32,6 +32,10 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
   (the active tab automatically, the others on first click). Restored
   sessions show their earlier prompts as display-only **History** rows in
   the timeline.
+- **Pinned input strip** — scroll up to read and the terminal's bottom rows
+  stay on screen as a live, typeable mirror: answer long agent questions
+  without losing your place. `⌘⇧B` moves the caret in and out; Tab
+  completion, multi-line input (`Shift+Enter`) and IME work as usual.
 - **Open from Finder** — Services → "New clitab Tab Here".
 - **Resizable layout and font zoom** — drag the dividers between the three
   columns (double-click to reset); `⌘=` / `⌘-` / `⌘0` zoom the terminal text.

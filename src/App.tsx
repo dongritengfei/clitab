@@ -49,6 +49,8 @@ function App() {
     searchNonce,
     closeSearch,
     terminalFontSize,
+    inputStripEnabled,
+    inputStripFocusNonce,
     timelines,
     staleEvents,
     navigateToEvent,
@@ -204,6 +206,8 @@ function App() {
                 tabId={tab.id}
                 isActive={tab.id === activeTabId}
                 fontSize={terminalFontSize}
+                stripEnabled={inputStripEnabled}
+                stripFocusNonce={inputStripFocusNonce}
                 attach={attachTab}
                 detach={detachTab}
                 onInput={writeInput}

@@ -94,7 +94,7 @@ export const SearchBar: React.FC<SearchBarProps> = ({ tabId, nonce, onClose }) =
      a terminal nobody is looking at — drop them — and the query carries over
      to the new tab. Focus is deliberately not stolen back: activating a tab
      moves the caret into its terminal (App.tsx), and fighting that would
-     make ⌃Tab-then-type surprising. */
+     make switch-then-type surprising. */
   const prevTabId = useRef(tabId);
   useEffect(() => {
     if (prevTabId.current === tabId) return;

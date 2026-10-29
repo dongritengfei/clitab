@@ -75,7 +75,6 @@ export interface TabManagerState {
   closeActiveTab: () => Promise<void>;
   switchTab: (tabId: string) => void;
   selectTabByIndex: (index: number) => void;
-  cycleTab: (direction: 1 | -1) => void;
   /** Move a tab to `toIndex` (remove-then-insert). Local order updates
    * immediately; `persist` also writes the arrangement to the registry, so a
    * webview reload restores the user's order. */
@@ -298,17 +297,6 @@ export function useTabManager(): TabManagerState {
   const selectTabByIndex = useCallback(
     (index: number) => {
       const tab = tabsRef.current[index];
-      if (tab) switchTab(tab.id);
-    },
-    [switchTab]
-  );
-
-  const cycleTab = useCallback(
-    (direction: 1 | -1) => {
-      const list = tabsRef.current;
-      if (list.length < 2) return;
-      const current = list.findIndex((tab) => tab.id === activeTabRef.current);
-      const tab = list[(current + direction + list.length) % list.length];
       if (tab) switchTab(tab.id);
     },
     [switchTab]
@@ -591,7 +579,6 @@ export function useTabManager(): TabManagerState {
     createTab,
     closeActiveTab,
     selectTabByIndex,
-    cycleTab,
     switchTab,
     jumpToNextWaiting,
     openSearch,
@@ -850,12 +837,6 @@ export function useTabManager(): TabManagerState {
           case 'close-tab':
             void actions.closeActiveTab();
             break;
-          case 'next-tab':
-            actions.cycleTab(1);
-            break;
-          case 'prev-tab':
-            actions.cycleTab(-1);
-            break;
           case 'next-waiting':
             actions.jumpToNextWaiting();
             break;
@@ -918,7 +899,6 @@ export function useTabManager(): TabManagerState {
     closeActiveTab,
     switchTab,
     selectTabByIndex,
-    cycleTab,
     reorderTab,
     attachTab,
     detachTab,

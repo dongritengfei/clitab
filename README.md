@@ -21,7 +21,7 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
   working: each tab carries a live turn timer while its agent runs.
 - **Jump to what needs you** — `⌘J` (next tab waiting for input); flashing
   tabs, a Dock badge and macOS notifications point the way.
-- **Fast switching** — `⌃Tab` cycles, `⌘1–9` go straight to a tab.
+- **Fast switching** — `⌘1–9` go straight to a tab.
 - **Tab dashboard** — live tool timer, last turn's duration and waiting
   notices, via the optional agent hooks.
 - **Session timeline** — a clickable log of every prompt you submitted and

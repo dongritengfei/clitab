@@ -22,8 +22,6 @@ use tauri::{AppHandle, Emitter, Runtime};
 pub const QUIT: &str = "quit";
 pub const NEW_TAB: &str = "new-tab";
 pub const CLOSE_TAB: &str = "close-tab";
-pub const NEXT_TAB: &str = "next-tab";
-pub const PREV_TAB: &str = "prev-tab";
 pub const SELECT_TAB: &str = "select-tab";
 pub const NEXT_WAITING: &str = "next-waiting";
 pub const FIND: &str = "find";
@@ -55,8 +53,6 @@ fn is_renderer_action(id: &str) -> bool {
         id,
         NEW_TAB
             | CLOSE_TAB
-            | NEXT_TAB
-            | PREV_TAB
             | NEXT_WAITING
             | FIND
             | ZOOM_IN
@@ -93,8 +89,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     let new_tab = item(app, NEW_TAB, "New Tab", "CmdOrCtrl+T")?;
     let close_tab = item(app, CLOSE_TAB, "Close Tab", "CmdOrCtrl+W")?;
-    let next_tab = item(app, NEXT_TAB, "Next Tab", "Control+Tab")?;
-    let prev_tab = item(app, PREV_TAB, "Previous Tab", "Control+Shift+Tab")?;
     let next_waiting = item(app, NEXT_WAITING, "Next Waiting Tab", "CmdOrCtrl+J")?;
 
     // ⌘1 … ⌘9 jump straight to a tab.
@@ -112,8 +106,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&new_tab)
         .item(&close_tab)
         .separator()
-        .item(&next_tab)
-        .item(&prev_tab)
         .item(&next_waiting)
         .separator();
     for tab in &indexed {
@@ -217,8 +209,6 @@ mod tests {
     fn renderer_actions_are_forwarded() {
         assert!(is_renderer_action(NEW_TAB));
         assert!(is_renderer_action(CLOSE_TAB));
-        assert!(is_renderer_action(NEXT_TAB));
-        assert!(is_renderer_action(PREV_TAB));
         assert!(is_renderer_action(NEXT_WAITING));
         assert!(is_renderer_action(FIND));
         assert!(is_renderer_action(ZOOM_IN));

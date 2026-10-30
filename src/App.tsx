@@ -11,6 +11,22 @@ import './App.css';
 /** Stable empty array, so an eventless panel does not re-render every tick. */
 const NO_EVENTS: TimelineEvent[] = [];
 
+/* The zero-tab shortcut sheet. Mirrors the native menu (src-tauri/src/menu.rs)
+   and the wiki's Shortcuts page — update all three together. Display only:
+   the menu owns the actual bindings, nothing here handles keys. */
+const SHORTCUTS: ReadonlyArray<readonly [keys: string, action: string]> = [
+  ['⌘T', 'New tab'],
+  ['⌘W', 'Close tab (asks first if a process is running)'],
+  ['⌘J', 'Jump to the next tab waiting for input'],
+  ['⌘1 … ⌘8', 'Jump to tab 1–8'],
+  ['⌘9', 'Jump to the last tab'],
+  ['⌘F', 'Search the active terminal'],
+  ['⌘⇧B', 'Focus the pinned input strip (press again to return)'],
+  ['⌘= / ⌘-', 'Zoom the terminal text in / out'],
+  ['⌘0', 'Reset the terminal font size'],
+  ['⌘C / ⌘V / ⌘A', 'Copy / paste / select all'],
+];
+
 /* Draggable column widths. The defaults are a step up from the old fixed CSS
    widths (240/280) to match the enlarged UI fonts; the clamps keep neither
    panel from eating the terminal. Persisted per column — a saved width wins
@@ -192,6 +208,20 @@ function App() {
           <div className="empty-state">
             <p>No tabs open</p>
             <button onClick={createTab}>Create a new tab</button>
+            <div className="shortcut-sheet">
+              <h2>Keyboard shortcuts</h2>
+              {SHORTCUTS.map(([keys, action]) => (
+                <div className="shortcut-row" key={keys}>
+                  <kbd>{keys}</kbd>
+                  <span>{action}</span>
+                </div>
+              ))}
+              <p className="shortcut-note">
+                <strong>Shift+Enter</strong> inserts a newline in Claude
+                Code's prompt instead of submitting. In the tab list, arrow
+                keys / Home / End move between tabs.
+              </p>
+            </div>
           </div>
         ) : (
           panes.map((tab) => (

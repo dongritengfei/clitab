@@ -1,6 +1,7 @@
 use super::lock;
 use super::registry::{Registry, TabRecord};
 use super::session::{self, PtySession};
+use crate::status::{AgentKind, SessionBinding};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -257,7 +258,12 @@ impl TabManager {
     ) -> Result<TabRecord, ManagerError> {
         let tab_id = uuid::Uuid::new_v4().to_string();
         let cwd = resolve_cwd(Some(snapshot.cwd)).to_string_lossy().to_string();
-        let resumable = snapshot.agent_running && snapshot.session.is_some();
+        // Restorable whenever the snapshot says the agent was alive: with a
+        // binding it resumes the exact session, with only a launch signal it
+        // relaunches the plain binary (`resume_line`'s tiers). The renderer's
+        // history load still needs a binding, hence the separate flag.
+        let resumable = snapshot.agent_running;
+        let restored_session = resumable && snapshot.session.is_some();
         let keep_program_title = snapshot.has_program_title && resumable;
         let title = if keep_program_title { snapshot.title } else { cwd.clone() };
 
@@ -277,8 +283,9 @@ impl TabManager {
             // Restore does not claim the agent is running — it is not, yet.
             // The resume injection (`begin_resume`) sets the flag.
             agent_running: false,
+            last_agent: snapshot.agent,
             resume_pending: resumable,
-            restored_session: resumable,
+            restored_session,
         };
         let record = self.registry.insert_record(record);
 
@@ -301,14 +308,36 @@ impl TabManager {
         Ok(record)
     }
 
-    /// Issue the tab's pending resume: inject `<agent> --resume <sid>` into
-    /// its shell as ordinary input (spec D1 — keeps OSC 7 cwd reporting,
-    /// title revert and the preexec machinery working; no `--fork-session`,
-    /// so the transcript keeps growing under the same id). The sid's charset
-    /// was validated at decode time (`decode_session`), so interpolating it
-    /// into the command line is safe. Degrades silently to a plain shell
-    /// (spec D4) when no resume is pending, the binding is gone, or the
-    /// transcript file no longer exists; only a vanished TAB is NotFound.
+    /// The line `resume_tab` injects, or `None` when the tab should stay a
+    /// plain shell (spec D4's cancel path). Tiers: an exact session (live
+    /// transcript, and no *newer* launch of a different agent) resumes via
+    /// `--resume`; otherwise the agent is relaunched plain when its kind is
+    /// known — from the shell's launch signal or, failing that, the binding
+    /// whose transcript is gone. The sid's charset was validated at decode
+    /// time (`decode_session`), so interpolating it is safe; `cmd()` is a
+    /// static string.
+    fn resume_line(
+        session: Option<&SessionBinding>,
+        has_transcript: bool,
+        last_agent: Option<AgentKind>,
+    ) -> Option<String> {
+        match session {
+            Some(b) if has_transcript && last_agent.map_or(true, |k| k == b.agent) => {
+                Some(format!("{} --resume {}\n", b.agent.cmd(), b.sid))
+            }
+            _ => last_agent
+                .or(session.map(|b| b.agent))
+                .map(|kind| format!("{}\n", kind.cmd())),
+        }
+    }
+
+    /// Issue the tab's pending resume: inject `resume_line`'s pick into its
+    /// shell as ordinary input (spec D1 — keeps OSC 7 cwd reporting, title
+    /// revert and the preexec machinery working; no `--fork-session`, so the
+    /// transcript keeps growing under the same id). Degrades silently to a
+    /// plain shell (spec D4) when no resume is pending or neither a binding
+    /// nor a launch signal exists; a deleted transcript relaunches the plain
+    /// agent instead of stranding the shell. Only a vanished TAB is NotFound.
     pub fn resume_tab(&self, tab_id: &str) -> Result<(), ManagerError> {
         let record = self
             .registry
@@ -317,22 +346,21 @@ impl TabManager {
         if !record.resume_pending {
             return Ok(());
         }
-        let Some(binding) = record.session.clone() else {
+        let has_transcript = record
+            .session
+            .as_ref()
+            .and_then(|binding| crate::history::transcript_for(binding, &record.cwd))
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        let Some(line) =
+            Self::resume_line(record.session.as_ref(), has_transcript, record.last_agent)
+        else {
             self.registry.cancel_resume(tab_id);
             Self::emit_cancelled_title(&self.app, self.registry.as_ref(), tab_id);
             return Ok(());
         };
-        let has_transcript = crate::history::transcript_for(&binding, &record.cwd)
-            .map(|path| path.is_file())
-            .unwrap_or(false);
-        if !has_transcript {
-            // Deleted between quit and relaunch: plain shell, title reverts,
-            // no error the user could act on (Review Focus 5).
-            self.registry.cancel_resume(tab_id);
-            Self::emit_cancelled_title(&self.app, self.registry.as_ref(), tab_id);
-            return Ok(());
-        }
-        // `--resume` fires no hook: the registry must learn "agent alive"
+        // `--resume` fires no hook (and a plain relaunch fires none until
+        // the first prompt either): the registry must learn "agent alive"
         // from here, or an immediate quit would break the restore chain.
         // The flip is the single serialization point for the injection:
         // the PTY write happens only when this caller won it, so the
@@ -342,7 +370,6 @@ impl TabManager {
         if !self.registry.begin_resume(tab_id) {
             return Ok(());
         }
-        let line = format!("{} --resume {}\n", binding.agent.cmd(), binding.sid);
         self.session(tab_id)?.write(line.as_bytes())?;
         Ok(())
     }
@@ -381,6 +408,62 @@ fn resolve_cwd(requested: Option<String>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::{AgentKind, SessionBinding};
+
+    fn binding(agent: AgentKind, sid: &str) -> SessionBinding {
+        SessionBinding { agent, sid: sid.into(), transcript: None }
+    }
+
+    /// Tier 1: a live binding whose agent matches the last launch resumes
+    /// the exact session — the shipped restore behavior, unchanged.
+    #[test]
+    fn resume_line_prefers_a_live_transcript() {
+        let b = binding(AgentKind::Claude, "s-1");
+        assert_eq!(
+            TabManager::resume_line(Some(&b), true, Some(AgentKind::Claude)),
+            Some("claude --resume s-1\n".into())
+        );
+        // No launch signal at all (hook-only flow, or an older snapshot):
+        // the binding alone still resumes.
+        assert_eq!(
+            TabManager::resume_line(Some(&b), true, None),
+            Some("claude --resume s-1\n".into())
+        );
+    }
+
+    /// Tier 2: plain relaunch when the exact session cannot be resumed —
+    /// the never-prompted agent (no binding ever existed), the deleted
+    /// transcript, or a binding left stale by a newer launch of the other
+    /// agent.
+    #[test]
+    fn resume_line_falls_back_to_a_plain_relaunch() {
+        // Never-prompted claude: only the shell's launch signal exists.
+        assert_eq!(
+            TabManager::resume_line(None, false, Some(AgentKind::Claude)),
+            Some("claude\n".into())
+        );
+        // Transcript deleted between quit and relaunch: relaunch the agent
+        // instead of stranding a plain shell (the binding names the kind).
+        let b = binding(AgentKind::Qoder, "s-1");
+        assert_eq!(
+            TabManager::resume_line(Some(&b), false, None),
+            Some("qoder\n".into())
+        );
+        // Stale binding: qoder session on record, but claude was the last
+        // launch (it fired no hook) — resuming qoder would be the wrong
+        // agent, so relaunch claude.
+        assert_eq!(
+            TabManager::resume_line(Some(&b), true, Some(AgentKind::Claude)),
+            Some("claude\n".into())
+        );
+    }
+
+    /// Tier 3: nothing to resume and no agent kind to relaunch → None, the
+    /// cancel path (plain shell, title reverts).
+    #[test]
+    fn resume_line_without_any_agent_is_none() {
+        assert_eq!(TabManager::resume_line(None, false, None), None);
+    }
 
     #[test]
     fn requested_directory_wins_when_it_exists() {

@@ -3,7 +3,7 @@
 //! must leave the same state), read once at startup. Same best-effort
 //! contract as `last_cwd.rs`: I/O errors are silently ignored.
 
-use crate::status::SessionBinding;
+use crate::status::{AgentKind, SessionBinding};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 
@@ -36,6 +36,17 @@ pub struct SnapshotTab {
     /// True when the agent CLI was still running at snapshot time; only then
     /// does restore offer a resume (spec D3).
     pub agent_running: bool,
+    /// The agent binary the shell integration last saw launched in this tab
+    /// (strict preexec match). Lets restore relaunch a never-prompted agent
+    /// — no hook binding ever existed for it. Tolerant like `session`
+    /// (unknown kind → `None`), and absent in older snapshots — same
+    /// degradation, no version bump needed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_tolerant_agent"
+    )]
+    pub agent: Option<AgentKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +89,20 @@ where
         Ok(binding) => Ok(Some(binding)),
         Err(_) => Ok(None),
     }
+}
+
+/// Same tolerance policy as the session, one level simpler: an unknown or
+/// malformed agent kind becomes `None` (restore then declines the plain
+/// relaunch), never a snapshot-wide failure.
+fn deserialize_tolerant_agent<'de, D>(deserializer: D) -> Result<Option<AgentKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value::<AgentKind>(value).ok())
 }
 
 /// Best-effort write. Write-then-rename: a crash mid-write leaves the
@@ -131,6 +156,7 @@ mod tests {
                     has_program_title: false,
                     session: None,
                     agent_running: false,
+                    agent: None,
                 },
                 SnapshotTab {
                     cwd: "/b".into(),
@@ -142,6 +168,7 @@ mod tests {
                         transcript: Some("/b/s-1.jsonl".into()),
                     }),
                     agent_running: true,
+                    agent: Some(AgentKind::Claude),
                 },
             ],
             Some(1),
@@ -172,6 +199,37 @@ mod tests {
         std::fs::write(dir.join("tab-snapshot.json"), r#"{"version":1,"tabs":[{"cwd":"/a""#)
             .unwrap();
         assert!(load(&dir).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A snapshot written by an older build has no `agent` field: it must
+    /// still load (agent → None, no plain relaunch offered).
+    #[test]
+    fn older_snapshots_without_agent_still_load() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("tab-snapshot.json"),
+            r#"{"version":1,"active":0,"tabs":[{"cwd":"/a","title":"/a","hasProgramTitle":false,"agentRunning":true}]}"#,
+        )
+        .unwrap();
+        let snapshot = load(&dir).expect("pre-agent snapshots must load");
+        assert_eq!(snapshot.tabs[0].agent, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Same tolerance policy as `session`: an unknown agent kind degrades to
+    /// None for that tab instead of sinking the whole snapshot.
+    #[test]
+    fn unknown_agent_kind_degrades_to_none() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("tab-snapshot.json"),
+            r#"{"version":1,"tabs":[{"cwd":"/a","title":"/a","hasProgramTitle":false,"agentRunning":true,"agent":"gemini"}]}"#,
+        )
+        .unwrap();
+        let snapshot = load(&dir).expect("an unknown agent must not sink the snapshot");
+        assert_eq!(snapshot.tabs[0].agent, None);
+        assert_eq!(snapshot.tabs[0].cwd, "/a");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

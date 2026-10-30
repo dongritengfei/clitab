@@ -478,6 +478,7 @@ mod tests {
             last_stop_ms: None,
             session: None,
             agent_running: false,
+            last_agent: None,
             resume_pending: false,
             restored_session: false,
         };
@@ -510,6 +511,7 @@ mod tests {
             last_stop_ms: None,
             session: None,
             agent_running: false,
+            last_agent: None,
             resume_pending: false,
             restored_session: false,
         };
@@ -540,6 +542,7 @@ mod tests {
             last_stop_ms: None,
             session: None,
             agent_running: false,
+            last_agent: None,
             resume_pending: true,
             restored_session: true,
         };

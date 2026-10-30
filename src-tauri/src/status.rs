@@ -80,6 +80,17 @@ impl AgentKind {
             AgentKind::Qoder => "qoder",
         }
     }
+
+    /// Inverse of [`cmd`](Self::cmd): decodes the protocol spelling used by
+    /// the OSC 9 `<agent>-start` event. Anything else (the shell wrapper
+    /// normalizes `qodercli` before emitting) is not an agent.
+    pub fn from_cmd(cmd: &str) -> Option<AgentKind> {
+        match cmd {
+            "claude" => Some(AgentKind::Claude),
+            "qoder" => Some(AgentKind::Qoder),
+            _ => None,
+        }
+    }
 }
 
 /// The agent session a tab is currently talking to, learned from the prompt
@@ -237,6 +248,14 @@ pub struct Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_kind_from_cmd_inverts_cmd() {
+        assert_eq!(AgentKind::from_cmd("claude"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::from_cmd("qoder"), Some(AgentKind::Qoder));
+        assert_eq!(AgentKind::from_cmd("vim"), None);
+        assert_eq!(AgentKind::from_cmd(""), None);
+    }
 
     #[test]
     fn decodes_each_event() {

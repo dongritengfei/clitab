@@ -63,13 +63,18 @@ directories. A tab whose agent CLI was still running when the snapshot was
 taken comes back with its session resumed — `<agent> --resume <sid>` is
 injected into the tab's ordinary shell, which keeps shell integration (cwd
 reporting, title revert) working and appends to the same transcript (no
-`--fork-session`).
+`--fork-session`). A tab whose agent was *launched but never prompted* (no
+hook ever fired, so no session exists) comes back with the plain `<agent>`
+relaunched instead — a fresh session, the screen the user left behind.
 
 - The binding (`sid`/`tp`/`a`) rides the UserPromptSubmit payload and
   refreshes on every prompt; only the *latest* session per tab is recorded.
   Agent liveness comes from existing signals: any hook event ⇒ running,
-  shell-integration `claude-done` (OSC 9) ⇒ exited. `--resume` itself fires
-  no hook, so clitab marks a resumed tab alive on injection.
+  the shell integration's strict launch signal (OSC 9 `<agent>-start`,
+  preexec-matched on the agent binary itself) ⇒ running, with the agent
+  kind recorded for the plain relaunch; shell-integration `claude-done`
+  (OSC 9) ⇒ exited. `--resume` itself fires no hook, so clitab marks a
+  resumed tab alive on injection.
 - Only the previously-active tab resumes at startup; the others resume on
   first activation.
 - After a resume, the timeline prepends the session's historical user prompts,
@@ -79,8 +84,11 @@ reporting, title revert) working and appends to the same transcript (no
   display-only — the scrollback they belonged to is gone, so there is nothing
   to jump to.
 - Degradation is silent at every step: hooks not (re)installed or missing jq
-  ⇒ no binding ⇒ tabs restore as plain shells; deleted transcript ⇒ the
-  resume is cancelled and a kept program title reverts to the cwd. The `sid`
+  ⇒ no binding ⇒ tabs still restore, relaunching the plain agent when the
+  launch signal recorded its kind; deleted transcript ⇒ the plain agent is
+  relaunched instead of the exact session; with neither a binding nor a
+  launch signal the resume is cancelled and a kept program title reverts to
+  the cwd. The `sid`
   is charset-checked (`[A-Za-z0-9-]`) at decode time because it is
   interpolated into a shell command line.
 
@@ -109,7 +117,9 @@ reporting, title revert) working and appends to the same transcript (no
   misconfiguration.
 - The shell-integration title revert recognizes `qoder*` commands alongside
   `claude*`; the `claude-done` OSC 9 event name is protocol-internal and
-  fires for both agents.
+  fires for both agents. The launch signal normalizes `qodercli` to the
+  protocol name `qoder` (`qoder-start`), which is also what the plain
+  relaunch injects.
 
 ## Legacy notes
 

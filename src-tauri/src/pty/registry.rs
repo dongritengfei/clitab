@@ -8,7 +8,7 @@
 
 use super::lock;
 use crate::restore::{Snapshot, SnapshotTab};
-use crate::status::{is_injected_prompt, Answer, Notice, SessionBinding, TabStatus};
+use crate::status::{is_injected_prompt, AgentKind, Answer, Notice, SessionBinding, TabStatus};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -66,6 +66,11 @@ pub struct TabRecord {
     /// sets it, shell-integration `claude-done` (PromptReady) clears it
     /// (spec D3). Snapshotted — it decides whether restore offers a resume.
     pub agent_running: bool,
+    /// The agent binary the shell integration last saw launched in this tab
+    /// (OSC 9 `<agent>-start`, strict first-word match). Recorded with no
+    /// hook binding in sight — restore relaunches the plain binary when the
+    /// binding/transcript path is unavailable.
+    pub last_agent: Option<AgentKind>,
     /// Restored tab whose resume has not been issued yet. Set at restore for
     /// resumable tabs; cleared by `begin_resume` / `cancel_resume`.
     pub resume_pending: bool,
@@ -129,6 +134,7 @@ impl Registry {
             last_stop_ms: None,
             session: None,
             agent_running: false,
+            last_agent: None,
             resume_pending: false,
             restored_session: false,
         };
@@ -302,6 +308,27 @@ impl Registry {
             match tabs.iter_mut().find(|t| t.id == id) {
                 Some(tab) if tab.agent_running != running => {
                     tab.agent_running = running;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// The shell integration saw the agent binary itself launch (OSC 9
+    /// `<agent>-start`): liveness with no hook event — a never-prompted
+    /// agent fires none — plus the kind restore needs for a plain relaunch.
+    /// Change-gated like every other snapshot-relevant mutator.
+    pub fn agent_started(&self, id: &str, agent: AgentKind) {
+        let changed = {
+            let mut tabs = lock(&self.tabs);
+            match tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) if !tab.agent_running || tab.last_agent != Some(agent) => {
+                    tab.agent_running = true;
+                    tab.last_agent = Some(agent);
                     true
                 }
                 _ => false,
@@ -593,6 +620,7 @@ impl Registry {
                     // owes its `--resume`, and `restore_tab`'s resumable
                     // gate reads this field.
                     agent_running: t.agent_running || t.resume_pending,
+                    agent: t.last_agent,
                 })
                 .collect(),
             active_index,
@@ -602,7 +630,7 @@ impl Registry {
     // Persistence map (spec Q6). Snapshot-relevant mutators write the file:
     //   insert, insert_record, remove, reorder, set_title, set_cwd,
     //   clear_program_title, set_active, set_session, set_agent_running,
-    //   begin_resume, cancel_resume
+    //   agent_started, begin_resume, cancel_resume
     // Turn-protocol mutators deliberately do NOT (turn state is not part of
     // the snapshot; a restored tab starts protocol-fresh):
     //   set_waiting, clear_waiting, begin_turn, begin_auto_turn, set_tool,
@@ -1211,6 +1239,7 @@ mod tests {
             last_stop_ms: None,
             session: Some(binding("s-1")),
             agent_running: true,
+            last_agent: None,
             resume_pending: true,
             restored_session: true,
         }
@@ -1232,6 +1261,37 @@ mod tests {
         // the binding survives the exit — history still knows which session
         // the tab belongs to
         assert_eq!(registry.get("t1").unwrap().session.unwrap().sid, "s-1");
+    }
+
+    /// The shell integration's strict launch signal: `agent_running` without
+    /// any hook event (a never-prompted agent fires none), plus the kind for
+    /// the restore's plain relaunch.
+    #[test]
+    fn agent_started_records_liveness_and_kind() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        registry.agent_started("t1", AgentKind::Claude);
+        let tab = registry.get("t1").unwrap();
+        assert!(tab.agent_running, "the agent binary is running — no hook needed");
+        assert_eq!(tab.last_agent, Some(AgentKind::Claude));
+        // Latest launch wins (claude exited, qoder started in the same tab).
+        registry.agent_started("t1", AgentKind::Qoder);
+        assert_eq!(registry.get("t1").unwrap().last_agent, Some(AgentKind::Qoder));
+        // claude-done clears liveness but keeps the kind: restore gates on
+        // agent_running, and the next launch re-records anyway.
+        registry.set_agent_running("t1", false);
+        assert_eq!(registry.get("t1").unwrap().last_agent, Some(AgentKind::Qoder));
+        // Unknown tabs are a silent no-op, like every other mutator.
+        registry.agent_started("nope", AgentKind::Claude);
+    }
+
+    #[test]
+    fn snapshot_carries_the_last_agent() {
+        let registry = Registry::new();
+        registry.insert("t1".into(), "/tmp".into());
+        assert_eq!(registry.snapshot().tabs[0].agent, None);
+        registry.agent_started("t1", AgentKind::Claude);
+        assert_eq!(registry.snapshot().tabs[0].agent, Some(AgentKind::Claude));
     }
 
     #[test]

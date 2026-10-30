@@ -3,7 +3,7 @@
 // Detects:
 //   * OSC 0 / 1 / 2 -> terminal title
 //   * OSC 7         -> current working directory (`file://host/path`)
-//   * OSC 9         -> custom notifications (`claude-done`)
+//   * OSC 9         -> custom notifications (`claude-done`, `<agent>-start`)
 //   * OSC 7777      -> the clitab hook protocol (JSON, decoded in `status.rs`)
 //   * standalone BEL -> attention flash
 //
@@ -29,6 +29,11 @@ pub enum OscEvent {
     CwdChanged(String),
     Bell,
     PromptReady,
+    /// OSC 9 `<agent>-start`: the shell integration's preexec saw an agent
+    /// binary launched as the command itself (strict first-word match — a
+    /// `vim claude.md` must NOT count). Payload is the normalized agent name
+    /// (`claude` / `qoder`), decoded into `status::AgentKind` by the caller.
+    AgentStart(String),
     /// OSC 7777: the clitab hook protocol. The payload is the raw text after
     /// the first `;` (parameters rejoined losslessly); JSON semantics live in
     /// `crate::status`, not here.
@@ -222,6 +227,8 @@ impl OscParser {
             "0" | "1" | "2" => Some(OscEvent::TitleChanged(value)),
             "7" => Some(OscEvent::CwdChanged(parse_osc7_path(&value))),
             "9" if value == "claude-done" => Some(OscEvent::PromptReady),
+            "9" if value == "claude-start" => Some(OscEvent::AgentStart("claude".into())),
+            "9" if value == "qoder-start" => Some(OscEvent::AgentStart("qoder".into())),
             "7777" if !value.is_empty() => Some(OscEvent::Clitab(value)),
             _ => None,
         }
@@ -386,6 +393,20 @@ mod tests {
         let mut parser = OscParser::new();
         let events = parser.parse(b"\x1b]9;claude-done\x1b\\");
         assert_eq!(events, vec![OscEvent::PromptReady]);
+    }
+
+    /// The shell integration's strict agent-launch signal: the payload names
+    /// the agent, normalized to the protocol spelling (`qodercli` → `qoder`).
+    #[test]
+    fn osc9_agent_start() {
+        let mut parser = OscParser::new();
+        let events = parser.parse(b"\x1b]9;claude-start\x1b\\");
+        assert_eq!(events, vec![OscEvent::AgentStart("claude".into())]);
+        let events = parser.parse(b"\x1b]9;qoder-start\x1b\\");
+        assert_eq!(events, vec![OscEvent::AgentStart("qoder".into())]);
+        // Any other OSC 9 payload stays ignored.
+        let events = parser.parse(b"\x1b]9;vim-start\x1b\\");
+        assert!(events.is_empty());
     }
 
     #[test]

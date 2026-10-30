@@ -366,6 +366,16 @@ impl PtySession {
                 let _ = app.emit("tab-flash", serde_json::json!({ "tab_id": tab_id }));
                 let _ = app.emit("prompt-ready", serde_json::json!({ "tab_id": tab_id }));
             }
+            OscEvent::AgentStart(cmd) => {
+                // The shell integration's strict launch signal (preexec saw
+                // the agent binary itself): record liveness + kind so an
+                // agent that never fired a hook still restores. Title state
+                // is deliberately untouched — PromptReady / TitleChanged own
+                // it (same invariant as `stop`).
+                if let Some(agent) = status::AgentKind::from_cmd(&cmd) {
+                    registry.agent_started(tab_id, agent);
+                }
+            }
             OscEvent::Clitab(json) => {
                 // Unknown kinds and malformed payloads decode to None and are
                 // dropped: a hook emitting something newer than this build

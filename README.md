@@ -29,7 +29,8 @@ Built with [Tauri 2](https://tauri.app) (Rust + portable-pty) and
   that point. It even spans agent sessions within a tab.
 - **Session restore** — relaunch to the tabs you left behind: same order,
   same names, and the agent session you were in resumes where it stopped
-  (the active tab automatically, the others on first click). Restored
+  (the active tab automatically, the others on first click); an agent you
+  had launched but never prompted comes back as a fresh launch. Restored
   sessions show their earlier prompts as display-only **History** rows in
   the timeline.
 - **Pinned input strip** — scroll up to read and the terminal's bottom rows

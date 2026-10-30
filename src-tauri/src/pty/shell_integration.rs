@@ -29,12 +29,28 @@ use std::path::{Path, PathBuf};
 /// prompt (OSC 7) and, when the previous command looked like an agent CLI
 /// (`claude`, `qodercli`), signals that the assistant's turn is over (OSC 9).
 /// The event name stays `claude-done` for both agents — it is a protocol-level
-/// identifier, not a brand statement.
+/// identifier, not a brand statement. When an agent binary is launched as the
+/// command itself, preexec also announces the launch (OSC 9 `<agent>-start`)
+/// so a never-prompted agent still restores.
 const ZSH_SNIPPET: &str = r#"# clitab shell integration
 _clitab_claude_running=0
 _clitab_preexec() {
     case "$1" in
         *[cC]laude*|*[qQ]oder*) _clitab_claude_running=1 ;;
+    esac
+    _clitab_agent_start "$1"
+}
+_clitab_agent_start() {
+    # Strict launch signal: only the agent binary itself — the command's
+    # first word, basename-compared — may announce a start, because restore
+    # relaunches it. `vim claude.md` matches the loose glob above (harmless:
+    # a title revert) but must never trigger a relaunch. `qodercli`
+    # normalizes to the protocol name `qoder`.
+    local _clitab_bin="${1%% *}"
+    _clitab_bin="${_clitab_bin##*/}"
+    case "$_clitab_bin" in
+        claude) printf '\e]9;claude-start\e\\' ;;
+        qoder|qodercli) printf '\e]9;qoder-start\e\\' ;;
     esac
 }
 _clitab_precmd() {
@@ -52,8 +68,20 @@ precmd_functions+=(_clitab_precmd)
 const BASH_SNIPPET: &str = r#"# clitab shell integration
 _clitab_claude_running=0
 _clitab_preexec() {
-    case "$BASH_COMMAND" in
+    # The DEBUG trap passes "$BASH_COMMAND" so the function reads "$1" like
+    # its zsh twin (and is directly callable from tests).
+    case "$1" in
         *[cC]laude*|*[qQ]oder*) _clitab_claude_running=1 ;;
+    esac
+    _clitab_agent_start "$1"
+}
+_clitab_agent_start() {
+    # Strict launch signal — see the zsh snippet for the rationale.
+    local _clitab_bin="${1%% *}"
+    _clitab_bin="${_clitab_bin##*/}"
+    case "$_clitab_bin" in
+        claude) printf '\e]9;claude-start\e\\' ;;
+        qoder|qodercli) printf '\e]9;qoder-start\e\\' ;;
     esac
 }
 _clitab_prompt() {
@@ -63,7 +91,7 @@ _clitab_prompt() {
         printf '\e]9;claude-done\e\\'
     fi
 }
-trap '_clitab_preexec' DEBUG
+trap '_clitab_preexec "$BASH_COMMAND"' DEBUG
 PROMPT_COMMAND="_clitab_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 "#;
 
@@ -611,6 +639,45 @@ mod tests {
                 output.matches("\u{1b}]9;claude-done").count(),
                 1,
                 "{shell}: expected exactly one done notification after qodercli:\n{output}"
+            );
+        }
+    }
+
+    /// The strict agent-launch signal: only the agent binary *itself* — the
+    /// command's first word, basename-compared — may announce a start, because
+    /// restore will relaunch it. `vim claude.md` matches the loose turn-end
+    /// glob (harmless: a title revert) but must NOT trigger a relaunch.
+    #[cfg(unix)]
+    #[test]
+    fn agent_start_is_reported_only_for_a_real_agent_launch() {
+        for (shell, rc_name) in [("/bin/bash", "bashrc"), ("/bin/zsh", ".zshrc")] {
+            let name = Path::new(shell)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let script = "_clitab_preexec 'claude -p hi'; \
+                          _clitab_preexec '/usr/local/bin/claude'; \
+                          _clitab_preexec 'qodercli'; \
+                          _clitab_preexec 'qoder'; \
+                          _clitab_preexec 'vim claude.md'; \
+                          _clitab_preexec 'grep -r claude src'; \
+                          _clitab_preexec 'echo qoder'";
+            let Some(output) =
+                source_wrapper(&format!("probe-start-{name}"), shell, rc_name, script)
+            else {
+                eprintln!("skipped: {shell} unavailable");
+                continue;
+            };
+            assert_eq!(
+                output.matches("\u{1b}]9;claude-start").count(),
+                2,
+                "{shell}: only real claude launches may announce a start:\n{output}"
+            );
+            assert_eq!(
+                output.matches("\u{1b}]9;qoder-start").count(),
+                2,
+                "{shell}: qoder/qodercli launches announce qoder-start:\n{output}"
             );
         }
     }
